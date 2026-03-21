@@ -1,16 +1,79 @@
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+const DATA_DIR = path.join(__dirname, "data");
+const CALLS_FILE = path.join(DATA_DIR, "calls.json");
+
+// 修改成你要转接的号码（加拿大号码写 +1 开头）
+const LIVE_AGENT_NUMBER = "+19029892358";
+
+function ensureStorage() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(CALLS_FILE)) {
+    fs.writeFileSync(CALLS_FILE, JSON.stringify([], null, 2), "utf8");
+  }
+}
+
+function readCalls() {
+  ensureStorage();
+  try {
+    const raw = fs.readFileSync(CALLS_FILE, "utf8");
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error("Failed to read calls file:", err);
+    return [];
+  }
+}
+
+function saveCallRecord(record) {
+  const calls = readCalls();
+  calls.push(record);
+  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2), "utf8");
+}
+
+function updateCallRecord(callSid, updates) {
+  const calls = readCalls();
+  const index = calls.findIndex((item) => item.callSid === callSid);
+
+  if (index >= 0) {
+    calls[index] = {
+      ...calls[index],
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+  } else {
+    calls.push({
+      callSid,
+      ...updates,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2), "utf8");
+}
+
+ensureStorage();
+
 app.get("/", (req, res) => {
   res.send("Owen HVAC semi-automatic phone front desk is running.");
 });
 
+app.get("/calls", (req, res) => {
+  const calls = readCalls();
+  res.json(calls);
+});
+
 /**
- * 入口：Twilio 来电先打到这里
+ * 来电入口
  */
 app.post("/twilio/voice/incoming", (req, res) => {
   console.log("=== Incoming Call ===");
@@ -18,8 +81,22 @@ app.post("/twilio/voice/incoming", (req, res) => {
   console.log("To:", req.body.To);
   console.log("CallSid:", req.body.CallSid);
 
+  const from = req.body.From || "";
+  const to = req.body.To || "";
+  const callSid = req.body.CallSid || "";
   const host = req.get("host");
   const gatherActionUrl = `https://${host}/twilio/voice/menu`;
+
+  saveCallRecord({
+    callSid,
+    from,
+    to,
+    stage: "incoming",
+    selection: "",
+    callStatus: "started",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
 
   const twiml = `
 <Response>
@@ -31,6 +108,7 @@ app.post("/twilio/voice/incoming", (req, res) => {
     For a new heat pump installation, press 1.
     For service or repair, press 2.
     For rebate or grant questions, press 3.
+    To speak with our team directly, press 0.
   </Say>
   <Gather numDigits="1" action="${gatherActionUrl}" method="POST" timeout="8">
     <Say language="en-US" voice="alice">
@@ -38,7 +116,8 @@ app.post("/twilio/voice/incoming", (req, res) => {
     </Say>
   </Gather>
   <Say language="en-US" voice="alice">
-    We did not receive your selection. Please call again, or our team will follow up shortly.
+    We did not receive your selection.
+    Please call again, or our team will follow up shortly.
   </Say>
   <Hangup/>
 </Response>`.trim();
@@ -48,7 +127,7 @@ app.post("/twilio/voice/incoming", (req, res) => {
 });
 
 /**
- * 按键菜单处理
+ * 菜单处理
  */
 app.post("/twilio/voice/menu", (req, res) => {
   const digits = req.body.Digits || "";
@@ -60,9 +139,11 @@ app.post("/twilio/voice/menu", (req, res) => {
   console.log("CallSid:", callSid);
   console.log("Digits:", digits);
 
+  let selectionLabel = "invalid";
   let twiml = "";
 
   if (digits === "1") {
+    selectionLabel = "new_installation";
     twiml = `
 <Response>
   <Say language="en-US" voice="alice">
@@ -75,6 +156,7 @@ app.post("/twilio/voice/menu", (req, res) => {
   <Hangup/>
 </Response>`.trim();
   } else if (digits === "2") {
+    selectionLabel = "service_or_repair";
     twiml = `
 <Response>
   <Say language="en-US" voice="alice">
@@ -82,11 +164,13 @@ app.post("/twilio/voice/menu", (req, res) => {
   </Say>
   <Pause length="1"/>
   <Say language="en-US" voice="alice">
-    Our service team will contact you shortly. Please have your equipment brand, model number, and service address ready.
+    Our service team will contact you shortly.
+    Please have your equipment brand, model number, and service address ready.
   </Say>
   <Hangup/>
 </Response>`.trim();
   } else if (digits === "3") {
+    selectionLabel = "rebate_questions";
     twiml = `
 <Response>
   <Say language="en-US" voice="alice">
@@ -98,7 +182,17 @@ app.post("/twilio/voice/menu", (req, res) => {
   </Say>
   <Hangup/>
 </Response>`.trim();
+  } else if (digits === "0") {
+    selectionLabel = "transfer_to_agent";
+    twiml = `
+<Response>
+  <Say language="en-US" voice="alice">
+    Please hold while we transfer your call to our team.
+  </Say>
+  <Dial>${LIVE_AGENT_NUMBER}</Dial>
+</Response>`.trim();
   } else {
+    selectionLabel = "invalid";
     twiml = `
 <Response>
   <Say language="en-US" voice="alice">
@@ -106,11 +200,20 @@ app.post("/twilio/voice/menu", (req, res) => {
   </Say>
   <Pause length="1"/>
   <Say language="en-US" voice="alice">
-    Please call again and press 1 for installation, 2 for service, or 3 for rebate questions.
+    Please call again and press 1 for installation,
+    2 for service,
+    3 for rebate questions,
+    or 0 to speak with our team.
   </Say>
   <Hangup/>
 </Response>`.trim();
   }
+
+  updateCallRecord(callSid, {
+    stage: "menu_completed",
+    selection: selectionLabel,
+    digits,
+  });
 
   res.type("text/xml");
   res.send(twiml);
@@ -126,6 +229,14 @@ app.post("/twilio/voice/status", (req, res) => {
   console.log("From:", req.body.From);
   console.log("To:", req.body.To);
   console.log("Timestamp:", new Date().toISOString());
+
+  const callSid = req.body.CallSid || "";
+
+  updateCallRecord(callSid, {
+    callStatus: req.body.CallStatus || "unknown",
+    from: req.body.From || "",
+    to: req.body.To || "",
+  });
 
   res.sendStatus(200);
 });
