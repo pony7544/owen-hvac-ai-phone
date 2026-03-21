@@ -10,8 +10,8 @@ app.use(express.json());
 const DATA_DIR = path.join(__dirname, "data");
 const CALLS_FILE = path.join(DATA_DIR, "calls.json");
 
-// 修改成你要转接的号码（加拿大号码写 +1 开头）
-const LIVE_AGENT_NUMBER = "+19029892358";
+// 改成你的号码
+const LIVE_AGENT_NUMBER = "+1902XXXXXXXX";
 
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -33,10 +33,15 @@ function readCalls() {
   }
 }
 
+function saveAllCalls(calls) {
+  ensureStorage();
+  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2), "utf8");
+}
+
 function saveCallRecord(record) {
   const calls = readCalls();
   calls.push(record);
-  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2), "utf8");
+  saveAllCalls(calls);
 }
 
 function updateCallRecord(callSid, updates) {
@@ -58,7 +63,16 @@ function updateCallRecord(callSid, updates) {
     });
   }
 
-  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2), "utf8");
+  saveAllCalls(calls);
+}
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 ensureStorage();
@@ -68,13 +82,332 @@ app.get("/", (req, res) => {
 });
 
 app.get("/calls", (req, res) => {
-  const calls = readCalls();
+  const calls = readCalls().sort((a, b) => {
+    return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
+  });
   res.json(calls);
 });
 
-/**
- * 来电入口
- */
+app.get("/dashboard", (req, res) => {
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Owen HVAC Call Dashboard</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: #f5f7fb;
+      color: #1f2937;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    .sub {
+      color: #6b7280;
+      margin-bottom: 20px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    input, select, button {
+      padding: 10px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    button {
+      cursor: pointer;
+      background: #111827;
+      color: white;
+      border: none;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: white;
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .card .label {
+      color: #6b7280;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .card .value {
+      font-size: 24px;
+      font-weight: bold;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      font-size: 14px;
+      vertical-align: top;
+    }
+    th {
+      background: #111827;
+      color: white;
+      font-weight: 600;
+    }
+    tr:hover {
+      background: #f9fafb;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .status-completed { background: #dcfce7; color: #166534; }
+    .status-started { background: #dbeafe; color: #1d4ed8; }
+    .status-failed { background: #fee2e2; color: #991b1b; }
+    .status-unknown { background: #e5e7eb; color: #374151; }
+    .sel-install { background: #ede9fe; color: #5b21b6; }
+    .sel-service { background: #fef3c7; color: #92400e; }
+    .sel-rebate { background: #cffafe; color: #155e75; }
+    .sel-transfer { background: #fee2e2; color: #9f1239; }
+    .sel-invalid { background: #e5e7eb; color: #374151; }
+    .muted {
+      color: #6b7280;
+    }
+    .empty {
+      background: white;
+      padding: 24px;
+      border-radius: 14px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+      color: #6b7280;
+    }
+    @media (max-width: 900px) {
+      .stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      table, thead, tbody, th, td, tr {
+        display: block;
+      }
+      thead {
+        display: none;
+      }
+      tr {
+        margin-bottom: 12px;
+        background: white;
+        border-radius: 14px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        overflow: hidden;
+      }
+      td {
+        border-bottom: 1px solid #e5e7eb;
+      }
+      td::before {
+        content: attr(data-label);
+        display: block;
+        font-size: 12px;
+        color: #6b7280;
+        margin-bottom: 4px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Owen HVAC Call Dashboard</h1>
+    <div class="sub">Live call records from your semi-automatic phone front desk.</div>
+
+    <div class="toolbar">
+      <input id="searchInput" type="text" placeholder="Search phone / CallSid / selection" />
+      <select id="statusFilter">
+        <option value="">All statuses</option>
+        <option value="started">started</option>
+        <option value="completed">completed</option>
+        <option value="failed">failed</option>
+      </select>
+      <select id="selectionFilter">
+        <option value="">All selections</option>
+        <option value="new_installation">new_installation</option>
+        <option value="service_or_repair">service_or_repair</option>
+        <option value="rebate_questions">rebate_questions</option>
+        <option value="transfer_to_agent">transfer_to_agent</option>
+        <option value="invalid">invalid</option>
+      </select>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+
+    <div class="stats">
+      <div class="card">
+        <div class="label">Total Calls</div>
+        <div class="value" id="statTotal">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Completed</div>
+        <div class="value" id="statCompleted">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Service / Repair</div>
+        <div class="value" id="statService">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Transfer to Agent</div>
+        <div class="value" id="statTransfer">0</div>
+      </div>
+    </div>
+
+    <div id="tableWrap"></div>
+  </div>
+
+  <script>
+    let allCalls = [];
+
+    function statusBadge(status) {
+      const safe = (status || "unknown").toLowerCase();
+      const cls = ["completed", "started", "failed"].includes(safe) ? safe : "unknown";
+      return '<span class="badge status-' + cls + '">' + safe + '</span>';
+    }
+
+    function selectionBadge(selection) {
+      const map = {
+        new_installation: ["New Installation", "sel-install"],
+        service_or_repair: ["Service / Repair", "sel-service"],
+        rebate_questions: ["Rebate Questions", "sel-rebate"],
+        transfer_to_agent: ["Transfer to Agent", "sel-transfer"],
+        invalid: ["Invalid", "sel-invalid"],
+        "": ["-", "sel-invalid"]
+      };
+      const val = map[selection || ""] || [selection, "sel-invalid"];
+      return '<span class="badge ' + val[1] + '">' + val[0] + '</span>';
+    }
+
+    function fmtDate(value) {
+      if (!value) return "-";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return value;
+      return d.toLocaleString();
+    }
+
+    function renderStats(calls) {
+      document.getElementById("statTotal").textContent = calls.length;
+      document.getElementById("statCompleted").textContent =
+        calls.filter(c => (c.callStatus || "").toLowerCase() === "completed").length;
+      document.getElementById("statService").textContent =
+        calls.filter(c => c.selection === "service_or_repair").length;
+      document.getElementById("statTransfer").textContent =
+        calls.filter(c => c.selection === "transfer_to_agent").length;
+    }
+
+    function renderTable(calls) {
+      const wrap = document.getElementById("tableWrap");
+
+      if (!calls.length) {
+        wrap.innerHTML = '<div class="empty">No call records found.</div>';
+        return;
+      }
+
+      const rows = calls.map(call => {
+        return \`
+          <tr>
+            <td data-label="Time">\${fmtDate(call.createdAt)}</td>
+            <td data-label="From">\${call.from || "-"}</td>
+            <td data-label="To">\${call.to || "-"}</td>
+            <td data-label="Selection">\${selectionBadge(call.selection || "")}</td>
+            <td data-label="Status">\${statusBadge(call.callStatus || "unknown")}</td>
+            <td data-label="Digits">\${call.digits || "-"}</td>
+            <td data-label="CallSid"><span class="muted">\${call.callSid || "-"}</span></td>
+          </tr>
+        \`;
+      }).join("");
+
+      wrap.innerHTML = \`
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>From</th>
+              <th>To</th>
+              <th>Selection</th>
+              <th>Status</th>
+              <th>Digits</th>
+              <th>CallSid</th>
+            </tr>
+          </thead>
+          <tbody>\${rows}</tbody>
+        </table>
+      \`;
+    }
+
+    function applyFilters() {
+      const q = document.getElementById("searchInput").value.trim().toLowerCase();
+      const status = document.getElementById("statusFilter").value;
+      const selection = document.getElementById("selectionFilter").value;
+
+      const filtered = allCalls.filter(call => {
+        const haystack = [
+          call.from || "",
+          call.to || "",
+          call.callSid || "",
+          call.selection || "",
+          call.callStatus || "",
+          call.digits || ""
+        ].join(" ").toLowerCase();
+
+        const qMatch = !q || haystack.includes(q);
+        const statusMatch = !status || (call.callStatus || "").toLowerCase() === status;
+        const selectionMatch = !selection || (call.selection || "") === selection;
+
+        return qMatch && statusMatch && selectionMatch;
+      });
+
+      renderStats(filtered);
+      renderTable(filtered);
+    }
+
+    async function loadCalls() {
+      const res = await fetch("/calls", { cache: "no-store" });
+      const data = await res.json();
+      allCalls = Array.isArray(data) ? data.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)) : [];
+      applyFilters();
+    }
+
+    document.getElementById("refreshBtn").addEventListener("click", loadCalls);
+    document.getElementById("searchInput").addEventListener("input", applyFilters);
+    document.getElementById("statusFilter").addEventListener("change", applyFilters);
+    document.getElementById("selectionFilter").addEventListener("change", applyFilters);
+
+    loadCalls();
+    setInterval(loadCalls, 10000);
+  </script>
+</body>
+</html>
+  `.trim();
+
+  res.type("text/html");
+  res.send(html);
+});
+
 app.post("/twilio/voice/incoming", (req, res) => {
   console.log("=== Incoming Call ===");
   console.log("From:", req.body.From);
@@ -93,6 +426,7 @@ app.post("/twilio/voice/incoming", (req, res) => {
     to,
     stage: "incoming",
     selection: "",
+    digits: "",
     callStatus: "started",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -126,9 +460,6 @@ app.post("/twilio/voice/incoming", (req, res) => {
   res.send(twiml);
 });
 
-/**
- * 菜单处理
- */
 app.post("/twilio/voice/menu", (req, res) => {
   const digits = req.body.Digits || "";
   const from = req.body.From || "";
@@ -219,9 +550,6 @@ app.post("/twilio/voice/menu", (req, res) => {
   res.send(twiml);
 });
 
-/**
- * 通话状态回调
- */
 app.post("/twilio/voice/status", (req, res) => {
   console.log("=== Call Status Callback ===");
   console.log("CallSid:", req.body.CallSid);
@@ -244,5 +572,5 @@ app.post("/twilio/voice/status", (req, res) => {
 const port = process.env.PORT || 10000;
 
 app.listen(port, "0.0.0.0", () => {
-  console.log(`Server listening on port ${port}`);
+  console.log(\`Server listening on port \${port}\`);
 });
