@@ -1,6 +1,8 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
+const { WebSocketServer, WebSocket } = require("ws");
 
 const app = express();
 
@@ -10,8 +12,26 @@ app.use(express.json());
 const DATA_DIR = path.join(__dirname, "data");
 const CALLS_FILE = path.join(DATA_DIR, "calls.json");
 
-// 改成你的号码
-const LIVE_AGENT_NUMBER = "+19029892358";
+const LIVE_AGENT_NUMBER = process.env.LIVE_AGENT_NUMBER || "";
+
+const HVAC_SYSTEM_PROMPT = `
+You are the phone assistant for Owen HVAC Corp in Nova Scotia, Canada.
+
+Your job is to greet callers, ask what they need, and keep responses brief and clear in natural spoken English.
+
+You can help with:
+- new heat pump installation
+- service or repair
+- rebate or grant questions
+
+Rules:
+- keep answers short
+- ask one question at a time
+- do not promise pricing
+- do not give firm rebate eligibility decisions
+- if unsure, say a team member will follow up
+- collect callback number and service address when relevant
+`;
 
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -66,19 +86,255 @@ function updateCallRecord(callSid, updates) {
   saveAllCalls(calls);
 }
 
-function escapeHtml(value = "") {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 ensureStorage();
 
+function buildMenuTwiml(host) {
+  const gatherActionUrl = `https://${host}/twilio/voice/menu`;
+
+  return `
+<Response>
+  <Say language="en-US" voice="alice">
+    Thank you for calling Owen H V A C Corp.
+  </Say>
+  <Pause length="1"/>
+  <Say language="en-US" voice="alice">
+    For a new heat pump installation, press 1.
+    For service or repair, press 2.
+    For rebate or grant questions, press 3.
+    To speak with our team directly, press 0.
+  </Say>
+  <Gather numDigits="1" action="${gatherActionUrl}" method="POST" timeout="8">
+    <Say language="en-US" voice="alice">
+      Please make your selection now.
+    </Say>
+  </Gather>
+  <Say language="en-US" voice="alice">
+    We did not receive your selection.
+    Please call again, or our team will follow up shortly.
+  </Say>
+  <Hangup/>
+</Response>`.trim();
+}
+
+function buildAiStreamTwiml(host) {
+  const streamUrl = `wss://${host}/twilio/stream`;
+
+  return `
+<Response>
+  <Connect>
+    <Stream url="${streamUrl}" />
+  </Connect>
+</Response>`.trim();
+}
+
+function attachRealtimeBridge(server) {
+  const wss = new WebSocketServer({
+    server,
+    path: "/twilio/stream",
+  });
+
+  wss.on("connection", (twilioWs) => {
+    console.log("=== Twilio stream connected ===");
+
+    let streamSid = null;
+    let callSid = null;
+    let openAiReady = false;
+    let twilioStarted = false;
+    let initialGreetingSent = false;
+    let transcriptBuffer = [];
+
+    if (!process.env.OPENAI_API_KEY) {
+      console.error("OPENAI_API_KEY is missing");
+      try {
+        twilioWs.close();
+      } catch {}
+      return;
+    }
+
+    const openaiWs = new WebSocket(
+      "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "OpenAI-Beta": "realtime=v1",
+        },
+      }
+    );
+
+    function maybeStartInitialGreeting() {
+      if (!openAiReady || !twilioStarted || initialGreetingSent) return;
+      initialGreetingSent = true;
+
+      const initialResponse = {
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions:
+            "Greet the caller and say: Thank you for calling Owen HVAC Corp. How can I help you today?",
+        },
+      };
+
+      openaiWs.send(JSON.stringify(initialResponse));
+    }
+
+    openaiWs.on("open", () => {
+      console.log("=== OpenAI realtime connected ===");
+      openAiReady = true;
+
+      const sessionUpdate = {
+        type: "session.update",
+        session: {
+          modalities: ["audio", "text"],
+          instructions: HVAC_SYSTEM_PROMPT,
+          voice: "alloy",
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500,
+            create_response: true
+          }
+        },
+      };
+
+      openaiWs.send(JSON.stringify(sessionUpdate));
+      maybeStartInitialGreeting();
+    });
+
+    openaiWs.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+
+        if (
+          msg.type === "session.created" ||
+          msg.type === "session.updated" ||
+          msg.type === "response.done" ||
+          msg.type === "error"
+        ) {
+          console.log("OpenAI event:", msg.type);
+          if (msg.type === "error") {
+            console.error("OpenAI error payload:", JSON.stringify(msg));
+          }
+        }
+
+        // AI 文字 transcript（调试和保存）
+        if (msg.type === "response.audio_transcript.delta" && msg.delta) {
+          transcriptBuffer.push({
+            role: "assistant",
+            text: msg.delta,
+            at: new Date().toISOString(),
+          });
+        }
+
+        if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
+          transcriptBuffer.push({
+            role: "caller",
+            text: msg.transcript,
+            at: new Date().toISOString(),
+          });
+        }
+
+        // 把 AI 音频回送给 Twilio
+        if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
+          const mediaMsg = {
+            event: "media",
+            streamSid,
+            media: {
+              payload: msg.delta,
+            },
+          };
+          twilioWs.send(JSON.stringify(mediaMsg));
+        }
+      } catch (err) {
+        console.error("Failed to parse OpenAI message:", err);
+      }
+    });
+
+    openaiWs.on("close", () => {
+      console.log("=== OpenAI realtime disconnected ===");
+    });
+
+    openaiWs.on("error", (err) => {
+      console.error("OpenAI websocket error:", err);
+    });
+
+    twilioWs.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+
+        if (msg.event === "start") {
+          streamSid = msg.start?.streamSid || null;
+          callSid = msg.start?.callSid || msg.start?.customParameters?.CallSid || null;
+          twilioStarted = true;
+
+          console.log("Twilio stream started:", streamSid);
+          console.log("Twilio callSid:", callSid);
+
+          if (callSid) {
+            updateCallRecord(callSid, {
+              stage: "ai_stream_started",
+              streamSid,
+            });
+          }
+
+          maybeStartInitialGreeting();
+        }
+
+        if (msg.event === "media" && msg.media?.payload) {
+          const audioAppend = {
+            type: "input_audio_buffer.append",
+            audio: msg.media.payload,
+          };
+
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.send(JSON.stringify(audioAppend));
+          }
+        }
+
+        if (msg.event === "stop") {
+          console.log("Twilio stream stopped");
+
+          if (callSid && transcriptBuffer.length) {
+            updateCallRecord(callSid, {
+              transcript: transcriptBuffer,
+              stage: "ai_stream_stopped",
+            });
+          }
+
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.close();
+          }
+        }
+      } catch (err) {
+        console.error("Failed to parse Twilio message:", err);
+      }
+    });
+
+    twilioWs.on("close", () => {
+      console.log("=== Twilio websocket disconnected ===");
+
+      if (callSid && transcriptBuffer.length) {
+        updateCallRecord(callSid, {
+          transcript: transcriptBuffer,
+          stage: "ai_stream_closed",
+        });
+      }
+
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.close();
+      }
+    });
+
+    twilioWs.on("error", (err) => {
+      console.error("Twilio websocket error:", err);
+    });
+  });
+}
+
 app.get("/", (req, res) => {
-  res.send("Owen HVAC semi-automatic phone front desk is running.");
+  res.send("Owen HVAC phone system is running.");
 });
 
 app.get("/calls", (req, res) => {
@@ -194,6 +450,7 @@ app.get("/dashboard", (req, res) => {
     .sel-rebate { background: #cffafe; color: #155e75; }
     .sel-transfer { background: #fee2e2; color: #9f1239; }
     .sel-invalid { background: #e5e7eb; color: #374151; }
+    .sel-ai { background: #dbeafe; color: #1d4ed8; }
     .muted {
       color: #6b7280;
     }
@@ -203,6 +460,13 @@ app.get("/dashboard", (req, res) => {
       border-radius: 14px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
       color: #6b7280;
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+      font-size: 12px;
+      color: #374151;
     }
     @media (max-width: 900px) {
       .stats {
@@ -237,7 +501,7 @@ app.get("/dashboard", (req, res) => {
 <body>
   <div class="wrap">
     <h1>Owen HVAC Call Dashboard</h1>
-    <div class="sub">Live call records from your semi-automatic phone front desk.</div>
+    <div class="sub">Live call records from your phone front desk.</div>
 
     <div class="toolbar">
       <input id="searchInput" type="text" placeholder="Search phone / CallSid / selection" />
@@ -254,6 +518,7 @@ app.get("/dashboard", (req, res) => {
         <option value="rebate_questions">rebate_questions</option>
         <option value="transfer_to_agent">transfer_to_agent</option>
         <option value="invalid">invalid</option>
+        <option value="ai_mode">ai_mode</option>
       </select>
       <button id="refreshBtn">Refresh</button>
     </div>
@@ -272,8 +537,8 @@ app.get("/dashboard", (req, res) => {
         <div class="value" id="statService">0</div>
       </div>
       <div class="card">
-        <div class="label">Transfer to Agent</div>
-        <div class="value" id="statTransfer">0</div>
+        <div class="label">AI Mode Calls</div>
+        <div class="value" id="statAi">0</div>
       </div>
     </div>
 
@@ -296,6 +561,7 @@ app.get("/dashboard", (req, res) => {
         rebate_questions: ["Rebate Questions", "sel-rebate"],
         transfer_to_agent: ["Transfer to Agent", "sel-transfer"],
         invalid: ["Invalid", "sel-invalid"],
+        ai_mode: ["AI Mode", "sel-ai"],
         "": ["-", "sel-invalid"]
       };
       const val = map[selection || ""] || [selection, "sel-invalid"];
@@ -315,8 +581,8 @@ app.get("/dashboard", (req, res) => {
         calls.filter(c => (c.callStatus || "").toLowerCase() === "completed").length;
       document.getElementById("statService").textContent =
         calls.filter(c => c.selection === "service_or_repair").length;
-      document.getElementById("statTransfer").textContent =
-        calls.filter(c => c.selection === "transfer_to_agent").length;
+      document.getElementById("statAi").textContent =
+        calls.filter(c => c.selection === "ai_mode").length;
     }
 
     function renderTable(calls) {
@@ -328,6 +594,10 @@ app.get("/dashboard", (req, res) => {
       }
 
       const rows = calls.map(call => {
+        const transcriptText = Array.isArray(call.transcript)
+          ? call.transcript.map(t => '[' + (t.role || 'unknown') + '] ' + (t.text || '')).join("\\n")
+          : "";
+
         return \`
           <tr>
             <td data-label="Time">\${fmtDate(call.createdAt)}</td>
@@ -336,6 +606,7 @@ app.get("/dashboard", (req, res) => {
             <td data-label="Selection">\${selectionBadge(call.selection || "")}</td>
             <td data-label="Status">\${statusBadge(call.callStatus || "unknown")}</td>
             <td data-label="Digits">\${call.digits || "-"}</td>
+            <td data-label="Transcript"><pre>\${transcriptText || "-"}</pre></td>
             <td data-label="CallSid"><span class="muted">\${call.callSid || "-"}</span></td>
           </tr>
         \`;
@@ -351,6 +622,7 @@ app.get("/dashboard", (req, res) => {
               <th>Selection</th>
               <th>Status</th>
               <th>Digits</th>
+              <th>Transcript</th>
               <th>CallSid</th>
             </tr>
           </thead>
@@ -365,13 +637,18 @@ app.get("/dashboard", (req, res) => {
       const selection = document.getElementById("selectionFilter").value;
 
       const filtered = allCalls.filter(call => {
+        const transcriptText = Array.isArray(call.transcript)
+          ? call.transcript.map(t => t.text || "").join(" ")
+          : "";
+
         const haystack = [
           call.from || "",
           call.to || "",
           call.callSid || "",
           call.selection || "",
           call.callStatus || "",
-          call.digits || ""
+          call.digits || "",
+          transcriptText
         ].join(" ").toLowerCase();
 
         const qMatch = !q || haystack.includes(q);
@@ -388,7 +665,9 @@ app.get("/dashboard", (req, res) => {
     async function loadCalls() {
       const res = await fetch("/calls", { cache: "no-store" });
       const data = await res.json();
-      allCalls = Array.isArray(data) ? data.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)) : [];
+      allCalls = Array.isArray(data)
+        ? data.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+        : [];
       applyFilters();
     }
 
@@ -418,44 +697,28 @@ app.post("/twilio/voice/incoming", (req, res) => {
   const to = req.body.To || "";
   const callSid = req.body.CallSid || "";
   const host = req.get("host");
-  const gatherActionUrl = `https://${host}/twilio/voice/menu`;
+  const appMode = (process.env.APP_MODE || "menu").toLowerCase();
 
   saveCallRecord({
     callSid,
     from,
     to,
     stage: "incoming",
-    selection: "",
+    selection: appMode === "ai" ? "ai_mode" : "",
     digits: "",
     callStatus: "started",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
 
-  const twiml = `
-<Response>
-  <Say language="en-US" voice="alice">
-    Thank you for calling Owen H V A C Corp.
-  </Say>
-  <Pause length="1"/>
-  <Say language="en-US" voice="alice">
-    For a new heat pump installation, press 1.
-    For service or repair, press 2.
-    For rebate or grant questions, press 3.
-    To speak with our team directly, press 0.
-  </Say>
-  <Gather numDigits="1" action="${gatherActionUrl}" method="POST" timeout="8">
-    <Say language="en-US" voice="alice">
-      Please make your selection now.
-    </Say>
-  </Gather>
-  <Say language="en-US" voice="alice">
-    We did not receive your selection.
-    Please call again, or our team will follow up shortly.
-  </Say>
-  <Hangup/>
-</Response>`.trim();
+  if (appMode === "ai") {
+    const twiml = buildAiStreamTwiml(host);
+    res.type("text/xml");
+    res.send(twiml);
+    return;
+  }
 
+  const twiml = buildMenuTwiml(host);
   res.type("text/xml");
   res.send(twiml);
 });
@@ -570,7 +833,10 @@ app.post("/twilio/voice/status", (req, res) => {
 });
 
 const port = process.env.PORT || 10000;
+const server = http.createServer(app);
 
-app.listen(port, "0.0.0.0", () => {
+attachRealtimeBridge(server);
+
+server.listen(port, "0.0.0.0", () => {
   console.log(\`Server listening on port \${port}\`);
 });
