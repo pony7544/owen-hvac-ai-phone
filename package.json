@@ -1,0 +1,12 @@
+{
+  "name": "owen-hvac-ai-phone",
+  "version": "1.0.0",
+  "description": "Twilio voice webhook for Owen HVAC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
