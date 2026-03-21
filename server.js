@@ -11,7 +11,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const CALLS_FILE = path.join(DATA_DIR, "calls.json");
 
 // 改成你的号码
-const LIVE_AGENT_NUMBER = "+1902XXXXXXXX";
+const LIVE_AGENT_NUMBER = "+19029892358";
 
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
