@@ -221,6 +221,7 @@ function attachRealtimeBridge(server) {
 
         // AI 文字 transcript（调试和保存）
         if (msg.type === "response.audio_transcript.delta" && msg.delta) {
+          console.log("AI transcript delta:", msg.delta);
           transcriptBuffer.push({
             role: "assistant",
             text: msg.delta,
@@ -230,6 +231,7 @@ function attachRealtimeBridge(server) {
 
         if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
           transcriptBuffer.push({
+            console.log("Caller transcript:", msg.transcript);
             role: "caller",
             text: msg.transcript,
             at: new Date().toISOString(),
@@ -237,16 +239,20 @@ function attachRealtimeBridge(server) {
         }
 
         // 把 AI 音频回送给 Twilio
-        if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
+       if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
+          console.log("OpenAI audio delta received, length:", msg.delta.length);
+
           const mediaMsg = {
             event: "media",
             streamSid,
             media: {
               payload: msg.delta,
             },
-          };
-          twilioWs.send(JSON.stringify(mediaMsg));
-        }
+        };
+
+      console.log("Sending audio back to Twilio stream:", streamSid);
+      twilioWs.send(JSON.stringify(mediaMsg));
+      }
       } catch (err) {
         console.error("Failed to parse OpenAI message:", err);
       }
