@@ -153,6 +153,9 @@ function ensureLiveSession(callSid, initial = {}) {
       direction: initial.direction || "incoming",
       startedAt: initial.startedAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      activeSpeaker: "",
+      summary: "",
+      selection: initial.selection || "",
       transcript: [],
       fields: {
         intent: "",
@@ -178,67 +181,11 @@ function updateLiveSession(callSid, updates = {}) {
   broadcastLiveState();
   return session;
 }
-function appendTranscript(callSid, role, text) {
-  if (!callSid || !text) return;
-
-  const session = ensureLiveSession(callSid);
-  if (!session) return;
-
-  if (!Array.isArray(session.transcript)) {
-    session.transcript = [];
-  }
-
-  const clean = String(text).replace(/\s+/g, " ").trim();
-  if (!clean) return;
-
-  const last = session.transcript[session.transcript.length - 1];
-
-  // 如果上一条就是同一个角色，就直接拼接，不新开行
-  if (last && last.role === role) {
-    const needsSpace =
-      last.text &&
-      !last.text.endsWith(" ") &&
-      ![".", ",", "!", "?", ":", ";"].includes(clean[0]);
-
-    last.text = `${last.text}${needsSpace ? " " : ""}${clean}`.trim();
-    last.at = new Date().toISOString();
-  } else {
-    session.transcript.push({
-      role,
-      text: clean,
-      at: new Date().toISOString(),
-    });
-  }
-
-  session.updatedAt = new Date().toISOString();
-
-  if (role === "caller") {
-    extractFieldsFromText(session, role, clean);
-  }
-
-  broadcastLiveState();
-}
-function pushTranscript(callSid, role, text) {
-  if (!callSid || !text) return;
-  const session = ensureLiveSession(callSid);
-  if (!session) return;
-
-  session.transcript.push({
-    role,
-    text,
-    at: new Date().toISOString(),
-  });
-  session.updatedAt = new Date().toISOString();
-
-  extractFieldsFromText(session, role, text);
-  broadcastLiveState();
-}
 
 function extractFieldsFromText(session, role, text) {
   if (!session || !text) return;
   const lower = text.toLowerCase();
 
-  // intent
   if (!session.fields.intent) {
     if (
       lower.includes("install") ||
@@ -271,7 +218,6 @@ function extractFieldsFromText(session, role, text) {
 
   if (role !== "caller") return;
 
-  // name
   const namePatterns = [
     /my name is ([a-z ,.'-]+)/i,
     /this is ([a-z ,.'-]+)/i,
@@ -286,7 +232,6 @@ function extractFieldsFromText(session, role, text) {
     }
   }
 
-  // callback number
   const phoneMatch = text.match(
     /(\+?1?[\s\-().]*\d{3}[\s\-().]*\d{3}[\s\-().]*\d{4})/
   );
@@ -294,7 +239,6 @@ function extractFieldsFromText(session, role, text) {
     session.fields.callbackNumber = phoneMatch[1].trim();
   }
 
-  // service address
   const addressMatch = text.match(
     /\b\d{1,6}\s+[A-Za-z0-9.'-]+\s+(Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Lane|Ln|Court|Ct|Boulevard|Blvd|Highway|Hwy|Way|Place|Pl|Terrace|Ter)\b.*?/i
   );
@@ -302,23 +246,89 @@ function extractFieldsFromText(session, role, text) {
     session.fields.serviceAddress = addressMatch[0].trim();
   }
 
-  // issue summary
   if (text.trim().length > 12) {
     session.fields.issueSummary = text.trim();
   }
+}
+
+function appendTranscript(callSid, role, text) {
+  if (!callSid || !text) return;
+
+  const session = ensureLiveSession(callSid);
+  if (!session) return;
+
+  if (!Array.isArray(session.transcript)) {
+    session.transcript = [];
+  }
+
+  const clean = String(text).replace(/\s+/g, " ").trim();
+  if (!clean) return;
+
+  const last = session.transcript[session.transcript.length - 1];
+
+  if (last && last.role === role) {
+    const needsSpace =
+      last.text &&
+      !last.text.endsWith(" ") &&
+      ![".", ",", "!", "?", ":", ";"].includes(clean[0]);
+
+    last.text = `${last.text}${needsSpace ? " " : ""}${clean}`.trim();
+    last.at = new Date().toISOString();
+  } else {
+    session.transcript.push({
+      role,
+      text: clean,
+      at: new Date().toISOString(),
+    });
+  }
+
+  session.updatedAt = new Date().toISOString();
+
+  if (role === "caller") {
+    extractFieldsFromText(session, role, clean);
+  }
+
+  broadcastLiveState();
+}
+
+function buildCallSummary(session) {
+  if (!session) return "";
+
+  const fields = session.fields || {};
+  const parts = [];
+
+  if (fields.intent) parts.push(`Intent: ${fields.intent}`);
+  if (fields.callerName) parts.push(`Name: ${fields.callerName}`);
+  if (fields.callbackNumber) parts.push(`Callback: ${fields.callbackNumber}`);
+  if (fields.serviceAddress) parts.push(`Address: ${fields.serviceAddress}`);
+  if (fields.issueSummary) parts.push(`Issue: ${fields.issueSummary}`);
+
+  if (!parts.length) {
+    const transcriptText = Array.isArray(session.transcript)
+      ? session.transcript.map((t) => `[${t.role}] ${t.text}`).join(" ")
+      : "";
+    return transcriptText.slice(0, 500);
+  }
+
+  return parts.join(" | ");
 }
 
 function finalizeSession(callSid) {
   const session = liveSessions.get(callSid);
   if (!session) return;
 
+  session.activeSpeaker = "";
+  session.summary = buildCallSummary(session);
+
   updateCallRecord(callSid, {
     transcript: session.transcript,
     extractedFields: session.fields,
+    summary: session.summary || "",
     liveStatus: session.status,
   });
 
-  // 保留一段时间给监控页看，之后自动清掉
+  broadcastLiveState();
+
   setTimeout(() => {
     liveSessions.delete(callSid);
     broadcastLiveState();
@@ -464,6 +474,11 @@ function attachRealtimeBridge(server) {
 
         if (msg.type === "response.audio_transcript.delta" && msg.delta) {
           console.log("AI transcript delta:", msg.delta);
+
+          updateLiveSession(callSid, {
+            activeSpeaker: "assistant",
+          });
+
           appendTranscript(callSid, "assistant", msg.delta);
         }
 
@@ -472,11 +487,20 @@ function attachRealtimeBridge(server) {
           msg.transcript
         ) {
           console.log("Caller transcript:", msg.transcript);
-           appendTranscript(callSid, "caller", msg.transcript);
+
+          updateLiveSession(callSid, {
+            activeSpeaker: "caller",
+          });
+
+          appendTranscript(callSid, "caller", msg.transcript);
         }
 
         if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
           console.log("OpenAI audio delta received, length:", msg.delta.length);
+
+          updateLiveSession(callSid, {
+            activeSpeaker: "assistant",
+          });
 
           const mediaMsg = {
             event: "media",
@@ -517,9 +541,9 @@ function attachRealtimeBridge(server) {
 
         if (msg.event === "start") {
           streamSid = msg.start?.streamSid || null;
-          callSid = msg.start?.callSid || msg.start?.customParameters?.CallSid || null;
+          callSid =
+            msg.start?.callSid || msg.start?.customParameters?.CallSid || null;
 
-          // 某些情况下 callSid 在 start.customParameters 里没有，我们后面用状态回调补
           twilioStarted = true;
 
           console.log("Twilio stream started:", streamSid);
@@ -529,6 +553,7 @@ function attachRealtimeBridge(server) {
             ensureLiveSession(callSid, {
               streamSid,
               status: "in_progress",
+              selection: "ai_mode",
             });
             updateLiveSession(callSid, {
               streamSid,
@@ -566,6 +591,7 @@ function attachRealtimeBridge(server) {
           if (callSid) {
             updateLiveSession(callSid, {
               status: "stream_stopped",
+              activeSpeaker: "",
             });
             updateCallRecord(callSid, {
               stage: "ai_stream_stopped",
@@ -587,6 +613,7 @@ function attachRealtimeBridge(server) {
       if (callSid) {
         updateLiveSession(callSid, {
           status: "stream_closed",
+          activeSpeaker: "",
         });
       }
 
@@ -622,7 +649,9 @@ app.get("/live/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
+  if (typeof res.flushHeaders === "function") {
+    res.flushHeaders();
+  }
 
   const sendInitial = JSON.stringify({
     type: "snapshot",
@@ -735,6 +764,10 @@ app.get("/live", (req, res) => {
       font-size: 14px;
       line-height: 1.5;
     }
+    .bubble.active {
+      outline: 3px solid #2563eb;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
+    }
     .caller {
       background: #fef3c7;
     }
@@ -758,6 +791,8 @@ app.get("/live", (req, res) => {
       border-radius: 10px;
       padding: 10px;
       min-height: 18px;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .status {
       display: inline-block;
@@ -850,6 +885,10 @@ app.get("/live", (req, res) => {
             <div class="field-label">Issue Summary</div>
             <div class="field-value" id="fieldIssue"></div>
           </div>
+          <div class="field">
+            <div class="field-label">Call Summary</div>
+            <div class="field-value" id="fieldSummary"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -884,6 +923,7 @@ app.get("/live", (req, res) => {
             <div class="muted">CallSid: \${escapeHtml(s.callSid || "-")}</div>
             <div class="muted">Status: <span class="status">\${escapeHtml(s.status || "unknown")}</span></div>
             <div class="muted">Intent: \${escapeHtml((s.fields && s.fields.intent) || "-")}</div>
+            <div class="muted">Summary: \${escapeHtml((s.summary || "").slice(0, 80) || "-")}</div>
           </div>
         \`;
       }).join("");
@@ -905,15 +945,21 @@ app.get("/live", (req, res) => {
         document.getElementById("fieldCallback").textContent = "";
         document.getElementById("fieldAddress").textContent = "";
         document.getElementById("fieldIssue").textContent = "";
+        document.getElementById("fieldSummary").textContent = "";
         return;
       }
 
       const transcript = Array.isArray(session.transcript) ? session.transcript : [];
+      const activeSpeaker = session.activeSpeaker || "";
+
       transcriptBox.innerHTML = transcript.length
-        ? transcript.map(t => {
+        ? transcript.map((t, idx) => {
             const cls = t.role === "caller" ? "caller" : t.role === "assistant" ? "assistant" : "system";
+            const isLast = idx === transcript.length - 1;
+            const activeClass = isLast && t.role === activeSpeaker ? "active" : "";
+
             return \`
-              <div class="bubble \${cls}">
+              <div class="bubble \${cls} \${activeClass}">
                 <strong>\${escapeHtml(t.role)}:</strong><br/>
                 \${escapeHtml(t.text || "")}
               </div>
@@ -930,6 +976,7 @@ app.get("/live", (req, res) => {
       document.getElementById("fieldCallback").textContent = (session.fields && session.fields.callbackNumber) || "";
       document.getElementById("fieldAddress").textContent = (session.fields && session.fields.serviceAddress) || "";
       document.getElementById("fieldIssue").textContent = (session.fields && session.fields.issueSummary) || "";
+      document.getElementById("fieldSummary").textContent = session.summary || "";
     }
 
     function selectSession(callSid) {
@@ -1072,6 +1119,7 @@ app.post("/twilio/voice/incoming", (req, res) => {
     direction: "incoming",
     status: "started",
     startedAt: new Date().toISOString(),
+    selection: appMode === "ai" ? "ai_mode" : "",
   });
 
   updateLiveSession(callSid, {
@@ -1079,6 +1127,7 @@ app.post("/twilio/voice/incoming", (req, res) => {
     to,
     direction: "incoming",
     status: "started",
+    selection: appMode === "ai" ? "ai_mode" : "",
   });
 
   if (appMode === "ai") {
@@ -1124,6 +1173,7 @@ app.post("/twilio/voice/outbound", (req, res) => {
     direction: "outbound",
     status: "started",
     startedAt: new Date().toISOString(),
+    selection: mode === "ai" ? "ai_mode" : "",
   });
 
   updateLiveSession(callSid, {
@@ -1131,6 +1181,7 @@ app.post("/twilio/voice/outbound", (req, res) => {
     to,
     direction: "outbound",
     status: "started",
+    selection: mode === "ai" ? "ai_mode" : "",
   });
 
   if (mode === "ai") {
@@ -1234,7 +1285,10 @@ app.post("/twilio/voice/menu", (req, res) => {
   ensureLiveSession(callSid);
   updateLiveSession(callSid, {
     status: "menu_completed",
+    activeSpeaker: "",
+    selection: selectionLabel,
   });
+
   const session = liveSessions.get(callSid);
   if (session) {
     session.fields.intent = selectionLabel;
