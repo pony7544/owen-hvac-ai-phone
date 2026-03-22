@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
+const twilio = require("twilio");
 
 const app = express();
 
@@ -13,24 +14,56 @@ const DATA_DIR = path.join(__dirname, "data");
 const CALLS_FILE = path.join(DATA_DIR, "calls.json");
 
 const LIVE_AGENT_NUMBER = process.env.LIVE_AGENT_NUMBER || "";
+const APP_MODE = (process.env.APP_MODE || "menu").toLowerCase();
+
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+// 实时通话会话
+const liveSessions = new Map();
+
+// SSE 客户端集合
+const sseClients = new Set();
 
 const HVAC_SYSTEM_PROMPT = `
 You are the phone assistant for Owen HVAC Corp in Nova Scotia, Canada.
 
-Your job is to greet callers, ask what they need, and keep responses brief and clear in natural spoken English.
+Your role is to act like a professional phone intake coordinator for an HVAC company.
 
-You can help with:
-- new heat pump installation
-- service or repair
-- rebate or grant questions
+Your goals:
+1. Greet the caller briefly.
+2. Determine whether the call is about:
+   - new heat pump installation
+   - service or repair
+   - rebate or grant questions
+3. Collect these fields in a natural phone conversation:
+   - caller name
+   - callback number
+   - service address
+   - short issue summary or job request
+4. Confirm important details clearly.
+5. Keep responses short and spoken, not written.
 
 Rules:
-- keep answers short
-- ask one question at a time
-- do not promise pricing
-- do not give firm rebate eligibility decisions
-- if unsure, say a team member will follow up
-- collect callback number and service address when relevant
+- Ask one question at a time.
+- Be concise and professional.
+- Do not promise exact pricing.
+- Do not make final rebate eligibility decisions.
+- If unsure, say a team member will follow up.
+- If the caller gives an address or phone number, repeat it back clearly for confirmation.
+- After collecting enough information, summarize the call and say the team will follow up shortly.
+
+Important classification hints:
+- "install", "new heat pump", "quote", "estimate", "replace system" => new_installation
+- "service", "repair", "not working", "error code", "broken", "no heat" => service_or_repair
+- "rebate", "grant", "program", "efficiency", "incentive" => rebate_questions
 `;
 
 function ensureStorage() {
@@ -86,7 +119,172 @@ function updateCallRecord(callSid, updates) {
   saveAllCalls(calls);
 }
 
-ensureStorage();
+function getLiveState() {
+  return Array.from(liveSessions.values()).sort((a, b) => {
+    return new Date(b.startedAt || 0) - new Date(a.startedAt || 0);
+  });
+}
+
+function broadcastLiveState() {
+  const payload = JSON.stringify({
+    type: "snapshot",
+    sessions: getLiveState(),
+  });
+
+  for (const res of sseClients) {
+    try {
+      res.write(`data: ${payload}\n\n`);
+    } catch (err) {
+      console.error("SSE write error:", err);
+    }
+  }
+}
+
+function ensureLiveSession(callSid, initial = {}) {
+  if (!callSid) return null;
+
+  if (!liveSessions.has(callSid)) {
+    liveSessions.set(callSid, {
+      callSid,
+      from: initial.from || "",
+      to: initial.to || "",
+      status: initial.status || "started",
+      streamSid: initial.streamSid || "",
+      direction: initial.direction || "incoming",
+      startedAt: initial.startedAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      transcript: [],
+      fields: {
+        intent: "",
+        callerName: "",
+        callbackNumber: "",
+        serviceAddress: "",
+        issueSummary: "",
+      },
+    });
+  }
+
+  return liveSessions.get(callSid);
+}
+
+function updateLiveSession(callSid, updates = {}) {
+  const session = ensureLiveSession(callSid);
+  if (!session) return null;
+
+  Object.assign(session, updates, {
+    updatedAt: new Date().toISOString(),
+  });
+
+  broadcastLiveState();
+  return session;
+}
+
+function pushTranscript(callSid, role, text) {
+  if (!callSid || !text) return;
+  const session = ensureLiveSession(callSid);
+  if (!session) return;
+
+  session.transcript.push({
+    role,
+    text,
+    at: new Date().toISOString(),
+  });
+  session.updatedAt = new Date().toISOString();
+
+  extractFieldsFromText(session, role, text);
+  broadcastLiveState();
+}
+
+function extractFieldsFromText(session, role, text) {
+  if (!session || !text) return;
+  const lower = text.toLowerCase();
+
+  // intent
+  if (!session.fields.intent) {
+    if (
+      lower.includes("install") ||
+      lower.includes("new heat pump") ||
+      lower.includes("quote") ||
+      lower.includes("estimate") ||
+      lower.includes("replace")
+    ) {
+      session.fields.intent = "new_installation";
+    } else if (
+      lower.includes("service") ||
+      lower.includes("repair") ||
+      lower.includes("error code") ||
+      lower.includes("not working") ||
+      lower.includes("broken") ||
+      lower.includes("no heat") ||
+      lower.includes("no cooling")
+    ) {
+      session.fields.intent = "service_or_repair";
+    } else if (
+      lower.includes("rebate") ||
+      lower.includes("grant") ||
+      lower.includes("program") ||
+      lower.includes("incentive") ||
+      lower.includes("efficiency")
+    ) {
+      session.fields.intent = "rebate_questions";
+    }
+  }
+
+  if (role !== "caller") return;
+
+  // name
+  const namePatterns = [
+    /my name is ([a-z ,.'-]+)/i,
+    /this is ([a-z ,.'-]+)/i,
+    /i am ([a-z ,.'-]+)/i,
+    /i'm ([a-z ,.'-]+)/i,
+  ];
+  for (const p of namePatterns) {
+    const m = text.match(p);
+    if (m && !session.fields.callerName) {
+      session.fields.callerName = m[1].trim();
+      break;
+    }
+  }
+
+  // callback number
+  const phoneMatch = text.match(
+    /(\+?1?[\s\-().]*\d{3}[\s\-().]*\d{3}[\s\-().]*\d{4})/
+  );
+  if (phoneMatch && !session.fields.callbackNumber) {
+    session.fields.callbackNumber = phoneMatch[1].trim();
+  }
+
+  // service address
+  const addressMatch = text.match(
+    /\b\d{1,6}\s+[A-Za-z0-9.'-]+\s+(Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Lane|Ln|Court|Ct|Boulevard|Blvd|Highway|Hwy|Way|Place|Pl|Terrace|Ter)\b.*?/i
+  );
+  if (addressMatch && !session.fields.serviceAddress) {
+    session.fields.serviceAddress = addressMatch[0].trim();
+  }
+
+  // issue summary
+  if (text.trim().length > 12) {
+    session.fields.issueSummary = text.trim();
+  }
+}
+
+function finalizeSession(callSid) {
+  const session = liveSessions.get(callSid);
+  if (!session) return;
+
+  updateCallRecord(callSid, {
+    transcript: session.transcript,
+    extractedFields: session.fields,
+    liveStatus: session.status,
+  });
+
+  // 保留一段时间给监控页看，之后自动清掉
+  setTimeout(() => {
+    liveSessions.delete(callSid);
+    broadcastLiveState();
+  }, 5 * 60 * 1000);
+}
 
 function buildMenuTwiml(host) {
   const gatherActionUrl = `https://${host}/twilio/voice/menu`;
@@ -141,9 +339,8 @@ function attachRealtimeBridge(server) {
     let openAiReady = false;
     let twilioStarted = false;
     let initialGreetingSent = false;
-    let transcriptBuffer = [];
 
-    if (!process.env.OPENAI_API_KEY) {
+    if (!OPENAI_API_KEY) {
       console.error("OPENAI_API_KEY is missing");
       try {
         twilioWs.close();
@@ -155,7 +352,7 @@ function attachRealtimeBridge(server) {
       "wss://api.openai.com/v1/realtime?model=gpt-realtime",
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
           "OpenAI-Beta": "realtime=v1",
         },
       }
@@ -168,9 +365,9 @@ function attachRealtimeBridge(server) {
       const initialResponse = {
         type: "response.create",
         response: {
-          modalities: ["audio", "text"],
+          output_modalities: ["audio", "text"],
           instructions:
-            "Greet the caller and say: Thank you for calling Owen HVAC Corp. How can I help you today?",
+            "Greet the caller briefly and say: Thank you for calling Owen HVAC Corp. Are you calling about a new installation, service or repair, or rebate questions?",
         },
       };
 
@@ -194,8 +391,11 @@ function attachRealtimeBridge(server) {
             threshold: 0.5,
             prefix_padding_ms: 300,
             silence_duration_ms: 500,
-            create_response: true
-          }
+            create_response: true,
+          },
+          input_audio_transcription: {
+            model: "gpt-4o-mini-transcribe",
+          },
         },
       };
 
@@ -206,6 +406,10 @@ function attachRealtimeBridge(server) {
     openaiWs.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
+
+        if (msg.type) {
+          console.log("OpenAI raw event type:", msg.type);
+        }
 
         if (
           msg.type === "session.created" ||
@@ -219,27 +423,20 @@ function attachRealtimeBridge(server) {
           }
         }
 
-        // AI 文字 transcript（调试和保存）
         if (msg.type === "response.audio_transcript.delta" && msg.delta) {
           console.log("AI transcript delta:", msg.delta);
-          transcriptBuffer.push({
-            role: "assistant",
-            text: msg.delta,
-            at: new Date().toISOString(),
-          });
+          pushTranscript(callSid, "assistant", msg.delta);
         }
 
-        if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
-          transcriptBuffer.push({
-            console.log("Caller transcript:", msg.transcript);
-            role: "caller",
-            text: msg.transcript,
-            at: new Date().toISOString(),
-          });
+        if (
+          msg.type === "conversation.item.input_audio_transcription.completed" &&
+          msg.transcript
+        ) {
+          console.log("Caller transcript:", msg.transcript);
+          pushTranscript(callSid, "caller", msg.transcript);
         }
 
-        // 把 AI 音频回送给 Twilio
-       if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
+        if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
           console.log("OpenAI audio delta received, length:", msg.delta.length);
 
           const mediaMsg = {
@@ -248,11 +445,20 @@ function attachRealtimeBridge(server) {
             media: {
               payload: msg.delta,
             },
-        };
+          };
 
-      console.log("Sending audio back to Twilio stream:", streamSid);
-      twilioWs.send(JSON.stringify(mediaMsg));
-      }
+          twilioWs.send(JSON.stringify(mediaMsg));
+
+          twilioWs.send(
+            JSON.stringify({
+              event: "mark",
+              streamSid,
+              mark: { name: "ai-audio-chunk" },
+            })
+          );
+
+          console.log("Sent audio back to Twilio stream:", streamSid);
+        }
       } catch (err) {
         console.error("Failed to parse OpenAI message:", err);
       }
@@ -273,15 +479,27 @@ function attachRealtimeBridge(server) {
         if (msg.event === "start") {
           streamSid = msg.start?.streamSid || null;
           callSid = msg.start?.callSid || msg.start?.customParameters?.CallSid || null;
+
+          // 某些情况下 callSid 在 start.customParameters 里没有，我们后面用状态回调补
           twilioStarted = true;
 
           console.log("Twilio stream started:", streamSid);
           console.log("Twilio callSid:", callSid);
 
           if (callSid) {
+            ensureLiveSession(callSid, {
+              streamSid,
+              status: "in_progress",
+            });
+            updateLiveSession(callSid, {
+              streamSid,
+              status: "in_progress",
+              selection: "ai_mode",
+            });
             updateCallRecord(callSid, {
               stage: "ai_stream_started",
               streamSid,
+              selection: "ai_mode",
             });
           }
 
@@ -299,12 +517,18 @@ function attachRealtimeBridge(server) {
           }
         }
 
+        if (msg.event === "mark") {
+          console.log("Twilio mark event:", JSON.stringify(msg.mark || {}));
+        }
+
         if (msg.event === "stop") {
           console.log("Twilio stream stopped");
 
-          if (callSid && transcriptBuffer.length) {
+          if (callSid) {
+            updateLiveSession(callSid, {
+              status: "stream_stopped",
+            });
             updateCallRecord(callSid, {
-              transcript: transcriptBuffer,
               stage: "ai_stream_stopped",
             });
           }
@@ -321,10 +545,9 @@ function attachRealtimeBridge(server) {
     twilioWs.on("close", () => {
       console.log("=== Twilio websocket disconnected ===");
 
-      if (callSid && transcriptBuffer.length) {
-        updateCallRecord(callSid, {
-          transcript: transcriptBuffer,
-          stage: "ai_stream_closed",
+      if (callSid) {
+        updateLiveSession(callSid, {
+          status: "stream_closed",
         });
       }
 
@@ -339,6 +562,8 @@ function attachRealtimeBridge(server) {
   });
 }
 
+ensureStorage();
+
 app.get("/", (req, res) => {
   res.send("Owen HVAC phone system is running.");
 });
@@ -351,339 +576,381 @@ app.get("/calls", (req, res) => {
 });
 
 app.get("/dashboard", (req, res) => {
+  res.redirect("/live");
+});
+
+app.get("/live/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const sendInitial = JSON.stringify({
+    type: "snapshot",
+    sessions: getLiveState(),
+  });
+  res.write(`data: ${sendInitial}\n\n`);
+
+  sseClients.add(res);
+
+  req.on("close", () => {
+    sseClients.delete(res);
+  });
+});
+
+app.get("/live", (req, res) => {
   const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Owen HVAC Call Dashboard</title>
+  <title>Owen HVAC Live Monitor</title>
   <style>
     body {
-      font-family: Arial, sans-serif;
       margin: 0;
-      background: #f5f7fb;
-      color: #1f2937;
+      font-family: Arial, sans-serif;
+      background: #f4f6fb;
+      color: #111827;
     }
     .wrap {
-      max-width: 1200px;
+      max-width: 1400px;
       margin: 0 auto;
-      padding: 24px;
+      padding: 20px;
     }
     h1 {
       margin: 0 0 8px;
-      font-size: 28px;
     }
     .sub {
       color: #6b7280;
-      margin-bottom: 20px;
-    }
-    .toolbar {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
       margin-bottom: 16px;
     }
-    input, select, button {
-      padding: 10px 12px;
-      border: 1px solid #d1d5db;
-      border-radius: 8px;
-      font-size: 14px;
-    }
-    button {
-      cursor: pointer;
-      background: #111827;
-      color: white;
-      border: none;
-    }
-    .stats {
+    .topbar {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 20px;
+      grid-template-columns: 1fr 380px;
+      gap: 16px;
+      margin-bottom: 16px;
     }
     .card {
       background: white;
-      border-radius: 14px;
+      border-radius: 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
       padding: 16px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
-    .card .label {
-      color: #6b7280;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-    .card .value {
-      font-size: 24px;
-      font-weight: bold;
-    }
-    table {
+    .dial-box input, .dial-box select, .dial-box button {
       width: 100%;
-      border-collapse: collapse;
-      background: white;
-      border-radius: 14px;
-      overflow: hidden;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-    }
-    th, td {
-      padding: 12px 14px;
-      border-bottom: 1px solid #e5e7eb;
-      text-align: left;
+      box-sizing: border-box;
+      margin-bottom: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
       font-size: 14px;
-      vertical-align: top;
     }
-    th {
+    .dial-box button {
       background: #111827;
       color: white;
-      font-weight: 600;
+      border: none;
+      cursor: pointer;
     }
-    tr:hover {
+    .layout {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 16px;
+    }
+    .session-list {
+      max-height: 75vh;
+      overflow: auto;
+    }
+    .session-item {
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .session-item.active {
+      border-color: #2563eb;
+      background: #eff6ff;
+    }
+    .session-title {
+      font-weight: bold;
+      margin-bottom: 4px;
+    }
+    .muted {
+      color: #6b7280;
+      font-size: 13px;
+    }
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 16px;
+    }
+    .transcript-box {
+      max-height: 75vh;
+      overflow: auto;
+    }
+    .bubble {
+      padding: 10px 12px;
+      border-radius: 12px;
+      margin-bottom: 10px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .caller {
+      background: #fef3c7;
+    }
+    .assistant {
+      background: #dbeafe;
+    }
+    .system {
+      background: #e5e7eb;
+    }
+    .field {
+      margin-bottom: 12px;
+    }
+    .field-label {
+      font-size: 12px;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
+    .field-value {
       background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 10px;
+      min-height: 18px;
     }
-    .badge {
+    .status {
       display: inline-block;
       padding: 4px 8px;
       border-radius: 999px;
+      background: #dcfce7;
+      color: #166534;
       font-size: 12px;
       font-weight: 600;
     }
-    .status-completed { background: #dcfce7; color: #166534; }
-    .status-started { background: #dbeafe; color: #1d4ed8; }
-    .status-failed { background: #fee2e2; color: #991b1b; }
-    .status-unknown { background: #e5e7eb; color: #374151; }
-    .sel-install { background: #ede9fe; color: #5b21b6; }
-    .sel-service { background: #fef3c7; color: #92400e; }
-    .sel-rebate { background: #cffafe; color: #155e75; }
-    .sel-transfer { background: #fee2e2; color: #9f1239; }
-    .sel-invalid { background: #e5e7eb; color: #374151; }
-    .sel-ai { background: #dbeafe; color: #1d4ed8; }
-    .muted {
-      color: #6b7280;
-    }
-    .empty {
-      background: white;
-      padding: 24px;
-      border-radius: 14px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-      color: #6b7280;
-    }
-    pre {
-      white-space: pre-wrap;
-      word-break: break-word;
-      margin: 0;
+    .small {
       font-size: 12px;
-      color: #374151;
     }
-    @media (max-width: 900px) {
-      .stats {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-      table, thead, tbody, th, td, tr {
-        display: block;
-      }
-      thead {
-        display: none;
-      }
-      tr {
-        margin-bottom: 12px;
-        background: white;
-        border-radius: 14px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-        overflow: hidden;
-      }
-      td {
-        border-bottom: 1px solid #e5e7eb;
-      }
-      td::before {
-        content: attr(data-label);
-        display: block;
-        font-size: 12px;
-        color: #6b7280;
-        margin-bottom: 4px;
+    @media (max-width: 1100px) {
+      .topbar, .layout, .main-grid {
+        grid-template-columns: 1fr;
       }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Owen HVAC Call Dashboard</h1>
-    <div class="sub">Live call records from your phone front desk.</div>
+    <h1>Owen HVAC Live Monitor</h1>
+    <div class="sub">Real-time phone call transcript + AI intake fields + outbound call launcher.</div>
 
-    <div class="toolbar">
-      <input id="searchInput" type="text" placeholder="Search phone / CallSid / selection" />
-      <select id="statusFilter">
-        <option value="">All statuses</option>
-        <option value="started">started</option>
-        <option value="completed">completed</option>
-        <option value="failed">failed</option>
-      </select>
-      <select id="selectionFilter">
-        <option value="">All selections</option>
-        <option value="new_installation">new_installation</option>
-        <option value="service_or_repair">service_or_repair</option>
-        <option value="rebate_questions">rebate_questions</option>
-        <option value="transfer_to_agent">transfer_to_agent</option>
-        <option value="invalid">invalid</option>
-        <option value="ai_mode">ai_mode</option>
-      </select>
-      <button id="refreshBtn">Refresh</button>
-    </div>
+    <div class="topbar">
+      <div class="card">
+        <div><strong>System mode:</strong> ${APP_MODE}</div>
+        <div class="small muted" style="margin-top:8px;">
+          Open this page during a call to see transcript updates in real time.
+        </div>
+      </div>
 
-    <div class="stats">
-      <div class="card">
-        <div class="label">Total Calls</div>
-        <div class="value" id="statTotal">0</div>
-      </div>
-      <div class="card">
-        <div class="label">Completed</div>
-        <div class="value" id="statCompleted">0</div>
-      </div>
-      <div class="card">
-        <div class="label">Service / Repair</div>
-        <div class="value" id="statService">0</div>
-      </div>
-      <div class="card">
-        <div class="label">AI Mode Calls</div>
-        <div class="value" id="statAi">0</div>
+      <div class="card dial-box">
+        <h3 style="margin-top:0;">Place outbound AI call</h3>
+        <input id="dialTo" type="text" placeholder="+1902XXXXXXX" />
+        <select id="dialMode">
+          <option value="ai">AI mode</option>
+          <option value="menu">Menu mode</option>
+        </select>
+        <button id="dialBtn">Call now</button>
+        <div id="dialResult" class="muted small"></div>
       </div>
     </div>
 
-    <div id="tableWrap"></div>
+    <div class="layout">
+      <div class="card session-list" id="sessionList"></div>
+
+      <div class="main-grid">
+        <div class="card transcript-box">
+          <h3 style="margin-top:0;">Live Transcript</h3>
+          <div id="transcriptBox" class="muted">No active call selected.</div>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0;">Extracted Fields</h3>
+          <div class="field">
+            <div class="field-label">Call SID</div>
+            <div class="field-value" id="fieldCallSid"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">From</div>
+            <div class="field-value" id="fieldFrom"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">To</div>
+            <div class="field-value" id="fieldTo"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Status</div>
+            <div class="field-value" id="fieldStatus"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Intent</div>
+            <div class="field-value" id="fieldIntent"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Caller Name</div>
+            <div class="field-value" id="fieldName"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Callback Number</div>
+            <div class="field-value" id="fieldCallback"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Service Address</div>
+            <div class="field-value" id="fieldAddress"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Issue Summary</div>
+            <div class="field-value" id="fieldIssue"></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
-    let allCalls = [];
+    let sessions = [];
+    let selectedCallSid = null;
 
-    function statusBadge(status) {
-      const safe = (status || "unknown").toLowerCase();
-      const cls = ["completed", "started", "failed"].includes(safe) ? safe : "unknown";
-      return '<span class="badge status-' + cls + '">' + safe + '</span>';
+    function escapeHtml(value = "") {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
-    function selectionBadge(selection) {
-      const map = {
-        new_installation: ["New Installation", "sel-install"],
-        service_or_repair: ["Service / Repair", "sel-service"],
-        rebate_questions: ["Rebate Questions", "sel-rebate"],
-        transfer_to_agent: ["Transfer to Agent", "sel-transfer"],
-        invalid: ["Invalid", "sel-invalid"],
-        ai_mode: ["AI Mode", "sel-ai"],
-        "": ["-", "sel-invalid"]
-      };
-      const val = map[selection || ""] || [selection, "sel-invalid"];
-      return '<span class="badge ' + val[1] + '">' + val[0] + '</span>';
-    }
+    function renderSessionList() {
+      const el = document.getElementById("sessionList");
 
-    function fmtDate(value) {
-      if (!value) return "-";
-      const d = new Date(value);
-      if (Number.isNaN(d.getTime())) return value;
-      return d.toLocaleString();
-    }
-
-    function renderStats(calls) {
-      document.getElementById("statTotal").textContent = calls.length;
-      document.getElementById("statCompleted").textContent =
-        calls.filter(c => (c.callStatus || "").toLowerCase() === "completed").length;
-      document.getElementById("statService").textContent =
-        calls.filter(c => c.selection === "service_or_repair").length;
-      document.getElementById("statAi").textContent =
-        calls.filter(c => c.selection === "ai_mode").length;
-    }
-
-    function renderTable(calls) {
-      const wrap = document.getElementById("tableWrap");
-
-      if (!calls.length) {
-        wrap.innerHTML = '<div class="empty">No call records found.</div>';
+      if (!sessions.length) {
+        el.innerHTML = '<div class="muted">No live or recent sessions.</div>';
         return;
       }
 
-      const rows = calls.map(call => {
-        const transcriptText = Array.isArray(call.transcript)
-          ? call.transcript.map(t => '[' + (t.role || 'unknown') + '] ' + (t.text || '')).join("\\n")
-          : "";
-
+      el.innerHTML = sessions.map(s => {
+        const activeClass = s.callSid === selectedCallSid ? "active" : "";
         return \`
-          <tr>
-            <td data-label="Time">\${fmtDate(call.createdAt)}</td>
-            <td data-label="From">\${call.from || "-"}</td>
-            <td data-label="To">\${call.to || "-"}</td>
-            <td data-label="Selection">\${selectionBadge(call.selection || "")}</td>
-            <td data-label="Status">\${statusBadge(call.callStatus || "unknown")}</td>
-            <td data-label="Digits">\${call.digits || "-"}</td>
-            <td data-label="Transcript"><pre>\${transcriptText || "-"}</pre></td>
-            <td data-label="CallSid"><span class="muted">\${call.callSid || "-"}</span></td>
-          </tr>
+          <div class="session-item \${activeClass}" onclick="selectSession('\${s.callSid}')">
+            <div class="session-title">\${escapeHtml(s.from || "Unknown caller")}</div>
+            <div class="muted">CallSid: \${escapeHtml(s.callSid || "-")}</div>
+            <div class="muted">Status: <span class="status">\${escapeHtml(s.status || "unknown")}</span></div>
+            <div class="muted">Intent: \${escapeHtml((s.fields && s.fields.intent) || "-")}</div>
+          </div>
         \`;
       }).join("");
-
-      wrap.innerHTML = \`
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>From</th>
-              <th>To</th>
-              <th>Selection</th>
-              <th>Status</th>
-              <th>Digits</th>
-              <th>Transcript</th>
-              <th>CallSid</th>
-            </tr>
-          </thead>
-          <tbody>\${rows}</tbody>
-        </table>
-      \`;
     }
 
-    function applyFilters() {
-      const q = document.getElementById("searchInput").value.trim().toLowerCase();
-      const status = document.getElementById("statusFilter").value;
-      const selection = document.getElementById("selectionFilter").value;
+    function renderSelectedSession() {
+      const session = sessions.find(s => s.callSid === selectedCallSid);
 
-      const filtered = allCalls.filter(call => {
-        const transcriptText = Array.isArray(call.transcript)
-          ? call.transcript.map(t => t.text || "").join(" ")
-          : "";
+      const transcriptBox = document.getElementById("transcriptBox");
 
-        const haystack = [
-          call.from || "",
-          call.to || "",
-          call.callSid || "",
-          call.selection || "",
-          call.callStatus || "",
-          call.digits || "",
-          transcriptText
-        ].join(" ").toLowerCase();
+      if (!session) {
+        transcriptBox.innerHTML = '<div class="muted">No active call selected.</div>';
+        document.getElementById("fieldCallSid").textContent = "";
+        document.getElementById("fieldFrom").textContent = "";
+        document.getElementById("fieldTo").textContent = "";
+        document.getElementById("fieldStatus").textContent = "";
+        document.getElementById("fieldIntent").textContent = "";
+        document.getElementById("fieldName").textContent = "";
+        document.getElementById("fieldCallback").textContent = "";
+        document.getElementById("fieldAddress").textContent = "";
+        document.getElementById("fieldIssue").textContent = "";
+        return;
+      }
 
-        const qMatch = !q || haystack.includes(q);
-        const statusMatch = !status || (call.callStatus || "").toLowerCase() === status;
-        const selectionMatch = !selection || (call.selection || "") === selection;
+      const transcript = Array.isArray(session.transcript) ? session.transcript : [];
+      transcriptBox.innerHTML = transcript.length
+        ? transcript.map(t => {
+            const cls = t.role === "caller" ? "caller" : t.role === "assistant" ? "assistant" : "system";
+            return \`
+              <div class="bubble \${cls}">
+                <strong>\${escapeHtml(t.role)}:</strong><br/>
+                \${escapeHtml(t.text || "")}
+              </div>
+            \`;
+          }).join("")
+        : '<div class="muted">No transcript yet.</div>';
 
-        return qMatch && statusMatch && selectionMatch;
-      });
-
-      renderStats(filtered);
-      renderTable(filtered);
+      document.getElementById("fieldCallSid").textContent = session.callSid || "";
+      document.getElementById("fieldFrom").textContent = session.from || "";
+      document.getElementById("fieldTo").textContent = session.to || "";
+      document.getElementById("fieldStatus").textContent = session.status || "";
+      document.getElementById("fieldIntent").textContent = (session.fields && session.fields.intent) || "";
+      document.getElementById("fieldName").textContent = (session.fields && session.fields.callerName) || "";
+      document.getElementById("fieldCallback").textContent = (session.fields && session.fields.callbackNumber) || "";
+      document.getElementById("fieldAddress").textContent = (session.fields && session.fields.serviceAddress) || "";
+      document.getElementById("fieldIssue").textContent = (session.fields && session.fields.issueSummary) || "";
     }
 
-    async function loadCalls() {
-      const res = await fetch("/calls", { cache: "no-store" });
-      const data = await res.json();
-      allCalls = Array.isArray(data)
-        ? data.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
-        : [];
-      applyFilters();
+    function selectSession(callSid) {
+      selectedCallSid = callSid;
+      renderSessionList();
+      renderSelectedSession();
     }
 
-    document.getElementById("refreshBtn").addEventListener("click", loadCalls);
-    document.getElementById("searchInput").addEventListener("input", applyFilters);
-    document.getElementById("statusFilter").addEventListener("change", applyFilters);
-    document.getElementById("selectionFilter").addEventListener("change", applyFilters);
+    window.selectSession = selectSession;
 
-    loadCalls();
-    setInterval(loadCalls, 10000);
+    function applySnapshot(data) {
+      sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      if (!selectedCallSid && sessions.length) {
+        selectedCallSid = sessions[0].callSid;
+      }
+      if (selectedCallSid && !sessions.find(s => s.callSid === selectedCallSid)) {
+        selectedCallSid = sessions.length ? sessions[0].callSid : null;
+      }
+      renderSessionList();
+      renderSelectedSession();
+    }
+
+    const es = new EventSource("/live/events");
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "snapshot") {
+          applySnapshot(data);
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    document.getElementById("dialBtn").addEventListener("click", async () => {
+      const to = document.getElementById("dialTo").value.trim();
+      const mode = document.getElementById("dialMode").value;
+      const result = document.getElementById("dialResult");
+
+      result.textContent = "Calling...";
+
+      try {
+        const res = await fetch("/admin/call", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ to, mode })
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          result.textContent = data.error || "Failed to place call.";
+          return;
+        }
+
+        result.textContent = "Call started. CallSid: " + (data.callSid || "");
+      } catch (err) {
+        result.textContent = "Request failed.";
+      }
+    });
   </script>
 </body>
 </html>
@@ -691,6 +958,48 @@ app.get("/dashboard", (req, res) => {
 
   res.type("text/html");
   res.send(html);
+});
+
+app.post("/admin/call", async (req, res) => {
+  try {
+    if (!twilioClient) {
+      return res.status(500).json({
+        error: "Twilio client is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER.",
+      });
+    }
+
+    const to = String(req.body.to || "").trim();
+    const mode = String(req.body.mode || "ai").trim().toLowerCase();
+
+    if (!to) {
+      return res.status(400).json({ error: "Phone number is required." });
+    }
+
+    const host = req.get("host");
+    const voiceUrl =
+      mode === "menu"
+        ? `https://${host}/twilio/voice/outbound?mode=menu`
+        : `https://${host}/twilio/voice/outbound?mode=ai`;
+
+    const call = await twilioClient.calls.create({
+      to,
+      from: TWILIO_PHONE_NUMBER,
+      url: voiceUrl,
+      method: "POST",
+      statusCallback: `https://${host}/twilio/voice/status`,
+      statusCallbackMethod: "POST",
+    });
+
+    return res.json({
+      ok: true,
+      callSid: call.sid,
+    });
+  } catch (err) {
+    console.error("Outbound call failed:", err);
+    return res.status(500).json({
+      error: err.message || "Outbound call failed.",
+    });
+  }
 });
 
 app.post("/twilio/voice/incoming", (req, res) => {
@@ -713,11 +1022,79 @@ app.post("/twilio/voice/incoming", (req, res) => {
     selection: appMode === "ai" ? "ai_mode" : "",
     digits: "",
     callStatus: "started",
+    direction: "incoming",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
 
+  ensureLiveSession(callSid, {
+    from,
+    to,
+    direction: "incoming",
+    status: "started",
+    startedAt: new Date().toISOString(),
+  });
+
+  updateLiveSession(callSid, {
+    from,
+    to,
+    direction: "incoming",
+    status: "started",
+  });
+
   if (appMode === "ai") {
+    const twiml = buildAiStreamTwiml(host);
+    res.type("text/xml");
+    res.send(twiml);
+    return;
+  }
+
+  const twiml = buildMenuTwiml(host);
+  res.type("text/xml");
+  res.send(twiml);
+});
+
+app.post("/twilio/voice/outbound", (req, res) => {
+  console.log("=== Outbound Call TwiML Request ===");
+  console.log("From:", req.body.From);
+  console.log("To:", req.body.To);
+  console.log("CallSid:", req.body.CallSid);
+
+  const from = req.body.From || "";
+  const to = req.body.To || "";
+  const callSid = req.body.CallSid || "";
+  const host = req.get("host");
+  const mode = String(req.query.mode || "ai").toLowerCase();
+
+  saveCallRecord({
+    callSid,
+    from,
+    to,
+    stage: "outbound_started",
+    selection: mode === "ai" ? "ai_mode" : "",
+    digits: "",
+    callStatus: "started",
+    direction: "outbound",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  ensureLiveSession(callSid, {
+    from,
+    to,
+    direction: "outbound",
+    status: "started",
+    startedAt: new Date().toISOString(),
+  });
+
+  updateLiveSession(callSid, {
+    from,
+    to,
+    direction: "outbound",
+    status: "started",
+  });
+
+  if (mode === "ai") {
     const twiml = buildAiStreamTwiml(host);
     res.type("text/xml");
     res.send(twiml);
@@ -815,6 +1192,17 @@ app.post("/twilio/voice/menu", (req, res) => {
     digits,
   });
 
+  ensureLiveSession(callSid);
+  updateLiveSession(callSid, {
+    status: "menu_completed",
+  });
+  const session = liveSessions.get(callSid);
+  if (session) {
+    session.fields.intent = selectionLabel;
+    session.updatedAt = new Date().toISOString();
+  }
+  broadcastLiveState();
+
   res.type("text/xml");
   res.send(twiml);
 });
@@ -828,12 +1216,26 @@ app.post("/twilio/voice/status", (req, res) => {
   console.log("Timestamp:", new Date().toISOString());
 
   const callSid = req.body.CallSid || "";
+  const callStatus = req.body.CallStatus || "unknown";
+  const from = req.body.From || "";
+  const to = req.body.To || "";
 
   updateCallRecord(callSid, {
-    callStatus: req.body.CallStatus || "unknown",
-    from: req.body.From || "",
-    to: req.body.To || "",
+    callStatus,
+    from,
+    to,
   });
+
+  ensureLiveSession(callSid, { from, to });
+  updateLiveSession(callSid, {
+    from,
+    to,
+    status: callStatus,
+  });
+
+  if (["completed", "failed", "busy", "no-answer", "canceled"].includes(callStatus)) {
+    finalizeSession(callSid);
+  }
 
   res.sendStatus(200);
 });
