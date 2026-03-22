@@ -178,7 +178,46 @@ function updateLiveSession(callSid, updates = {}) {
   broadcastLiveState();
   return session;
 }
+function appendTranscript(callSid, role, text) {
+  if (!callSid || !text) return;
 
+  const session = ensureLiveSession(callSid);
+  if (!session) return;
+
+  if (!Array.isArray(session.transcript)) {
+    session.transcript = [];
+  }
+
+  const clean = String(text).replace(/\s+/g, " ").trim();
+  if (!clean) return;
+
+  const last = session.transcript[session.transcript.length - 1];
+
+  // 如果上一条就是同一个角色，就直接拼接，不新开行
+  if (last && last.role === role) {
+    const needsSpace =
+      last.text &&
+      !last.text.endsWith(" ") &&
+      ![".", ",", "!", "?", ":", ";"].includes(clean[0]);
+
+    last.text = `${last.text}${needsSpace ? " " : ""}${clean}`.trim();
+    last.at = new Date().toISOString();
+  } else {
+    session.transcript.push({
+      role,
+      text: clean,
+      at: new Date().toISOString(),
+    });
+  }
+
+  session.updatedAt = new Date().toISOString();
+
+  if (role === "caller") {
+    extractFieldsFromText(session, role, clean);
+  }
+
+  broadcastLiveState();
+}
 function pushTranscript(callSid, role, text) {
   if (!callSid || !text) return;
   const session = ensureLiveSession(callSid);
@@ -425,7 +464,7 @@ function attachRealtimeBridge(server) {
 
         if (msg.type === "response.audio_transcript.delta" && msg.delta) {
           console.log("AI transcript delta:", msg.delta);
-          pushTranscript(callSid, "assistant", msg.delta);
+          appendTranscript(callSid, "assistant", msg.delta);
         }
 
         if (
@@ -433,7 +472,7 @@ function attachRealtimeBridge(server) {
           msg.transcript
         ) {
           console.log("Caller transcript:", msg.transcript);
-          pushTranscript(callSid, "caller", msg.transcript);
+           appendTranscript(callSid, "caller", msg.transcript);
         }
 
         if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
