@@ -1,3 +1,4 @@
+const { HVACCalendarService } = require("./service");
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -9,6 +10,8 @@ const app = express();
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+let calendarService = null;
+
 
 const DATA_DIR = path.join(__dirname, "data");
 const CALLS_FILE = path.join(DATA_DIR, "calls.json");
@@ -65,7 +68,12 @@ Important classification hints:
 - "service", "repair", "not working", "error code", "broken", "no heat" => service_or_repair
 - "rebate", "grant", "program", "efficiency", "incentive" => rebate_questions
 `;
-
+function getCalendarService() {
+  if (!calendarService) {
+    calendarService = new HVACCalendarService();
+  }
+  return calendarService;
+}
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1045,6 +1053,81 @@ app.get("/live", (req, res) => {
   res.type("text/html");
   res.send(html);
 });
+
+app.get("/test/calendar", async (req, res) => {
+  try {
+    const svc = getCalendarService();
+    const info = await svc.getCalendarInfo();
+    res.json({
+      ok: true,
+      calendar: info,
+    });
+  } catch (err) {
+    console.error("Calendar info test failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
+
+app.get("/test/calendar/slots", async (req, res) => {
+  try {
+    const svc = getCalendarService();
+
+    const now = new Date();
+    const end = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+
+    const slots = await svc.getAvailableSlots({
+      start: now,
+      end,
+      maxSlots: 5,
+    });
+
+    res.json({
+      ok: true,
+      count: slots.length,
+      slots,
+    });
+  } catch (err) {
+    console.error("Calendar slots test failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
+
+app.get("/test/calendar/slots", async (req, res) => {
+  try {
+    const svc = getCalendarService();
+
+    const now = new Date();
+    const end = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+
+    const slots = await svc.getAvailableSlots({
+      start: now,
+      end,
+      maxSlots: 5,
+    });
+
+    res.json({
+      ok: true,
+      count: slots.length,
+      slots,
+    });
+  } catch (err) {
+    console.error("Calendar slots test failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
+
+
+
+
 
 app.post("/admin/call", async (req, res) => {
   try {
