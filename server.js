@@ -10,8 +10,8 @@ const app = express();
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-let calendarService = null;
 
+let calendarService = null;
 
 const DATA_DIR = path.join(__dirname, "data");
 const CALLS_FILE = path.join(DATA_DIR, "calls.json");
@@ -23,6 +23,12 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
+const DEFAULT_APPOINTMENT_MINUTES = Number(
+  process.env.DEFAULT_APPOINTMENT_MINUTES || 60
+);
+
+const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || "America/Halifax";
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
@@ -68,12 +74,14 @@ Important classification hints:
 - "service", "repair", "not working", "error code", "broken", "no heat" => service_or_repair
 - "rebate", "grant", "program", "efficiency", "incentive" => rebate_questions
 `;
+
 function getCalendarService() {
   if (!calendarService) {
     calendarService = new HVACCalendarService();
   }
   return calendarService;
 }
+
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -232,6 +240,7 @@ function extractFieldsFromText(session, role, text) {
     /i am ([a-z ,.'-]+)/i,
     /i'm ([a-z ,.'-]+)/i,
   ];
+
   for (const p of namePatterns) {
     const m = text.match(p);
     if (m && !session.fields.callerName) {
@@ -380,6 +389,22 @@ function buildAiStreamTwiml(host) {
     <Stream url="${streamUrl}" />
   </Connect>
 </Response>`.trim();
+}
+
+function parseDateRangeFromQuery(dateStr) {
+  const date = String(dateStr || "").trim();
+  if (!date) {
+    throw new Error("date is required, format: YYYY-MM-DD");
+  }
+
+  const start = new Date(`${date}T00:00:00-03:00`);
+  const end = new Date(`${date}T23:59:59-03:00`);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw new Error("Invalid date format. Use YYYY-MM-DD");
+  }
+
+  return { start, end, date };
 }
 
 function attachRealtimeBridge(server) {
@@ -1054,6 +1079,10 @@ app.get("/live", (req, res) => {
   res.send(html);
 });
 
+// =========================
+// Calendar test routes
+// =========================
+
 app.get("/test/calendar", async (req, res) => {
   try {
     const svc = getCalendarService();
@@ -1075,6 +1104,27 @@ app.get("/test/calendar/slots", async (req, res) => {
   try {
     const svc = getCalendarService();
 
+    if (req.query.date) {
+      const { start, end, date } = parseDateRangeFromQuery(req.query.date);
+      const slotMinutes = Number(req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES);
+      const maxSlots = Number(req.query.maxSlots || 5);
+
+      const slots = await svc.getAvailableSlots({
+        start,
+        end,
+        slotMinutes,
+        maxSlots,
+      });
+
+      return res.json({
+        ok: true,
+        date,
+        slotMinutes,
+        count: slots.length,
+        slots,
+      });
+    }
+
     const now = new Date();
     const end = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
 
@@ -1082,6 +1132,7 @@ app.get("/test/calendar/slots", async (req, res) => {
       start: now,
       end,
       maxSlots: 5,
+      slotMinutes: DEFAULT_APPOINTMENT_MINUTES,
     });
 
     res.json({
@@ -1098,26 +1149,80 @@ app.get("/test/calendar/slots", async (req, res) => {
   }
 });
 
-app.get("/test/calendar/slots", async (req, res) => {
+// =========================
+// Formal appointment APIs
+// =========================
+
+// 查询某天可预约时间
+app.get("/appointments/availability", async (req, res) => {
+  try {
+    const svc = getCalendarService();
+    const { start, end, date } = parseDateRangeFromQuery(req.query.date);
+
+    const slotMinutes = Number(req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES);
+    const maxSlots = Number(req.query.maxSlots || 10);
+
+    const slots = await svc.getAvailableSlots({
+      start,
+      end,
+      slotMinutes,
+      maxSlots,
+    });
+
+    res.json({
+      ok: true,
+      date,
+      slotMinutes,
+      count: slots.length,
+      slots,
+    });
+  } catch (err) {
+    console.error("Availability lookup failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
+
+// 创建预约
+app.post("/appointments", async (req, res) => {
   try {
     const svc = getCalendarService();
 
-    const now = new Date();
-    const end = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+    const {
+      customerName,
+      phone,
+      address,
+      serviceType,
+      startDateTime,
+      durationMinutes,
+      notes,
+    } = req.body || {};
 
-    const slots = await svc.getAvailableSlots({
-      start: now,
-      end,
-      maxSlots: 5,
+    if (!customerName || !serviceType || !startDateTime) {
+      return res.status(400).json({
+        ok: false,
+        error: "customerName, serviceType, startDateTime are required",
+      });
+    }
+
+    const result = await svc.createAppointment({
+      customerName,
+      phone: phone || "",
+      address: address || "",
+      serviceType,
+      startDateTime,
+      durationMinutes: Number(durationMinutes || DEFAULT_APPOINTMENT_MINUTES),
+      notes: notes || "",
     });
 
     res.json({
       ok: true,
-      count: slots.length,
-      slots,
+      event: result,
     });
   } catch (err) {
-    console.error("Calendar slots test failed:", err);
+    console.error("Create appointment failed:", err);
     res.status(500).json({
       ok: false,
       error: err.message,
@@ -1125,9 +1230,61 @@ app.get("/test/calendar/slots", async (req, res) => {
   }
 });
 
+// 修改预约
+app.patch("/appointments/:eventId", async (req, res) => {
+  try {
+    const svc = getCalendarService();
+    const { eventId } = req.params;
 
+    if (!eventId) {
+      return res.status(400).json({
+        ok: false,
+        error: "eventId is required",
+      });
+    }
 
+    const result = await svc.updateAppointment(eventId, req.body || {});
 
+    res.json({
+      ok: true,
+      event: result,
+    });
+  } catch (err) {
+    console.error("Update appointment failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
+
+// 删除预约
+app.delete("/appointments/:eventId", async (req, res) => {
+  try {
+    const svc = getCalendarService();
+    const { eventId } = req.params;
+
+    if (!eventId) {
+      return res.status(400).json({
+        ok: false,
+        error: "eventId is required",
+      });
+    }
+
+    const result = await svc.cancelAppointment(eventId);
+
+    res.json({
+      ok: true,
+      result,
+    });
+  } catch (err) {
+    console.error("Delete appointment failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
 
 app.post("/admin/call", async (req, res) => {
   try {
