@@ -866,7 +866,17 @@ Rules:
     console.error("Twilio WS error:", err?.message || err);
   });
 });
+app.post("/twilio/voice/status", (req, res) => {
+  console.log("📞 Twilio Status Callback:", req.body);
 
+  // 你可以在这里记录通话状态
+  // 例如：
+  // CallSid
+  // CallStatus (queued, ringing, in-progress, completed)
+  // From / To
+
+  res.sendStatus(200); // 很关键，必须返回 200
+});
 // =========================
 // Manual update endpoint
 // =========================
