@@ -48,6 +48,15 @@ class HVACCalendarService {
     };
   }
 
+  async getEvent(eventId) {
+    const res = await this.calendar.events.get({
+      calendarId: this.calendarId,
+      eventId,
+    });
+
+    return res.data;
+  }
+
   async getBusyBlocks({ start, end }) {
     const timeMin =
       start instanceof Date ? start.toISOString() : new Date(start).toISOString();
@@ -174,6 +183,152 @@ class HVACCalendarService {
       start: res.data.start,
       end: res.data.end,
     };
+  }
+
+  async createAppointment({
+    customerName,
+    phone = "",
+    address = "",
+    serviceType = "HVAC Appointment",
+    startDateTime,
+    durationMinutes = DEFAULT_APPOINTMENT_MINUTES,
+    notes = "",
+  }) {
+    const start = new Date(startDateTime);
+    const end = new Date(start.getTime() + Number(durationMinutes) * 60 * 1000);
+
+    const description = [
+      `Customer: ${customerName || ""}`,
+      `Phone: ${phone}`,
+      `Address: ${address}`,
+      `Service Type: ${serviceType}`,
+      `Notes: ${notes}`,
+      "",
+      "Created by Owen HVAC AI system.",
+    ].join("\n");
+
+    const res = await this.calendar.events.insert({
+      calendarId: this.calendarId,
+      requestBody: {
+        summary: `${serviceType} - ${customerName}`,
+        description,
+        location: address,
+        start: {
+          dateTime: start.toISOString(),
+          timeZone: BUSINESS_TIMEZONE,
+        },
+        end: {
+          dateTime: end.toISOString(),
+          timeZone: BUSINESS_TIMEZONE,
+        },
+      },
+    });
+
+    return {
+      eventId: res.data.id,
+      htmlLink: res.data.htmlLink,
+      summary: res.data.summary,
+      description: res.data.description,
+      location: res.data.location,
+      start: res.data.start,
+      end: res.data.end,
+      status: res.data.status,
+    };
+  }
+
+  async updateAppointment(eventId, updates = {}) {
+    const existing = await this.getEvent(eventId);
+
+    const existingStart = existing.start?.dateTime || existing.start?.date;
+    const existingEnd = existing.end?.dateTime || existing.end?.date;
+
+    let startDateTime = existingStart;
+    let endDateTime = existingEnd;
+
+    if (updates.startDateTime) {
+      const start = new Date(updates.startDateTime);
+      const durationMinutes = Number(
+        updates.durationMinutes || DEFAULT_APPOINTMENT_MINUTES
+      );
+      const end = new Date(start.getTime() + durationMinutes * 60 * 1000);
+
+      startDateTime = start.toISOString();
+      endDateTime = end.toISOString();
+    }
+
+    const newCustomerName =
+      updates.customerName ||
+      this.extractField(existing.description, "Customer") ||
+      "";
+    const newPhone =
+      updates.phone || this.extractField(existing.description, "Phone") || "";
+    const newAddress =
+      updates.address || existing.location || this.extractField(existing.description, "Address") || "";
+    const newServiceType =
+      updates.serviceType ||
+      this.extractField(existing.description, "Service Type") ||
+      existing.summary ||
+      "HVAC Appointment";
+    const newNotes =
+      updates.notes || this.extractField(existing.description, "Notes") || "";
+
+    const description = [
+      `Customer: ${newCustomerName}`,
+      `Phone: ${newPhone}`,
+      `Address: ${newAddress}`,
+      `Service Type: ${newServiceType}`,
+      `Notes: ${newNotes}`,
+      "",
+      "Updated by Owen HVAC AI system.",
+    ].join("\n");
+
+    const res = await this.calendar.events.update({
+      calendarId: this.calendarId,
+      eventId,
+      requestBody: {
+        ...existing,
+        summary: `${newServiceType} - ${newCustomerName}`,
+        description,
+        location: newAddress,
+        start: {
+          dateTime: startDateTime,
+          timeZone: BUSINESS_TIMEZONE,
+        },
+        end: {
+          dateTime: endDateTime,
+          timeZone: BUSINESS_TIMEZONE,
+        },
+      },
+    });
+
+    return {
+      eventId: res.data.id,
+      htmlLink: res.data.htmlLink,
+      summary: res.data.summary,
+      description: res.data.description,
+      location: res.data.location,
+      start: res.data.start,
+      end: res.data.end,
+      status: res.data.status,
+    };
+  }
+
+  async cancelAppointment(eventId) {
+    await this.calendar.events.delete({
+      calendarId: this.calendarId,
+      eventId,
+    });
+
+    return {
+      success: true,
+      eventId,
+    };
+  }
+
+  extractField(description = "", label) {
+    const regex = new RegExp(`^${label}:\\s*(.*)$`, "mi");
+    const match = description.match(regex);
+    return match ? match[1].trim() : "";
   }
 }
 
