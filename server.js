@@ -514,18 +514,36 @@ function buildPreferredDateTime(fields) {
   if (fields.preferredDateTime) return fields.preferredDateTime;
 
   const normalizedDate = normalizePreferredDate(fields.preferredDate);
-  const normalizedTime = normalizePreferredTime(fields.preferredTime);
+  let timeRaw = normalizePreferredTime(fields.preferredTime);
 
-  if (!normalizedDate || !normalizedTime) return "";
+  if (!normalizedDate || !timeRaw) return "";
 
-  const combined = `${normalizedDate} ${normalizedTime}`;
-  const parsed = new Date(combined);
+  // 👉 把 "8 PM" 转换成 24小时制
+  let hour = 0;
+  let minute = 0;
 
-  if (Number.isNaN(parsed.getTime())) {
-    return "";
+  const match = timeRaw.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+
+  if (!match) return "";
+
+  hour = parseInt(match[1], 10);
+  minute = match[2] ? parseInt(match[2], 10) : 0;
+  const period = match[3].toUpperCase();
+
+  if (period === "PM" && hour !== 12) {
+    hour += 12;
+  }
+  if (period === "AM" && hour === 12) {
+    hour = 0;
   }
 
-  return parsed.toISOString();
+  const hh = String(hour).padStart(2, "0");
+  const mm = String(minute).padStart(2, "0");
+
+  // 👉 强制 ISO 格式（关键）
+  const iso = `${normalizedDate}T${hh}:${mm}:00-03:00`;
+
+  return iso;
 }
 
 function mapIntentToServiceType(intent) {
