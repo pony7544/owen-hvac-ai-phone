@@ -6,6 +6,7 @@ const path = require("path");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const { google } = require("googleapis");
+const OpenAI = require("openai");
 
 const app = express();
 const server = http.createServer(app);
@@ -33,6 +34,17 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 
+if (!OPENAI_API_KEY) {
+  console.warn("Missing OPENAI_API_KEY");
+}
+
+// =========================
+// OpenAI SDK
+// =========================
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+});
+
 // =========================
 // Google Calendar
 // =========================
@@ -52,7 +64,7 @@ const calendar = google.calendar({
 
 // =========================
 // In-memory session store
-// production可换Redis
+// production建议换Redis
 // =========================
 const liveCalls = new Map();
 /*
@@ -61,14 +73,17 @@ liveCalls[callSid] = {
   streamSid,
   transcript: [],
   lastAssistantText: "",
+  lastCallerText: "",
+  extractionInFlight: false,
+  lastExtractionAt: 0,
   extracted: {
     intent: "",
     name: "",
     phone: "",
     address: "",
     issue: "",
-    preferredDateRaw: "",
-    preferredTimeRaw: "",
+    preferredDateRaw: "",   // YYYY-MM-DD
+    preferredTimeRaw: "",   // HH:MM
     bookingConfirmed: false,
     appointmentCreated: false,
     appointmentEventId: "",
@@ -86,6 +101,9 @@ function getOrCreateCallSession(callSid) {
       streamSid: "",
       transcript: [],
       lastAssistantText: "",
+      lastCallerText: "",
+      extractionInFlight: false,
+      lastExtractionAt: 0,
       extracted: {
         intent: "",
         name: "",
@@ -103,13 +121,8 @@ function getOrCreateCallSession(callSid) {
   return liveCalls.get(callSid);
 }
 
-function pushTranscript(callSid, role, text) {
-  const session = getOrCreateCallSession(callSid);
-  session.transcript.push({
-    role,
-    text,
-    ts: new Date().toISOString(),
-  });
+function cleanText(s) {
+  return (s || "").replace(/\s+/g, " ").trim();
 }
 
 function normalizePhone(phone) {
@@ -117,162 +130,16 @@ function normalizePhone(phone) {
   return phone.replace(/[^\d+]/g, "").trim();
 }
 
-function cleanText(s) {
-  return (s || "").replace(/\s+/g, " ").trim();
-}
+function pushTranscript(callSid, role, text) {
+  const session = getOrCreateCallSession(callSid);
+  const cleaned = cleanText(text);
+  if (!cleaned) return;
 
-function monthNameToNumber(name) {
-  const months = {
-    january: 1,
-    february: 2,
-    march: 3,
-    april: 4,
-    may: 5,
-    june: 6,
-    july: 7,
-    august: 8,
-    september: 9,
-    october: 10,
-    november: 11,
-    december: 12,
-  };
-  return months[(name || "").toLowerCase()] || null;
-}
-
-function parseAssistantConfirmation(text) {
-  const raw = cleanText(text);
-  const result = {};
-
-  // name
-  const nameMatch =
-    raw.match(/name as ([^,\.]+)/i) ||
-    raw.match(/your name is ([^,\.]+)/i) ||
-    raw.match(/i have your name as ([^,\.]+)/i);
-  if (nameMatch) result.name = cleanText(nameMatch[1]);
-
-  // phone
-  const phoneMatch =
-    raw.match(/phone number as ([+\d\-\s\(\)]+)/i) ||
-    raw.match(/callback number as ([+\d\-\s\(\)]+)/i) ||
-    raw.match(/number as ([+\d\-\s\(\)]+)/i);
-  if (phoneMatch) result.phone = cleanText(phoneMatch[1]);
-
-  // address
-  const addressMatch =
-    raw.match(/address as ([^\.]+?)(?:, and the issue is| and the issue is|\.|$)/i) ||
-    raw.match(/service address as ([^\.]+?)(?:, and the issue is| and the issue is|\.|$)/i);
-  if (addressMatch) result.address = cleanText(addressMatch[1]);
-
-  // issue
-  const issueMatch =
-    raw.match(/issue is (.+?)(?:\.| is that all correct| perfect)/i) ||
-    raw.match(/problem is (.+?)(?:\.| is that all correct| perfect)/i);
-  if (issueMatch) result.issue = cleanText(issueMatch[1]);
-
-  // confirmation
-  if (
-    /is that all correct/i.test(raw) ||
-    /just to confirm/i.test(raw) ||
-    /we've recorded your appointment request/i.test(raw)
-  ) {
-    result.confirmationPromptSeen = true;
-  }
-
-  // appointment date + time
-  // e.g. "appointment on March 25 at 8 o'clock"
-  const dateTimeMatch =
-    raw.match(/appointment on ([a-zA-Z]+ \d{1,2}) at ([^\.]+?)(?:\.| just to confirm)/i) ||
-    raw.match(/prefer an appointment on ([a-zA-Z]+ \d{1,2}) at ([^\.]+?)(?:\.| just to confirm)/i) ||
-    raw.match(/like the appointment on ([a-zA-Z]+ \d{1,2}) at ([^\.]+?)(?:\.| just to confirm)/i);
-
-  if (dateTimeMatch) {
-    result.preferredDateRaw = cleanText(dateTimeMatch[1]);
-    result.preferredTimeRaw = cleanText(dateTimeMatch[2]);
-  }
-
-  return result;
-}
-
-function mergeExtracted(target, incoming) {
-  for (const key of Object.keys(incoming)) {
-    if (
-      incoming[key] !== undefined &&
-      incoming[key] !== null &&
-      incoming[key] !== ""
-    ) {
-      target[key] = incoming[key];
-    }
-  }
-}
-
-function parsePreferredDateTime(dateRaw, timeRaw, timezone = BUSINESS_TIMEZONE) {
-  if (!dateRaw || !timeRaw) return null;
-
-  // 支持 "March 25"
-  const dateMatch = dateRaw.match(/^([A-Za-z]+)\s+(\d{1,2})$/);
-  if (!dateMatch) return null;
-
-  const month = monthNameToNumber(dateMatch[1]);
-  const day = parseInt(dateMatch[2], 10);
-  if (!month || !day) return null;
-
-  // 默认按今年；若已过去太多，可改成明年
-  const now = new Date();
-  let year = now.getFullYear();
-
-  // time parse
-  // 例：8 o'clock / 8:30 / 5 pm / 5:30 pm
-  let hour = null;
-  let minute = 0;
-  const t = timeRaw.toLowerCase().replace(/\s+/g, " ").trim();
-
-  let m =
-    t.match(/^(\d{1,2})\s*o'?clock$/) ||
-    t.match(/^(\d{1,2})$/) ||
-    t.match(/^(\d{1,2}):(\d{2})$/) ||
-    t.match(/^(\d{1,2})\s*(am|pm)$/) ||
-    t.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/);
-
-  if (!m) return null;
-
-  if (m.length === 2) {
-    hour = parseInt(m[1], 10);
-  } else if (m.length === 3 && /^\d+$/.test(m[1]) && /^\d+$/.test(m[2])) {
-    hour = parseInt(m[1], 10);
-    minute = parseInt(m[2], 10);
-  } else if (m.length === 3) {
-    hour = parseInt(m[1], 10);
-    const ampm = m[2];
-    if (ampm === "pm" && hour < 12) hour += 12;
-    if (ampm === "am" && hour === 12) hour = 0;
-  } else if (m.length === 4) {
-    hour = parseInt(m[1], 10);
-    minute = parseInt(m[2], 10);
-    const ampm = m[3];
-    if (ampm === "pm" && hour < 12) hour += 12;
-    if (ampm === "am" && hour === 12) hour = 0;
-  }
-
-  // 对纯数字时间做简单业务推断：
-  // 1-8 默认下午更常见，可按实际业务调整
-  if (/^\d{1,2}$/.test(t) || /^\d{1,2}\s*o'?clock$/.test(t)) {
-    if (hour >= 1 && hour <= 8) hour += 12;
-  }
-
-  const start = new Date(year, month - 1, day, hour, minute, 0, 0);
-
-  // 如果日期已经过去很多，可自动挪到明年
-  if (start.getTime() < now.getTime() - 24 * 60 * 60 * 1000) {
-    start.setFullYear(year + 1);
-  }
-
-  const end = new Date(start.getTime() + DEFAULT_APPOINTMENT_MINUTES * 60000);
-
-  return {
-    start,
-    end,
-    timezone,
-  };
+  session.transcript.push({
+    role,
+    text: cleaned,
+    ts: new Date().toISOString(),
+  });
 }
 
 function buildCallSummary(extracted) {
@@ -288,6 +155,78 @@ function buildCallSummary(extracted) {
     `Appointment Created: ${extracted.appointmentCreated ? "yes" : "no"}`,
     `Event ID: ${extracted.appointmentEventId || ""}`,
   ].join(" | ");
+}
+
+function mergeManualUpdate(target, incoming) {
+  const allowed = [
+    "intent",
+    "name",
+    "phone",
+    "address",
+    "issue",
+    "preferredDateRaw",
+    "preferredTimeRaw",
+    "bookingConfirmed",
+  ];
+
+  for (const key of allowed) {
+    if (incoming[key] !== undefined && incoming[key] !== null) {
+      target[key] = incoming[key];
+    }
+  }
+}
+
+function normalizeExtractedFromModel(data = {}) {
+  const intent =
+    typeof data.intent === "string" ? data.intent.trim() : "";
+  const name =
+    typeof data.name === "string" ? data.name.trim() : "";
+  const phone =
+    typeof data.phone === "string" ? normalizePhone(data.phone) : "";
+  const address =
+    typeof data.address === "string" ? data.address.trim() : "";
+  const issue =
+    typeof data.issue === "string" ? data.issue.trim() : "";
+  const preferredDateRaw =
+    typeof data.preferred_date === "string" ? data.preferred_date.trim() : "";
+  const preferredTimeRaw =
+    typeof data.preferred_time === "string" ? data.preferred_time.trim() : "";
+
+  return {
+    intent,
+    name,
+    phone,
+    address,
+    issue,
+    preferredDateRaw,
+    preferredTimeRaw,
+    bookingConfirmed: Boolean(data.booking_confirmed),
+  };
+}
+
+function isValidIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function isValidHHMM(s) {
+  return /^\d{2}:\d{2}$/.test(s);
+}
+
+function parsePreferredDateTime(dateRaw, timeRaw, timezone = BUSINESS_TIMEZONE) {
+  if (!dateRaw || !timeRaw) return null;
+  if (!isValidIsoDate(dateRaw)) return null;
+  if (!isValidHHMM(timeRaw)) return null;
+
+  const start = new Date(`${dateRaw}T${timeRaw}:00`);
+  if (Number.isNaN(start.getTime())) return null;
+
+  const end = new Date(start.getTime() + DEFAULT_APPOINTMENT_MINUTES * 60000);
+
+  return {
+    start,
+    end,
+    timezone,
+  };
 }
 
 async function testCalendarConnection() {
@@ -314,7 +253,6 @@ async function listEventsForDay(dateStr) {
 
 function generateSlotsForDay(dateStr, events, slotMinutes = 120) {
   const slots = [];
-
   const workStart = new Date(`${dateStr}T08:00:00`);
   const workEnd = new Date(`${dateStr}T18:00:00`);
 
@@ -354,7 +292,7 @@ async function createAppointmentEvent({
 }) {
   const parsed = parsePreferredDateTime(preferredDateRaw, preferredTimeRaw);
   if (!parsed) {
-    throw new Error("Unable to parse preferred date/time from confirmation text.");
+    throw new Error("Unable to parse normalized preferred date/time.");
   }
 
   const event = {
@@ -416,6 +354,141 @@ async function maybeAutoCreateAppointment(callSid) {
   ex.appointmentEventId = created.id || "";
 
   return created;
+}
+
+// =========================
+// Structured extraction
+// =========================
+async function extractCallInfoWithOpenAI({ transcript, nowIso, timezone }) {
+  const transcriptText = transcript
+    .map((x) => `${x.role}: ${x.text}`)
+    .join("\n");
+
+  const response = await openai.responses.create({
+    model: "gpt-5-mini",
+    input: [
+      {
+        role: "system",
+        content: [
+          {
+            type: "input_text",
+            text: `
+You extract structured booking information from an HVAC phone call transcript.
+
+Return only information clearly supported by the transcript.
+
+Current datetime: ${nowIso}
+Business timezone: ${timezone}
+
+Rules:
+- Return data matching the schema exactly.
+- Use empty string for unknown text fields.
+- Normalize preferred_date to YYYY-MM-DD when possible.
+- Normalize preferred_time to HH:MM in 24-hour format when possible.
+- booking_confirmed is true only if the caller clearly confirmed the booking summary or accepted the booking details.
+- If the assistant only asks for confirmation, that does not mean confirmed.
+- If the caller says "correct", "yes", "that's right", "正确", or equivalent after the summary, set booking_confirmed=true.
+- intent must be one of:
+  service_or_repair, quote_request, maintenance, general_inquiry, other, or empty string.
+            `.trim(),
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: transcriptText,
+          },
+        ],
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "call_info_extraction",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            intent: { type: "string" },
+            name: { type: "string" },
+            phone: { type: "string" },
+            address: { type: "string" },
+            issue: { type: "string" },
+            preferred_date: { type: "string" },
+            preferred_time: { type: "string" },
+            booking_confirmed: { type: "boolean" },
+          },
+          required: [
+            "intent",
+            "name",
+            "phone",
+            "address",
+            "issue",
+            "preferred_date",
+            "preferred_time",
+            "booking_confirmed",
+          ],
+        },
+      },
+    },
+  });
+
+  const raw = response.output_text || "{}";
+  return JSON.parse(raw);
+}
+
+async function refreshStructuredCallInfo(callSid) {
+  const session = getOrCreateCallSession(callSid);
+
+  if (!session.transcript || session.transcript.length === 0) {
+    return session.extracted;
+  }
+
+  const modelData = await extractCallInfoWithOpenAI({
+    transcript: session.transcript,
+    nowIso: new Date().toISOString(),
+    timezone: BUSINESS_TIMEZONE,
+  });
+
+  const normalized = normalizeExtractedFromModel(modelData);
+
+  session.extracted.intent = normalized.intent;
+  session.extracted.name = normalized.name;
+  session.extracted.phone = normalized.phone;
+  session.extracted.address = normalized.address;
+  session.extracted.issue = normalized.issue;
+  session.extracted.preferredDateRaw = normalized.preferredDateRaw;
+  session.extracted.preferredTimeRaw = normalized.preferredTimeRaw;
+  session.extracted.bookingConfirmed = normalized.bookingConfirmed;
+
+  return session.extracted;
+}
+
+async function refreshStructuredCallInfoDebounced(callSid, minIntervalMs = 1000) {
+  const session = getOrCreateCallSession(callSid);
+  const now = Date.now();
+
+  if (session.extractionInFlight) {
+    return session.extracted;
+  }
+
+  if (now - session.lastExtractionAt < minIntervalMs) {
+    return session.extracted;
+  }
+
+  session.extractionInFlight = true;
+  session.lastExtractionAt = now;
+
+  try {
+    const extracted = await refreshStructuredCallInfo(callSid);
+    return extracted;
+  } finally {
+    session.extractionInFlight = false;
+  }
 }
 
 // =========================
@@ -554,8 +627,7 @@ app.post("/twilio/voice", (req, res) => {
 });
 
 // =========================
-// WebSocket servers
-// 1) /media-stream for Twilio
+// WebSocket server
 // =========================
 const wss = new WebSocket.Server({ noServer: true });
 
@@ -579,7 +651,6 @@ wss.on("connection", async (twilioWs, request) => {
 
   let streamSid = "";
 
-  // OpenAI Realtime WS
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -599,31 +670,33 @@ wss.on("connection", async (twilioWs, request) => {
         modalities: ["text", "audio"],
         instructions: `
 You are the phone receptionist for ${BUSINESS_NAME}, an HVAC company.
-Your job is to speak naturally and help callers with service, repair, maintenance, quotes, and booking.
 
-Goals:
-1. Identify the caller's intent.
-2. Collect:
+Your job is to speak naturally and help callers with:
+- service
+- repair
+- maintenance
+- installation quote requests
+- general HVAC questions
+
+Conversation goals:
+1. Understand the caller's intent.
+2. Collect, if relevant:
    - full name
    - callback number
    - full service address
    - short issue summary
    - preferred appointment date
    - preferred appointment time
-3. Once you have all details, read them back in one confirmation sentence using this style exactly:
-
-"Got it. You’d prefer an appointment on [DATE] at [TIME]. Just to confirm, I have your name as [NAME], your phone number as [PHONE], the address as [ADDRESS], and the issue is [ISSUE]. Is that all correct?"
-
-4. If the caller confirms, say:
-"Perfect. We’ve recorded your appointment request. A team member will follow up soon to confirm. Thanks for calling ${BUSINESS_NAME}."
+3. Read the details back clearly for confirmation.
+4. If the caller confirms, let them know the request has been recorded and a team member will follow up.
 
 Rules:
-- Keep answers short and phone-friendly.
-- Ask one thing at a time if information is missing.
+- Keep responses short and phone-friendly.
+- Ask one thing at a time when information is missing.
 - Do not invent customer details.
-- Use English unless caller speaks another language.
-- If the caller gives a preferred date/time, restate it clearly.
-- Once caller confirms all details are correct, that means booking is confirmed.
+- Use English unless the caller speaks another language.
+- Do not output JSON to the caller.
+- Speak naturally as a receptionist.
         `.trim(),
         voice: "alloy",
         input_audio_format: "g711_ulaw",
@@ -636,13 +709,12 @@ Rules:
 
     openaiWs.send(JSON.stringify(sessionUpdate));
 
-    // 首句
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Greet the caller and ask how you can help today.`,
+          instructions: "Greet the caller and ask how you can help today.",
         },
       })
     );
@@ -652,7 +724,7 @@ Rules:
     try {
       const data = JSON.parse(message.toString());
 
-      // 返回音频给Twilio
+      // 音频回传给Twilio
       if (data.type === "response.audio.delta" && data.delta) {
         twilioWs.send(
           JSON.stringify({
@@ -665,38 +737,30 @@ Rules:
         );
       }
 
-      // assistant 文本片段
+      // assistant文本增量
       if (data.type === "response.output_text.delta" && data.delta) {
         session.lastAssistantText += data.delta;
       }
 
-      // assistant 一轮结束
+      // assistant一轮说完
       if (data.type === "response.done") {
         const assistantText = cleanText(session.lastAssistantText);
 
         if (assistantText) {
           pushTranscript(callSid, "assistant", assistantText);
           console.log("Assistant:", assistantText);
-
-          const parsed = parseAssistantConfirmation(assistantText);
-          mergeExtracted(session.extracted, parsed);
-
-          // 如果assistant明确是在确认详情
-          if (parsed.confirmationPromptSeen) {
-            // 可认为intent大概率是service_or_repair
-            if (!session.extracted.intent) {
-              session.extracted.intent = "service_or_repair";
-            }
-          }
-
-          // 如果assistant已经说“已记录预约请求”，也算用户确认完毕之后的结束语
-          if (/we[’']?ve recorded your appointment request/i.test(assistantText)) {
-            session.extracted.bookingConfirmed = true;
-          }
-
           session.lastAssistantText = "";
 
-          // 自动创建预约
+          try {
+            const extracted = await refreshStructuredCallInfoDebounced(callSid);
+            console.log("Structured extracted after assistant:", extracted);
+          } catch (err) {
+            console.error(
+              "Structured extraction after assistant failed:",
+              err?.message || err
+            );
+          }
+
           try {
             const created = await maybeAutoCreateAppointment(callSid);
             if (created) {
@@ -704,6 +768,40 @@ Rules:
             }
           } catch (err) {
             console.error("Auto-create appointment failed:", err?.message || err);
+          }
+        }
+      }
+
+      // 可选：如果Realtime返回用户转写事件，抓进去
+      if (
+        data.type === "conversation.item.input_audio_transcription.completed" &&
+        data.transcript
+      ) {
+        const callerText = cleanText(data.transcript);
+        if (callerText) {
+          pushTranscript(callSid, "caller", callerText);
+          console.log("Caller:", callerText);
+
+          try {
+            const extracted = await refreshStructuredCallInfoDebounced(callSid);
+            console.log("Structured extracted after caller:", extracted);
+          } catch (err) {
+            console.error(
+              "Structured extraction after caller failed:",
+              err?.message || err
+            );
+          }
+
+          try {
+            const created = await maybeAutoCreateAppointment(callSid);
+            if (created) {
+              console.log("✅ Appointment created:", created.id);
+            }
+          } catch (err) {
+            console.error(
+              "Auto-create appointment after caller failed:",
+              err?.message || err
+            );
           }
         }
       }
@@ -771,17 +869,16 @@ Rules:
 
 // =========================
 // Manual update endpoint
-// 供你前端测试右侧表单写入
 // =========================
 app.post("/api/live-call/:callSid/update", async (req, res) => {
   try {
     const callSid = req.params.callSid;
     const session = getOrCreateCallSession(callSid);
 
-    mergeExtracted(session.extracted, req.body);
+    mergeManualUpdate(session.extracted, req.body);
 
-    if (req.body.bookingConfirmed === true) {
-      session.extracted.bookingConfirmed = true;
+    if (req.body.phone) {
+      session.extracted.phone = normalizePhone(req.body.phone);
     }
 
     let created = null;
@@ -807,8 +904,37 @@ app.post("/api/live-call/:callSid/update", async (req, res) => {
 });
 
 // =========================
-// optional: mark customer confirmation
-// 当你从caller转写里识别到 “correct / yes / that's right” 可调这个
+// Force re-extract endpoint
+// =========================
+app.post("/api/live-call/:callSid/reextract", async (req, res) => {
+  try {
+    const callSid = req.params.callSid;
+    const extracted = await refreshStructuredCallInfo(callSid);
+
+    let created = null;
+    try {
+      created = await maybeAutoCreateAppointment(callSid);
+    } catch (err) {
+      console.error("Reextract auto-create failed:", err?.message || err);
+    }
+
+    res.json({
+      ok: true,
+      extracted,
+      createdEventId: created?.id || null,
+      callSummary: buildCallSummary(extracted),
+    });
+  } catch (err) {
+    console.error("Reextract error:", err?.message || err);
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Failed to re-extract call info",
+    });
+  }
+});
+
+// =========================
+// Manual confirm endpoint
 // =========================
 app.post("/api/live-call/:callSid/confirm", async (req, res) => {
   try {
