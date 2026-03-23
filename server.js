@@ -35,10 +35,7 @@ const twilioClient =
     ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     : null;
 
-// 实时通话会话
 const liveSessions = new Map();
-
-// SSE 客户端集合
 const sseClients = new Set();
 
 const HVAC_SYSTEM_PROMPT = `
@@ -242,7 +239,6 @@ function detectConfirmation(session, text) {
     return;
   }
 
-  // 容错：语音误识别短词，例如 Vai / Yah / Yep 之类
   const shortConfirmations = ["vai", "ya", "yah", "yup", "mm-hmm", "uh-huh"];
   if (shortConfirmations.includes(lower)) {
     session.fields.bookingConfirmed = true;
@@ -252,45 +248,112 @@ function detectConfirmation(session, text) {
 function extractDateTimeFields(session, text) {
   if (!session || !text) return;
 
-  const raw = text.trim();
+  const raw = String(text).trim();
   const lower = raw.toLowerCase();
 
-  // 日期识别
+  const numberWords = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+    thirteen: 13,
+    fourteen: 14,
+    fifteen: 15,
+    sixteen: 16,
+    seventeen: 17,
+    eighteen: 18,
+    nineteen: 19,
+    twenty: 20,
+    thirty: 30,
+    first: 1,
+    second: 2,
+    third: 3,
+    fourth: 4,
+    fifth: 5,
+    sixth: 6,
+    seventh: 7,
+    eighth: 8,
+    ninth: 9,
+    tenth: 10,
+    eleventh: 11,
+    twelfth: 12,
+    thirteenth: 13,
+    fourteenth: 14,
+    fifteenth: 15,
+    sixteenth: 16,
+    seventeenth: 17,
+    eighteenth: 18,
+    nineteenth: 19,
+    twentieth: 20,
+    twentyfirst: 21,
+    "twenty-first": 21,
+    twentysecond: 22,
+    "twenty-second": 22,
+    twentythird: 23,
+    "twenty-third": 23,
+    twentyfourth: 24,
+    "twenty-fourth": 24,
+    twentyfifth: 25,
+    "twenty-fifth": 25,
+    twentysixth: 26,
+    "twenty-sixth": 26,
+    twentyseventh: 27,
+    "twenty-seventh": 27,
+    twentyeighth: 28,
+    "twenty-eighth": 28,
+    twentyninth: 29,
+    "twenty-ninth": 29,
+    thirtieth: 30,
+    thirtyfirst: 31,
+    "thirty-first": 31,
+  };
+
+  function parseWordDay(fragment) {
+    if (!fragment) return null;
+
+    let s = fragment
+      .toLowerCase()
+      .replace(/[^a-z-\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!s) return null;
+
+    if (numberWords[s] != null) return numberWords[s];
+
+    const compact = s.replace(/\s+/g, "");
+    if (numberWords[compact] != null) return numberWords[compact];
+
+    const parts = s.split(/[\s-]+/).filter(Boolean);
+    if (!parts.length) return null;
+
+    let total = 0;
+    for (const p of parts) {
+      if (numberWords[p] == null) return null;
+      total += numberWords[p];
+    }
+
+    if (total >= 1 && total <= 31) return total;
+    return null;
+  }
+
+  // 1) 标准日期
   const fullDatePatterns = [
     /\b(20\d{2}-\d{2}-\d{2})\b/i,
     /\b(\d{1,2}\/\d{1,2}\/20\d{2})\b/i,
-    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,\s*20\d{2})?\b/i,
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,\s*20\d{2})?\b/i,
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/i,
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/i,
     /\b(today)\b/i,
     /\b(tomorrow)\b/i,
   ];
-
-  // 单独月份识别（例如 “on March”）
-  const monthOnlyPattern =
-    /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/i;
-
-  // 时间识别
-  const normalTimePatterns = [
-    /\b(\d{1,2}:\d{2}\s?(am|pm))\b/i,
-    /\b(\d{1,2}\s?(am|pm))\b/i,
-    /\b(\d{1,2}:\d{2})\b/i,
-  ];
-
-  // 识别 “three o'clock p.m.” 这种
-  const wordTimeMap = {
-    one: "1 PM",
-    two: "2 PM",
-    three: "3 PM",
-    four: "4 PM",
-    five: "5 PM",
-    six: "6 PM",
-    seven: "7 PM",
-    eight: "8 PM",
-    nine: "9 PM",
-    ten: "10 PM",
-    eleven: "11 PM",
-    twelve: "12 PM",
-  };
 
   for (const p of fullDatePatterns) {
     const m = raw.match(p);
@@ -300,13 +363,42 @@ function extractDateTimeFields(session, text) {
     }
   }
 
-  // 如果没抓到完整日期，但抓到月份，就先记录月份
+  // 2) March twenty-five
   if (!session.fields.preferredDate) {
+    const monthWordPattern =
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+([a-z-]+(?:\s+[a-z-]+)?)\b/i;
+
+    const mw = raw.match(monthWordPattern);
+    if (mw) {
+      const monthWord = mw[1];
+      const dayWord = mw[2];
+      const dayNum = parseWordDay(dayWord);
+
+      if (dayNum) {
+        session.fields.preferredDate = `${monthWord} ${dayNum}`;
+      } else {
+        session.fields.preferredDate = monthWord;
+      }
+    }
+  }
+
+  // 3) 只有月份
+  if (!session.fields.preferredDate) {
+    const monthOnlyPattern =
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/i;
+
     const monthOnly = raw.match(monthOnlyPattern);
     if (monthOnly) {
       session.fields.preferredDate = monthOnly[0].trim();
     }
   }
+
+  // 4) 标准时间
+  const normalTimePatterns = [
+    /\b(\d{1,2}:\d{2}\s?(am|pm))\b/i,
+    /\b(\d{1,2}\s?(am|pm))\b/i,
+    /\b(\d{1,2}:\d{2})\b/i,
+  ];
 
   for (const p of normalTimePatterns) {
     const m = raw.match(p);
@@ -316,30 +408,58 @@ function extractDateTimeFields(session, text) {
     }
   }
 
+  // 5) from eight o'clock / at three o'clock p.m.
   if (!session.fields.preferredTime) {
-    const wordMatch = lower.match(
-      /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b.*\b(o'clock)\b.*\b(p\.?m\.?|a\.?m\.?)\b/i
-    );
+    const wordClockPattern =
+      /\b(?:from\s+|at\s+|around\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b(?:\s+o'?clock)?(?:\s+in\s+the\s+(morning|afternoon|evening))?(?:\s+(a\.?m\.?|p\.?m\.?))?/i;
 
-    if (wordMatch) {
-      const word = wordMatch[1].toLowerCase();
-      const meridiem = wordMatch[3].toLowerCase().includes("a") ? "AM" : "PM";
-      const numberMap = {
-        one: 1,
-        two: 2,
-        three: 3,
-        four: 4,
-        five: 5,
-        six: 6,
-        seven: 7,
-        eight: 8,
-        nine: 9,
-        ten: 10,
-        eleven: 11,
-        twelve: 12,
-      };
+    const wm = lower.match(wordClockPattern);
+    if (wm) {
+      const word = wm[1];
+      const daytime = wm[2] || "";
+      const ap = wm[3] || "";
 
-      session.fields.preferredTime = `${numberMap[word]} ${meridiem}`;
+      let meridiem = "";
+
+      if (ap) {
+        meridiem = ap.toLowerCase().includes("a") ? "AM" : "PM";
+      } else if (daytime === "morning") {
+        meridiem = "AM";
+      } else if (daytime === "afternoon" || daytime === "evening") {
+        meridiem = "PM";
+      }
+
+      const hour = numberWords[word];
+      if (hour) {
+        session.fields.preferredTime = meridiem ? `${hour} ${meridiem}` : `${hour}`;
+      }
+    }
+  }
+
+  // 6) 8 in the morning
+  if (!session.fields.preferredTime) {
+    const numericDaytimePattern =
+      /\b(\d{1,2})(?::(\d{2}))?\s+in\s+the\s+(morning|afternoon|evening)\b/i;
+
+    const nm = raw.match(numericDaytimePattern);
+    if (nm) {
+      const hour = parseInt(nm[1], 10);
+      const minute = nm[2] ? nm[2] : "00";
+      const period = nm[3].toLowerCase() === "morning" ? "AM" : "PM";
+      session.fields.preferredTime = `${hour}:${minute} ${period}`;
+    }
+  }
+
+  // 7) eight in the morning
+  if (!session.fields.preferredTime) {
+    const wordDaytimePattern =
+      /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+in\s+the\s+(morning|afternoon|evening)\b/i;
+
+    const wd = lower.match(wordDaytimePattern);
+    if (wd) {
+      const hour = numberWords[wd[1]];
+      const period = wd[2].toLowerCase() === "morning" ? "AM" : "PM";
+      session.fields.preferredTime = `${hour} ${period}`;
     }
   }
 }
@@ -365,7 +485,9 @@ function extractFieldsFromText(session, role, text) {
       lower.includes("not working") ||
       lower.includes("broken") ||
       lower.includes("no heat") ||
-      lower.includes("no cooling")
+      lower.includes("no cooling") ||
+      lower.includes("e1") ||
+      lower.includes("e2")
     ) {
       session.fields.intent = "service_or_repair";
     } else if (
@@ -381,13 +503,12 @@ function extractFieldsFromText(session, role, text) {
 
   detectConfirmation(session, text);
 
-  if (role !== "caller") return;
-
   const namePatterns = [
     /my name is ([a-z ,.'-]+)/i,
     /this is ([a-z ,.'-]+)/i,
     /i am ([a-z ,.'-]+)/i,
     /i'm ([a-z ,.'-]+)/i,
+    /name as ([a-z ,.'-]+)/i,
   ];
 
   for (const p of namePatterns) {
@@ -414,7 +535,6 @@ function extractFieldsFromText(session, role, text) {
 
   extractDateTimeFields(session, text);
 
-  // 只有明显像“问题描述”时才更新 issue summary
   const looksLikeIssue =
     lower.includes("not working") ||
     lower.includes("broken") ||
@@ -423,16 +543,31 @@ function extractFieldsFromText(session, role, text) {
     lower.includes("error code") ||
     lower.includes("repair") ||
     lower.includes("service") ||
-    lower.includes("heat pump");
+    lower.includes("heat pump") ||
+    lower.includes("outside machine") ||
+    lower.includes("inside it works") ||
+    lower.includes("e1") ||
+    lower.includes("e2");
 
-  const looksLikeOnlyTimeInfo =
+  const looksLikeOnlyDateTime =
     lower.includes("o'clock") ||
     lower.includes("am") ||
     lower.includes("pm") ||
+    lower.includes("morning") ||
+    lower.includes("afternoon") ||
+    lower.includes("evening") ||
     lower.includes("march") ||
     lower.includes("april") ||
-    lower.includes("tomorrow") ||
-    lower.includes("today");
+    lower.includes("may") ||
+    lower.includes("june") ||
+    lower.includes("july") ||
+    lower.includes("august") ||
+    lower.includes("september") ||
+    lower.includes("october") ||
+    lower.includes("november") ||
+    lower.includes("december") ||
+    lower.includes("today") ||
+    lower.includes("tomorrow");
 
   const looksLikeConfirmation =
     lower === "yes" ||
@@ -440,9 +575,13 @@ function extractFieldsFromText(session, role, text) {
     lower === "right" ||
     lower === "okay" ||
     lower === "ok" ||
+    lower === "fine" ||
+    lower === "sure" ||
+    lower === "yep" ||
+    lower === "yeah" ||
     lower === "vai";
 
-  if (looksLikeIssue && !looksLikeOnlyTimeInfo && !looksLikeConfirmation) {
+  if (looksLikeIssue && !looksLikeOnlyDateTime && !looksLikeConfirmation) {
     session.fields.issueSummary = text.trim();
   }
 }
@@ -467,37 +606,46 @@ function normalizePreferredDate(rawDate) {
     return direct.toISOString().slice(0, 10);
   }
 
-  // 如果只有月份，没有日期，就默认当前年该月 23 号，便于测试
-  const monthNames = {
+  const monthMap = {
     january: "01",
+    jan: "01",
     february: "02",
+    feb: "02",
     march: "03",
+    mar: "03",
     april: "04",
+    apr: "04",
     may: "05",
     june: "06",
-    july: "07",
-    august: "08",
-    september: "09",
-    october: "10",
-    november: "11",
-    december: "12",
-    jan: "01",
-    feb: "02",
-    mar: "03",
-    apr: "04",
     jun: "06",
+    july: "07",
     jul: "07",
+    august: "08",
     aug: "08",
+    september: "09",
     sep: "09",
     sept: "09",
+    october: "10",
     oct: "10",
+    november: "11",
     nov: "11",
+    december: "12",
     dec: "12",
   };
 
-  if (monthNames[value]) {
+  const md = value.match(
+    /\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+(\d{1,2})\b/i
+  );
+  if (md) {
     const year = now.getFullYear();
-    return `${year}-${monthNames[value]}-23`;
+    const month = monthMap[md[1].toLowerCase()];
+    const day = String(parseInt(md[2], 10)).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  if (monthMap[value]) {
+    const year = now.getFullYear();
+    return `${year}-${monthMap[value]}-23`;
   }
 
   return "";
@@ -505,7 +653,24 @@ function normalizePreferredDate(rawDate) {
 
 function normalizePreferredTime(rawTime) {
   if (!rawTime) return "";
-  return String(rawTime).trim().toUpperCase();
+
+  const value = String(rawTime).trim().toUpperCase();
+
+  const m1 = value.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (m1) {
+    const hh = parseInt(m1[1], 10);
+    const mm = m1[2] ? m1[2] : "00";
+    return `${hh}:${mm} ${m1[3].toUpperCase()}`;
+  }
+
+  const m2 = value.match(/^(\d{1,2})(?::(\d{2}))?$/);
+  if (m2) {
+    const hh = parseInt(m2[1], 10);
+    const mm = m2[2] ? m2[2] : "00";
+    return `${hh}:${mm}`;
+  }
+
+  return value;
 }
 
 function buildPreferredDateTime(fields) {
@@ -518,32 +683,30 @@ function buildPreferredDateTime(fields) {
 
   if (!normalizedDate || !timeRaw) return "";
 
-  // 👉 把 "8 PM" 转换成 24小时制
   let hour = 0;
   let minute = 0;
 
-  const match = timeRaw.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+  let match = timeRaw.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
 
-  if (!match) return "";
+  if (match) {
+    hour = parseInt(match[1], 10);
+    minute = match[2] ? parseInt(match[2], 10) : 0;
+    const period = match[3].toUpperCase();
 
-  hour = parseInt(match[1], 10);
-  minute = match[2] ? parseInt(match[2], 10) : 0;
-  const period = match[3].toUpperCase();
+    if (period === "PM" && hour !== 12) hour += 12;
+    if (period === "AM" && hour === 12) hour = 0;
+  } else {
+    match = timeRaw.match(/^(\d{1,2})(?::(\d{2}))?$/);
+    if (!match) return "";
 
-  if (period === "PM" && hour !== 12) {
-    hour += 12;
-  }
-  if (period === "AM" && hour === 12) {
-    hour = 0;
+    hour = parseInt(match[1], 10);
+    minute = match[2] ? parseInt(match[2], 10) : 0;
   }
 
   const hh = String(hour).padStart(2, "0");
   const mm = String(minute).padStart(2, "0");
 
-  // 👉 强制 ISO 格式（关键）
-  const iso = `${normalizedDate}T${hh}:${mm}:00-03:00`;
-
-  return iso;
+  return `${normalizedDate}T${hh}:${mm}:00-03:00`;
 }
 
 function mapIntentToServiceType(intent) {
@@ -582,10 +745,11 @@ async function maybeAutoCreateAppointment(
 ) {
   const session = liveSessions.get(callSid);
   if (!session) return;
+
   console.log("AUTO BOOK CHECK:", {
-  callSid,
-  fields: session.fields,
-});
+    callSid,
+    fields: session.fields,
+  });
 
   const f = session.fields || {};
 
@@ -677,9 +841,11 @@ function appendTranscript(callSid, role, text) {
 
   session.updatedAt = new Date().toISOString();
 
-  if (role === "caller") {
+  if (role === "caller" || role === "assistant") {
     extractFieldsFromText(session, role, clean);
+  }
 
+  if (role === "caller" || role === "assistant") {
     const hostForInternalApi = `127.0.0.1:${process.env.PORT || 10000}`;
     maybeAutoCreateAppointment(callSid, hostForInternalApi).catch((err) => {
       console.error("maybeAutoCreateAppointment error:", err.message);
@@ -700,14 +866,11 @@ function buildCallSummary(session) {
   if (fields.callbackNumber) parts.push(`Callback: ${fields.callbackNumber}`);
   if (fields.serviceAddress) parts.push(`Address: ${fields.serviceAddress}`);
   if (fields.issueSummary) parts.push(`Issue: ${fields.issueSummary}`);
-  if (fields.preferredDate)
-    parts.push(`Preferred Date: ${fields.preferredDate}`);
-  if (fields.preferredTime)
-    parts.push(`Preferred Time: ${fields.preferredTime}`);
+  if (fields.preferredDate) parts.push(`Preferred Date: ${fields.preferredDate}`);
+  if (fields.preferredTime) parts.push(`Preferred Time: ${fields.preferredTime}`);
   if (fields.bookingConfirmed) parts.push(`Confirmed: yes`);
   if (fields.appointmentCreated) parts.push(`Appointment Created: yes`);
-  if (fields.appointmentEventId)
-    parts.push(`Event ID: ${fields.appointmentEventId}`);
+  if (fields.appointmentEventId) parts.push(`Event ID: ${fields.appointmentEventId}`);
 
   if (!parts.length) {
     const transcriptText = Array.isArray(session.transcript)
@@ -895,8 +1058,6 @@ function attachRealtimeBridge(server) {
         }
 
         if (msg.type === "response.audio_transcript.delta" && msg.delta) {
-          console.log("AI transcript delta:", msg.delta);
-
           updateLiveSession(callSid, {
             activeSpeaker: "assistant",
           });
@@ -909,8 +1070,6 @@ function attachRealtimeBridge(server) {
             "conversation.item.input_audio_transcription.completed" &&
           msg.transcript
         ) {
-          console.log("Caller transcript:", msg.transcript);
-
           updateLiveSession(callSid, {
             activeSpeaker: "caller",
           });
@@ -919,8 +1078,6 @@ function attachRealtimeBridge(server) {
         }
 
         if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
-          console.log("OpenAI audio delta received, length:", msg.delta.length);
-
           updateLiveSession(callSid, {
             activeSpeaker: "assistant",
           });
@@ -942,8 +1099,6 @@ function attachRealtimeBridge(server) {
               mark: { name: "ai-audio-chunk" },
             })
           );
-
-          console.log("Sent audio back to Twilio stream:", streamSid);
         }
       } catch (err) {
         console.error("Failed to parse OpenAI message:", err);
@@ -968,9 +1123,6 @@ function attachRealtimeBridge(server) {
             msg.start?.callSid || msg.start?.customParameters?.CallSid || null;
 
           twilioStarted = true;
-
-          console.log("Twilio stream started:", streamSid);
-          console.log("Twilio callSid:", callSid);
 
           if (callSid) {
             ensureLiveSession(callSid, {
@@ -1004,13 +1156,7 @@ function attachRealtimeBridge(server) {
           }
         }
 
-        if (msg.event === "mark") {
-          console.log("Twilio mark event:", JSON.stringify(msg.mark || {}));
-        }
-
         if (msg.event === "stop") {
-          console.log("Twilio stream stopped");
-
           if (callSid) {
             updateLiveSession(callSid, {
               status: "stream_stopped",
@@ -1031,8 +1177,6 @@ function attachRealtimeBridge(server) {
     });
 
     twilioWs.on("close", () => {
-      console.log("=== Twilio websocket disconnected ===");
-
       if (callSid) {
         updateLiveSession(callSid, {
           status: "stream_closed",
@@ -1499,10 +1643,6 @@ app.get("/live", (req, res) => {
   res.send(html);
 });
 
-// =========================
-// Calendar test routes
-// =========================
-
 app.get("/test/calendar", async (req, res) => {
   try {
     const svc = getCalendarService();
@@ -1571,10 +1711,6 @@ app.get("/test/calendar/slots", async (req, res) => {
   }
 });
 
-// =========================
-// Formal appointment APIs
-// =========================
-
 app.get("/appointments/availability", async (req, res) => {
   try {
     const svc = getCalendarService();
@@ -1635,9 +1771,7 @@ app.post("/appointments", async (req, res) => {
       address: address || "",
       serviceType,
       startDateTime,
-      durationMinutes: Number(
-        durationMinutes || DEFAULT_APPOINTMENT_MINUTES
-      ),
+      durationMinutes: Number(durationMinutes || DEFAULT_APPOINTMENT_MINUTES),
       notes: notes || "",
     });
 
@@ -1752,11 +1886,6 @@ app.post("/admin/call", async (req, res) => {
 });
 
 app.post("/twilio/voice/incoming", (req, res) => {
-  console.log("=== Incoming Call ===");
-  console.log("From:", req.body.From);
-  console.log("To:", req.body.To);
-  console.log("CallSid:", req.body.CallSid);
-
   const from = req.body.From || "";
   const to = req.body.To || "";
   const callSid = req.body.CallSid || "";
@@ -1806,11 +1935,6 @@ app.post("/twilio/voice/incoming", (req, res) => {
 });
 
 app.post("/twilio/voice/outbound", (req, res) => {
-  console.log("=== Outbound Call TwiML Request ===");
-  console.log("From:", req.body.From);
-  console.log("To:", req.body.To);
-  console.log("CallSid:", req.body.CallSid);
-
   const from = req.body.From || "";
   const to = req.body.To || "";
   const callSid = req.body.CallSid || "";
@@ -1861,13 +1985,7 @@ app.post("/twilio/voice/outbound", (req, res) => {
 
 app.post("/twilio/voice/menu", (req, res) => {
   const digits = req.body.Digits || "";
-  const from = req.body.From || "";
   const callSid = req.body.CallSid || "";
-
-  console.log("=== Menu Selection ===");
-  console.log("From:", from);
-  console.log("CallSid:", callSid);
-  console.log("Digits:", digits);
 
   let selectionLabel = "invalid";
   let twiml = "";
@@ -1964,13 +2082,6 @@ app.post("/twilio/voice/menu", (req, res) => {
 });
 
 app.post("/twilio/voice/status", (req, res) => {
-  console.log("=== Call Status Callback ===");
-  console.log("CallSid:", req.body.CallSid);
-  console.log("CallStatus:", req.body.CallStatus);
-  console.log("From:", req.body.From);
-  console.log("To:", req.body.To);
-  console.log("Timestamp:", new Date().toISOString());
-
   const callSid = req.body.CallSid || "";
   const callStatus = req.body.CallStatus || "unknown";
   const from = req.body.From || "";
