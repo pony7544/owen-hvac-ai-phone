@@ -57,6 +57,8 @@ Your goals:
    - callback number
    - service address
    - short issue summary or job request
+   - preferred appointment date
+   - preferred appointment time
 4. Confirm important details clearly.
 5. Keep responses short and spoken, not written.
 
@@ -66,13 +68,21 @@ Rules:
 - Do not promise exact pricing.
 - Do not make final rebate eligibility decisions.
 - If unsure, say a team member will follow up.
-- If the caller gives an address or phone number, repeat it back clearly for confirmation.
-- After collecting enough information, summarize the call and say the team will follow up shortly.
+- If the caller gives an address, phone number, date, or time, repeat it back clearly for confirmation.
+- After collecting enough information, summarize the call and confirm:
+  caller name, callback number, address, issue, preferred appointment date and preferred appointment time.
+- After confirmation, politely tell the caller the appointment request has been recorded.
 
 Important classification hints:
 - "install", "new heat pump", "quote", "estimate", "replace system" => new_installation
-- "service", "repair", "not working", "error code", "broken", "no heat" => service_or_repair
+- "service", "repair", "not working", "error code", "broken", "no heat", "no cooling" => service_or_repair
 - "rebate", "grant", "program", "efficiency", "incentive" => rebate_questions
+
+Very important:
+- Do not invent a date or time.
+- If the caller has not clearly provided a preferred date and time, ask for it.
+- Before finishing, ask for confirmation like:
+  "Just to confirm, I have your name as ..., your phone number as ..., the address as ..., and you’d like an appointment on ... at .... Is that correct?"
 `;
 
 function getCalendarService() {
@@ -179,6 +189,12 @@ function ensureLiveSession(callSid, initial = {}) {
         callbackNumber: "",
         serviceAddress: "",
         issueSummary: "",
+        preferredDate: "",
+        preferredTime: "",
+        preferredDateTime: "",
+        bookingConfirmed: false,
+        appointmentCreated: false,
+        appointmentEventId: "",
       },
     });
   }
@@ -198,8 +214,69 @@ function updateLiveSession(callSid, updates = {}) {
   return session;
 }
 
+function detectConfirmation(session, text) {
+  if (!session || !text) return;
+
+  const lower = text.toLowerCase();
+
+  const yesWords = [
+    "yes",
+    "correct",
+    "that's right",
+    "that is right",
+    "sounds good",
+    "okay",
+    "ok",
+    "confirmed",
+    "yes that's correct",
+    "yes that is correct",
+  ];
+
+  if (yesWords.some((w) => lower.includes(w))) {
+    session.fields.bookingConfirmed = true;
+  }
+}
+
+function extractDateTimeFields(session, text) {
+  if (!session || !text) return;
+
+  const raw = text.trim();
+
+  const datePatterns = [
+    /\b(20\d{2}-\d{2}-\d{2})\b/i,
+    /\b(\d{1,2}\/\d{1,2}\/20\d{2})\b/i,
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,\s*20\d{2})?\b/i,
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,\s*20\d{2})?\b/i,
+    /\b(today)\b/i,
+    /\b(tomorrow)\b/i,
+  ];
+
+  const timePatterns = [
+    /\b(\d{1,2}:\d{2}\s?(am|pm))\b/i,
+    /\b(\d{1,2}\s?(am|pm))\b/i,
+    /\b(\d{1,2}:\d{2})\b/i,
+  ];
+
+  for (const p of datePatterns) {
+    const m = raw.match(p);
+    if (m && !session.fields.preferredDate) {
+      session.fields.preferredDate = m[0].trim();
+      break;
+    }
+  }
+
+  for (const p of timePatterns) {
+    const m = raw.match(p);
+    if (m && !session.fields.preferredTime) {
+      session.fields.preferredTime = m[0].trim();
+      break;
+    }
+  }
+}
+
 function extractFieldsFromText(session, role, text) {
   if (!session || !text) return;
+
   const lower = text.toLowerCase();
 
   if (!session.fields.intent) {
@@ -232,6 +309,8 @@ function extractFieldsFromText(session, role, text) {
     }
   }
 
+  detectConfirmation(session, text);
+
   if (role !== "caller") return;
 
   const namePatterns = [
@@ -263,8 +342,171 @@ function extractFieldsFromText(session, role, text) {
     session.fields.serviceAddress = addressMatch[0].trim();
   }
 
+  extractDateTimeFields(session, text);
+
   if (text.trim().length > 12) {
-    session.fields.issueSummary = text.trim();
+    const lowerText = text.toLowerCase();
+
+    const ignorePhrases = [
+      "yes",
+      "correct",
+      "that's right",
+      "that is right",
+      "sounds good",
+      "okay",
+      "ok",
+      "confirmed",
+    ];
+
+    const isMostlyConfirmation = ignorePhrases.some((p) =>
+      lowerText.includes(p)
+    );
+
+    if (!isMostlyConfirmation) {
+      session.fields.issueSummary = text.trim();
+    }
+  }
+}
+
+function normalizePreferredDate(rawDate) {
+  if (!rawDate) return "";
+
+  const value = String(rawDate).trim().toLowerCase();
+  const now = new Date();
+
+  if (value === "today") {
+    return now.toISOString().slice(0, 10);
+  }
+
+  if (value === "tomorrow") {
+    const d = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    return d.toISOString().slice(0, 10);
+  }
+
+  const direct = new Date(rawDate);
+  if (!Number.isNaN(direct.getTime())) {
+    return direct.toISOString().slice(0, 10);
+  }
+
+  return "";
+}
+
+function normalizePreferredTime(rawTime) {
+  if (!rawTime) return "";
+  return String(rawTime).trim().toUpperCase();
+}
+
+function buildPreferredDateTime(fields) {
+  if (!fields) return "";
+
+  if (fields.preferredDateTime) return fields.preferredDateTime;
+
+  const normalizedDate = normalizePreferredDate(fields.preferredDate);
+  const normalizedTime = normalizePreferredTime(fields.preferredTime);
+
+  if (!normalizedDate || !normalizedTime) return "";
+
+  const combined = `${normalizedDate} ${normalizedTime}`;
+  const parsed = new Date(combined);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  return parsed.toISOString();
+}
+
+function mapIntentToServiceType(intent) {
+  if (intent === "new_installation") return "Heat Pump Estimate";
+  if (intent === "service_or_repair") return "Service Call";
+  if (intent === "rebate_questions") return "Rebate Consultation";
+  return "HVAC Appointment";
+}
+
+async function createAppointmentViaApi(
+  payload,
+  reqHost = `127.0.0.1:${process.env.PORT || 10000}`
+) {
+  const baseUrl = `http://${reqHost}`;
+
+  const res = await fetch(`${baseUrl}/appointments`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error(data.error || "Failed to create appointment");
+  }
+
+  return data;
+}
+
+async function maybeAutoCreateAppointment(
+  callSid,
+  reqHost = `127.0.0.1:${process.env.PORT || 10000}`
+) {
+  const session = liveSessions.get(callSid);
+  if (!session) return;
+
+  const f = session.fields || {};
+
+  if (f.appointmentCreated) return;
+
+  const startDateTime = buildPreferredDateTime(f);
+
+  const hasRequired =
+    f.callerName &&
+    f.callbackNumber &&
+    f.serviceAddress &&
+    f.issueSummary &&
+    startDateTime &&
+    f.bookingConfirmed;
+
+  if (!hasRequired) return;
+
+  try {
+    const serviceType = mapIntentToServiceType(f.intent);
+
+    const result = await createAppointmentViaApi(
+      {
+        customerName: f.callerName,
+        phone: f.callbackNumber,
+        address: f.serviceAddress,
+        serviceType,
+        startDateTime,
+        durationMinutes: DEFAULT_APPOINTMENT_MINUTES,
+        notes: f.issueSummary,
+      },
+      reqHost
+    );
+
+    f.preferredDateTime = startDateTime;
+    f.appointmentCreated = true;
+    f.appointmentEventId = result?.event?.eventId || "";
+
+    session.summary =
+      buildCallSummary(session) +
+      (f.appointmentEventId
+        ? ` | Appointment Created: ${f.appointmentEventId}`
+        : "");
+    session.updatedAt = new Date().toISOString();
+
+    updateCallRecord(callSid, {
+      extractedFields: f,
+      appointmentCreated: true,
+      appointmentEventId: f.appointmentEventId,
+      summary: session.summary,
+    });
+
+    broadcastLiveState();
+    console.log("Appointment auto-created:", f.appointmentEventId);
+  } catch (err) {
+    console.error("Auto appointment creation failed:", err.message);
   }
 }
 
@@ -303,6 +545,11 @@ function appendTranscript(callSid, role, text) {
 
   if (role === "caller") {
     extractFieldsFromText(session, role, clean);
+
+    const hostForInternalApi = `127.0.0.1:${process.env.PORT || 10000}`;
+    maybeAutoCreateAppointment(callSid, hostForInternalApi).catch((err) => {
+      console.error("maybeAutoCreateAppointment error:", err.message);
+    });
   }
 
   broadcastLiveState();
@@ -319,6 +566,14 @@ function buildCallSummary(session) {
   if (fields.callbackNumber) parts.push(`Callback: ${fields.callbackNumber}`);
   if (fields.serviceAddress) parts.push(`Address: ${fields.serviceAddress}`);
   if (fields.issueSummary) parts.push(`Issue: ${fields.issueSummary}`);
+  if (fields.preferredDate)
+    parts.push(`Preferred Date: ${fields.preferredDate}`);
+  if (fields.preferredTime)
+    parts.push(`Preferred Time: ${fields.preferredTime}`);
+  if (fields.bookingConfirmed) parts.push(`Confirmed: yes`);
+  if (fields.appointmentCreated) parts.push(`Appointment Created: yes`);
+  if (fields.appointmentEventId)
+    parts.push(`Event ID: ${fields.appointmentEventId}`);
 
   if (!parts.length) {
     const transcriptText = Array.isArray(session.transcript)
@@ -516,7 +771,8 @@ function attachRealtimeBridge(server) {
         }
 
         if (
-          msg.type === "conversation.item.input_audio_transcription.completed" &&
+          msg.type ===
+            "conversation.item.input_audio_transcription.completed" &&
           msg.transcript
         ) {
           console.log("Caller transcript:", msg.transcript);
@@ -919,6 +1175,26 @@ app.get("/live", (req, res) => {
             <div class="field-value" id="fieldIssue"></div>
           </div>
           <div class="field">
+            <div class="field-label">Preferred Date</div>
+            <div class="field-value" id="fieldPreferredDate"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Preferred Time</div>
+            <div class="field-value" id="fieldPreferredTime"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Booking Confirmed</div>
+            <div class="field-value" id="fieldBookingConfirmed"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Appointment Created</div>
+            <div class="field-value" id="fieldAppointmentCreated"></div>
+          </div>
+          <div class="field">
+            <div class="field-label">Appointment Event ID</div>
+            <div class="field-value" id="fieldAppointmentEventId"></div>
+          </div>
+          <div class="field">
             <div class="field-label">Call Summary</div>
             <div class="field-value" id="fieldSummary"></div>
           </div>
@@ -978,6 +1254,11 @@ app.get("/live", (req, res) => {
         document.getElementById("fieldCallback").textContent = "";
         document.getElementById("fieldAddress").textContent = "";
         document.getElementById("fieldIssue").textContent = "";
+        document.getElementById("fieldPreferredDate").textContent = "";
+        document.getElementById("fieldPreferredTime").textContent = "";
+        document.getElementById("fieldBookingConfirmed").textContent = "";
+        document.getElementById("fieldAppointmentCreated").textContent = "";
+        document.getElementById("fieldAppointmentEventId").textContent = "";
         document.getElementById("fieldSummary").textContent = "";
         return;
       }
@@ -1009,6 +1290,11 @@ app.get("/live", (req, res) => {
       document.getElementById("fieldCallback").textContent = (session.fields && session.fields.callbackNumber) || "";
       document.getElementById("fieldAddress").textContent = (session.fields && session.fields.serviceAddress) || "";
       document.getElementById("fieldIssue").textContent = (session.fields && session.fields.issueSummary) || "";
+      document.getElementById("fieldPreferredDate").textContent = (session.fields && session.fields.preferredDate) || "";
+      document.getElementById("fieldPreferredTime").textContent = (session.fields && session.fields.preferredTime) || "";
+      document.getElementById("fieldBookingConfirmed").textContent = (session.fields && String(session.fields.bookingConfirmed)) || "";
+      document.getElementById("fieldAppointmentCreated").textContent = (session.fields && String(session.fields.appointmentCreated)) || "";
+      document.getElementById("fieldAppointmentEventId").textContent = (session.fields && session.fields.appointmentEventId) || "";
       document.getElementById("fieldSummary").textContent = session.summary || "";
     }
 
@@ -1106,7 +1392,9 @@ app.get("/test/calendar/slots", async (req, res) => {
 
     if (req.query.date) {
       const { start, end, date } = parseDateRangeFromQuery(req.query.date);
-      const slotMinutes = Number(req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES);
+      const slotMinutes = Number(
+        req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES
+      );
       const maxSlots = Number(req.query.maxSlots || 5);
 
       const slots = await svc.getAvailableSlots({
@@ -1153,13 +1441,14 @@ app.get("/test/calendar/slots", async (req, res) => {
 // Formal appointment APIs
 // =========================
 
-// 查询某天可预约时间
 app.get("/appointments/availability", async (req, res) => {
   try {
     const svc = getCalendarService();
     const { start, end, date } = parseDateRangeFromQuery(req.query.date);
 
-    const slotMinutes = Number(req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES);
+    const slotMinutes = Number(
+      req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES
+    );
     const maxSlots = Number(req.query.maxSlots || 10);
 
     const slots = await svc.getAvailableSlots({
@@ -1185,7 +1474,6 @@ app.get("/appointments/availability", async (req, res) => {
   }
 });
 
-// 创建预约
 app.post("/appointments", async (req, res) => {
   try {
     const svc = getCalendarService();
@@ -1213,7 +1501,9 @@ app.post("/appointments", async (req, res) => {
       address: address || "",
       serviceType,
       startDateTime,
-      durationMinutes: Number(durationMinutes || DEFAULT_APPOINTMENT_MINUTES),
+      durationMinutes: Number(
+        durationMinutes || DEFAULT_APPOINTMENT_MINUTES
+      ),
       notes: notes || "",
     });
 
@@ -1230,7 +1520,6 @@ app.post("/appointments", async (req, res) => {
   }
 });
 
-// 修改预约
 app.patch("/appointments/:eventId", async (req, res) => {
   try {
     const svc = getCalendarService();
@@ -1258,7 +1547,6 @@ app.patch("/appointments/:eventId", async (req, res) => {
   }
 });
 
-// 删除预约
 app.delete("/appointments/:eventId", async (req, res) => {
   try {
     const svc = getCalendarService();
@@ -1290,7 +1578,8 @@ app.post("/admin/call", async (req, res) => {
   try {
     if (!twilioClient) {
       return res.status(500).json({
-        error: "Twilio client is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER.",
+        error:
+          "Twilio client is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER.",
       });
     }
 
@@ -1566,7 +1855,11 @@ app.post("/twilio/voice/status", (req, res) => {
     status: callStatus,
   });
 
-  if (["completed", "failed", "busy", "no-answer", "canceled"].includes(callStatus)) {
+  if (
+    ["completed", "failed", "busy", "no-answer", "canceled"].includes(
+      callStatus
+    )
+  ) {
     finalizeSession(callSid);
   }
 
