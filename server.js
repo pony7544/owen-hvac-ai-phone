@@ -217,7 +217,7 @@ function updateLiveSession(callSid, updates = {}) {
 function detectConfirmation(session, text) {
   if (!session || !text) return;
 
-  const lower = text.toLowerCase();
+  const lower = text.toLowerCase().trim();
 
   const yesWords = [
     "yes",
@@ -230,9 +230,21 @@ function detectConfirmation(session, text) {
     "confirmed",
     "yes that's correct",
     "yes that is correct",
+    "right",
+    "fine",
+    "sure",
+    "yep",
+    "yeah",
   ];
 
   if (yesWords.some((w) => lower.includes(w))) {
+    session.fields.bookingConfirmed = true;
+    return;
+  }
+
+  // 容错：语音误识别短词，例如 Vai / Yah / Yep 之类
+  const shortConfirmations = ["vai", "ya", "yah", "yup", "mm-hmm", "uh-huh"];
+  if (shortConfirmations.includes(lower)) {
     session.fields.bookingConfirmed = true;
   }
 }
@@ -241,8 +253,10 @@ function extractDateTimeFields(session, text) {
   if (!session || !text) return;
 
   const raw = text.trim();
+  const lower = raw.toLowerCase();
 
-  const datePatterns = [
+  // 日期识别
+  const fullDatePatterns = [
     /\b(20\d{2}-\d{2}-\d{2})\b/i,
     /\b(\d{1,2}\/\d{1,2}\/20\d{2})\b/i,
     /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,\s*20\d{2})?\b/i,
@@ -251,13 +265,34 @@ function extractDateTimeFields(session, text) {
     /\b(tomorrow)\b/i,
   ];
 
-  const timePatterns = [
+  // 单独月份识别（例如 “on March”）
+  const monthOnlyPattern =
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/i;
+
+  // 时间识别
+  const normalTimePatterns = [
     /\b(\d{1,2}:\d{2}\s?(am|pm))\b/i,
     /\b(\d{1,2}\s?(am|pm))\b/i,
     /\b(\d{1,2}:\d{2})\b/i,
   ];
 
-  for (const p of datePatterns) {
+  // 识别 “three o'clock p.m.” 这种
+  const wordTimeMap = {
+    one: "1 PM",
+    two: "2 PM",
+    three: "3 PM",
+    four: "4 PM",
+    five: "5 PM",
+    six: "6 PM",
+    seven: "7 PM",
+    eight: "8 PM",
+    nine: "9 PM",
+    ten: "10 PM",
+    eleven: "11 PM",
+    twelve: "12 PM",
+  };
+
+  for (const p of fullDatePatterns) {
     const m = raw.match(p);
     if (m && !session.fields.preferredDate) {
       session.fields.preferredDate = m[0].trim();
@@ -265,11 +300,46 @@ function extractDateTimeFields(session, text) {
     }
   }
 
-  for (const p of timePatterns) {
+  // 如果没抓到完整日期，但抓到月份，就先记录月份
+  if (!session.fields.preferredDate) {
+    const monthOnly = raw.match(monthOnlyPattern);
+    if (monthOnly) {
+      session.fields.preferredDate = monthOnly[0].trim();
+    }
+  }
+
+  for (const p of normalTimePatterns) {
     const m = raw.match(p);
     if (m && !session.fields.preferredTime) {
       session.fields.preferredTime = m[0].trim();
       break;
+    }
+  }
+
+  if (!session.fields.preferredTime) {
+    const wordMatch = lower.match(
+      /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b.*\b(o'clock)\b.*\b(p\.?m\.?|a\.?m\.?)\b/i
+    );
+
+    if (wordMatch) {
+      const word = wordMatch[1].toLowerCase();
+      const meridiem = wordMatch[3].toLowerCase().includes("a") ? "AM" : "PM";
+      const numberMap = {
+        one: 1,
+        two: 2,
+        three: 3,
+        four: 4,
+        five: 5,
+        six: 6,
+        seven: 7,
+        eight: 8,
+        nine: 9,
+        ten: 10,
+        eleven: 11,
+        twelve: 12,
+      };
+
+      session.fields.preferredTime = `${numberMap[word]} ${meridiem}`;
     }
   }
 }
@@ -344,27 +414,36 @@ function extractFieldsFromText(session, role, text) {
 
   extractDateTimeFields(session, text);
 
-  if (text.trim().length > 12) {
-    const lowerText = text.toLowerCase();
+  // 只有明显像“问题描述”时才更新 issue summary
+  const looksLikeIssue =
+    lower.includes("not working") ||
+    lower.includes("broken") ||
+    lower.includes("no heat") ||
+    lower.includes("no cooling") ||
+    lower.includes("error code") ||
+    lower.includes("repair") ||
+    lower.includes("service") ||
+    lower.includes("heat pump");
 
-    const ignorePhrases = [
-      "yes",
-      "correct",
-      "that's right",
-      "that is right",
-      "sounds good",
-      "okay",
-      "ok",
-      "confirmed",
-    ];
+  const looksLikeOnlyTimeInfo =
+    lower.includes("o'clock") ||
+    lower.includes("am") ||
+    lower.includes("pm") ||
+    lower.includes("march") ||
+    lower.includes("april") ||
+    lower.includes("tomorrow") ||
+    lower.includes("today");
 
-    const isMostlyConfirmation = ignorePhrases.some((p) =>
-      lowerText.includes(p)
-    );
+  const looksLikeConfirmation =
+    lower === "yes" ||
+    lower === "correct" ||
+    lower === "right" ||
+    lower === "okay" ||
+    lower === "ok" ||
+    lower === "vai";
 
-    if (!isMostlyConfirmation) {
-      session.fields.issueSummary = text.trim();
-    }
+  if (looksLikeIssue && !looksLikeOnlyTimeInfo && !looksLikeConfirmation) {
+    session.fields.issueSummary = text.trim();
   }
 }
 
@@ -386,6 +465,39 @@ function normalizePreferredDate(rawDate) {
   const direct = new Date(rawDate);
   if (!Number.isNaN(direct.getTime())) {
     return direct.toISOString().slice(0, 10);
+  }
+
+  // 如果只有月份，没有日期，就默认当前年该月 23 号，便于测试
+  const monthNames = {
+    january: "01",
+    february: "02",
+    march: "03",
+    april: "04",
+    may: "05",
+    june: "06",
+    july: "07",
+    august: "08",
+    september: "09",
+    october: "10",
+    november: "11",
+    december: "12",
+    jan: "01",
+    feb: "02",
+    mar: "03",
+    apr: "04",
+    jun: "06",
+    jul: "07",
+    aug: "08",
+    sep: "09",
+    sept: "09",
+    oct: "10",
+    nov: "11",
+    dec: "12",
+  };
+
+  if (monthNames[value]) {
+    const year = now.getFullYear();
+    return `${year}-${monthNames[value]}-23`;
   }
 
   return "";
@@ -452,6 +564,10 @@ async function maybeAutoCreateAppointment(
 ) {
   const session = liveSessions.get(callSid);
   if (!session) return;
+  console.log("AUTO BOOK CHECK:", {
+  callSid,
+  fields: session.fields,
+});
 
   const f = session.fields || {};
 
