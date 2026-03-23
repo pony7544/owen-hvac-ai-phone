@@ -1,2121 +1,847 @@
-const { HVACCalendarService } = require("./service");
+require("dotenv").config();
+
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const http = require("http");
-const { WebSocketServer, WebSocket } = require("ws");
-const twilio = require("twilio");
+const path = require("path");
+const bodyParser = require("body-parser");
+const WebSocket = require("ws");
+const { google } = require("googleapis");
 
 const app = express();
+const server = http.createServer(app);
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, "public")));
 
-let calendarService = null;
+const PORT = process.env.PORT || 10000;
 
-const DATA_DIR = path.join(__dirname, "data");
-const CALLS_FILE = path.join(DATA_DIR, "calls.json");
-
-const LIVE_AGENT_NUMBER = process.env.LIVE_AGENT_NUMBER || "";
-const APP_MODE = (process.env.APP_MODE || "menu").toLowerCase();
-
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-
-const DEFAULT_APPOINTMENT_MINUTES = Number(
-  process.env.DEFAULT_APPOINTMENT_MINUTES || 60
+// =========================
+// ENV
+// =========================
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "Owen HVAC Corp";
+const BUSINESS_PHONE = process.env.BUSINESS_PHONE || "";
+const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || "America/Halifax";
+const DEFAULT_APPOINTMENT_MINUTES = parseInt(
+  process.env.DEFAULT_APPOINTMENT_MINUTES || "60",
+  10
 );
 
-const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || "America/Halifax";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    : null;
+// =========================
+// Google Calendar
+// =========================
+const oauth2Client = new google.auth.OAuth2(
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET
+);
 
-const liveSessions = new Map();
-const sseClients = new Set();
+oauth2Client.setCredentials({
+  refresh_token: GOOGLE_REFRESH_TOKEN,
+});
 
-const HVAC_SYSTEM_PROMPT = `
-You are the phone assistant for Owen HVAC Corp in Nova Scotia, Canada.
+const calendar = google.calendar({
+  version: "v3",
+  auth: oauth2Client,
+});
 
-Your role is to act like a professional phone intake coordinator for an HVAC company.
-
-Your goals:
-1. Greet the caller briefly.
-2. Determine whether the call is about:
-   - new heat pump installation
-   - service or repair
-   - rebate or grant questions
-3. Collect these fields in a natural phone conversation:
-   - caller name
-   - callback number
-   - service address
-   - short issue summary or job request
-   - preferred appointment date
-   - preferred appointment time
-4. Confirm important details clearly.
-5. Keep responses short and spoken, not written.
-
-Rules:
-- Ask one question at a time.
-- Be concise and professional.
-- Do not promise exact pricing.
-- Do not make final rebate eligibility decisions.
-- If unsure, say a team member will follow up.
-- If the caller gives an address, phone number, date, or time, repeat it back clearly for confirmation.
-- After collecting enough information, summarize the call and confirm:
-  caller name, callback number, address, issue, preferred appointment date and preferred appointment time.
-- After confirmation, politely tell the caller the appointment request has been recorded.
-
-Important classification hints:
-- "install", "new heat pump", "quote", "estimate", "replace system" => new_installation
-- "service", "repair", "not working", "error code", "broken", "no heat", "no cooling" => service_or_repair
-- "rebate", "grant", "program", "efficiency", "incentive" => rebate_questions
-
-Very important:
-- Do not invent a date or time.
-- If the caller has not clearly provided a preferred date and time, ask for it.
-- Before finishing, ask for confirmation like:
-  "Just to confirm, I have your name as ..., your phone number as ..., the address as ..., and you’d like an appointment on ... at .... Is that correct?"
-`;
-
-function getCalendarService() {
-  if (!calendarService) {
-    calendarService = new HVACCalendarService();
-  }
-  return calendarService;
-}
-
-function ensureStorage() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(CALLS_FILE)) {
-    fs.writeFileSync(CALLS_FILE, JSON.stringify([], null, 2), "utf8");
+// =========================
+// In-memory session store
+// production可换Redis
+// =========================
+const liveCalls = new Map();
+/*
+liveCalls[callSid] = {
+  callSid,
+  streamSid,
+  transcript: [],
+  lastAssistantText: "",
+  extracted: {
+    intent: "",
+    name: "",
+    phone: "",
+    address: "",
+    issue: "",
+    preferredDateRaw: "",
+    preferredTimeRaw: "",
+    bookingConfirmed: false,
+    appointmentCreated: false,
+    appointmentEventId: "",
   }
 }
+*/
 
-function readCalls() {
-  ensureStorage();
-  try {
-    const raw = fs.readFileSync(CALLS_FILE, "utf8");
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error("Failed to read calls file:", err);
-    return [];
-  }
-}
-
-function saveAllCalls(calls) {
-  ensureStorage();
-  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2), "utf8");
-}
-
-function saveCallRecord(record) {
-  const calls = readCalls();
-  calls.push(record);
-  saveAllCalls(calls);
-}
-
-function updateCallRecord(callSid, updates) {
-  const calls = readCalls();
-  const index = calls.findIndex((item) => item.callSid === callSid);
-
-  if (index >= 0) {
-    calls[index] = {
-      ...calls[index],
-      ...updates,
-      updatedAt: new Date().toISOString(),
-    };
-  } else {
-    calls.push({
+// =========================
+// Helpers
+// =========================
+function getOrCreateCallSession(callSid) {
+  if (!liveCalls.has(callSid)) {
+    liveCalls.set(callSid, {
       callSid,
-      ...updates,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-  }
-
-  saveAllCalls(calls);
-}
-
-function getLiveState() {
-  return Array.from(liveSessions.values()).sort((a, b) => {
-    return new Date(b.startedAt || 0) - new Date(a.startedAt || 0);
-  });
-}
-
-function broadcastLiveState() {
-  const payload = JSON.stringify({
-    type: "snapshot",
-    sessions: getLiveState(),
-  });
-
-  for (const res of sseClients) {
-    try {
-      res.write(`data: ${payload}\n\n`);
-    } catch (err) {
-      console.error("SSE write error:", err);
-    }
-  }
-}
-
-function ensureLiveSession(callSid, initial = {}) {
-  if (!callSid) return null;
-
-  if (!liveSessions.has(callSid)) {
-    liveSessions.set(callSid, {
-      callSid,
-      from: initial.from || "",
-      to: initial.to || "",
-      status: initial.status || "started",
-      streamSid: initial.streamSid || "",
-      direction: initial.direction || "incoming",
-      startedAt: initial.startedAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      activeSpeaker: "",
-      summary: "",
-      selection: initial.selection || "",
+      streamSid: "",
       transcript: [],
-      fields: {
+      lastAssistantText: "",
+      extracted: {
         intent: "",
-        callerName: "",
-        callbackNumber: "",
-        serviceAddress: "",
-        issueSummary: "",
-        preferredDate: "",
-        preferredTime: "",
-        preferredDateTime: "",
+        name: "",
+        phone: "",
+        address: "",
+        issue: "",
+        preferredDateRaw: "",
+        preferredTimeRaw: "",
         bookingConfirmed: false,
         appointmentCreated: false,
         appointmentEventId: "",
       },
     });
   }
-
-  return liveSessions.get(callSid);
+  return liveCalls.get(callSid);
 }
 
-function updateLiveSession(callSid, updates = {}) {
-  const session = ensureLiveSession(callSid);
-  if (!session) return null;
+function pushTranscript(callSid, role, text) {
+  const session = getOrCreateCallSession(callSid);
+  session.transcript.push({
+    role,
+    text,
+    ts: new Date().toISOString(),
+  });
+}
 
-  Object.assign(session, updates, {
-    updatedAt: new Date().toISOString(),
+function normalizePhone(phone) {
+  if (!phone) return "";
+  return phone.replace(/[^\d+]/g, "").trim();
+}
+
+function cleanText(s) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+function monthNameToNumber(name) {
+  const months = {
+    january: 1,
+    february: 2,
+    march: 3,
+    april: 4,
+    may: 5,
+    june: 6,
+    july: 7,
+    august: 8,
+    september: 9,
+    october: 10,
+    november: 11,
+    december: 12,
+  };
+  return months[(name || "").toLowerCase()] || null;
+}
+
+function parseAssistantConfirmation(text) {
+  const raw = cleanText(text);
+  const result = {};
+
+  // name
+  const nameMatch =
+    raw.match(/name as ([^,\.]+)/i) ||
+    raw.match(/your name is ([^,\.]+)/i) ||
+    raw.match(/i have your name as ([^,\.]+)/i);
+  if (nameMatch) result.name = cleanText(nameMatch[1]);
+
+  // phone
+  const phoneMatch =
+    raw.match(/phone number as ([+\d\-\s\(\)]+)/i) ||
+    raw.match(/callback number as ([+\d\-\s\(\)]+)/i) ||
+    raw.match(/number as ([+\d\-\s\(\)]+)/i);
+  if (phoneMatch) result.phone = cleanText(phoneMatch[1]);
+
+  // address
+  const addressMatch =
+    raw.match(/address as ([^\.]+?)(?:, and the issue is| and the issue is|\.|$)/i) ||
+    raw.match(/service address as ([^\.]+?)(?:, and the issue is| and the issue is|\.|$)/i);
+  if (addressMatch) result.address = cleanText(addressMatch[1]);
+
+  // issue
+  const issueMatch =
+    raw.match(/issue is (.+?)(?:\.| is that all correct| perfect)/i) ||
+    raw.match(/problem is (.+?)(?:\.| is that all correct| perfect)/i);
+  if (issueMatch) result.issue = cleanText(issueMatch[1]);
+
+  // confirmation
+  if (
+    /is that all correct/i.test(raw) ||
+    /just to confirm/i.test(raw) ||
+    /we've recorded your appointment request/i.test(raw)
+  ) {
+    result.confirmationPromptSeen = true;
+  }
+
+  // appointment date + time
+  // e.g. "appointment on March 25 at 8 o'clock"
+  const dateTimeMatch =
+    raw.match(/appointment on ([a-zA-Z]+ \d{1,2}) at ([^\.]+?)(?:\.| just to confirm)/i) ||
+    raw.match(/prefer an appointment on ([a-zA-Z]+ \d{1,2}) at ([^\.]+?)(?:\.| just to confirm)/i) ||
+    raw.match(/like the appointment on ([a-zA-Z]+ \d{1,2}) at ([^\.]+?)(?:\.| just to confirm)/i);
+
+  if (dateTimeMatch) {
+    result.preferredDateRaw = cleanText(dateTimeMatch[1]);
+    result.preferredTimeRaw = cleanText(dateTimeMatch[2]);
+  }
+
+  return result;
+}
+
+function mergeExtracted(target, incoming) {
+  for (const key of Object.keys(incoming)) {
+    if (
+      incoming[key] !== undefined &&
+      incoming[key] !== null &&
+      incoming[key] !== ""
+    ) {
+      target[key] = incoming[key];
+    }
+  }
+}
+
+function parsePreferredDateTime(dateRaw, timeRaw, timezone = BUSINESS_TIMEZONE) {
+  if (!dateRaw || !timeRaw) return null;
+
+  // 支持 "March 25"
+  const dateMatch = dateRaw.match(/^([A-Za-z]+)\s+(\d{1,2})$/);
+  if (!dateMatch) return null;
+
+  const month = monthNameToNumber(dateMatch[1]);
+  const day = parseInt(dateMatch[2], 10);
+  if (!month || !day) return null;
+
+  // 默认按今年；若已过去太多，可改成明年
+  const now = new Date();
+  let year = now.getFullYear();
+
+  // time parse
+  // 例：8 o'clock / 8:30 / 5 pm / 5:30 pm
+  let hour = null;
+  let minute = 0;
+  const t = timeRaw.toLowerCase().replace(/\s+/g, " ").trim();
+
+  let m =
+    t.match(/^(\d{1,2})\s*o'?clock$/) ||
+    t.match(/^(\d{1,2})$/) ||
+    t.match(/^(\d{1,2}):(\d{2})$/) ||
+    t.match(/^(\d{1,2})\s*(am|pm)$/) ||
+    t.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/);
+
+  if (!m) return null;
+
+  if (m.length === 2) {
+    hour = parseInt(m[1], 10);
+  } else if (m.length === 3 && /^\d+$/.test(m[1]) && /^\d+$/.test(m[2])) {
+    hour = parseInt(m[1], 10);
+    minute = parseInt(m[2], 10);
+  } else if (m.length === 3) {
+    hour = parseInt(m[1], 10);
+    const ampm = m[2];
+    if (ampm === "pm" && hour < 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+  } else if (m.length === 4) {
+    hour = parseInt(m[1], 10);
+    minute = parseInt(m[2], 10);
+    const ampm = m[3];
+    if (ampm === "pm" && hour < 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+  }
+
+  // 对纯数字时间做简单业务推断：
+  // 1-8 默认下午更常见，可按实际业务调整
+  if (/^\d{1,2}$/.test(t) || /^\d{1,2}\s*o'?clock$/.test(t)) {
+    if (hour >= 1 && hour <= 8) hour += 12;
+  }
+
+  const start = new Date(year, month - 1, day, hour, minute, 0, 0);
+
+  // 如果日期已经过去很多，可自动挪到明年
+  if (start.getTime() < now.getTime() - 24 * 60 * 60 * 1000) {
+    start.setFullYear(year + 1);
+  }
+
+  const end = new Date(start.getTime() + DEFAULT_APPOINTMENT_MINUTES * 60000);
+
+  return {
+    start,
+    end,
+    timezone,
+  };
+}
+
+function buildCallSummary(extracted) {
+  return [
+    `Intent: ${extracted.intent || ""}`,
+    `Name: ${extracted.name || ""}`,
+    `Callback: ${extracted.phone || ""}`,
+    `Address: ${extracted.address || ""}`,
+    `Issue: ${extracted.issue || ""}`,
+    `Preferred Date: ${extracted.preferredDateRaw || ""}`,
+    `Preferred Time: ${extracted.preferredTimeRaw || ""}`,
+    `Confirmed: ${extracted.bookingConfirmed ? "yes" : "no"}`,
+    `Appointment Created: ${extracted.appointmentCreated ? "yes" : "no"}`,
+    `Event ID: ${extracted.appointmentEventId || ""}`,
+  ].join(" | ");
+}
+
+async function testCalendarConnection() {
+  const res = await calendar.calendars.get({
+    calendarId: GOOGLE_CALENDAR_ID,
+  });
+  return res.data;
+}
+
+async function listEventsForDay(dateStr) {
+  const dayStart = new Date(`${dateStr}T00:00:00`);
+  const dayEnd = new Date(`${dateStr}T23:59:59`);
+
+  const res = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    timeMin: dayStart.toISOString(),
+    timeMax: dayEnd.toISOString(),
+    singleEvents: true,
+    orderBy: "startTime",
   });
 
-  broadcastLiveState();
-  return session;
+  return res.data.items || [];
 }
 
-function detectConfirmation(session, text) {
-  if (!session || !text) return;
+function generateSlotsForDay(dateStr, events, slotMinutes = 120) {
+  const slots = [];
 
-  const lower = text.toLowerCase().trim();
+  const workStart = new Date(`${dateStr}T08:00:00`);
+  const workEnd = new Date(`${dateStr}T18:00:00`);
 
-  const yesWords = [
-    "yes",
-    "correct",
-    "that's right",
-    "that is right",
-    "sounds good",
-    "okay",
-    "ok",
-    "confirmed",
-    "yes that's correct",
-    "yes that is correct",
-    "right",
-    "fine",
-    "sure",
-    "yep",
-    "yeah",
-  ];
+  let cursor = new Date(workStart);
 
-  if (yesWords.some((w) => lower.includes(w))) {
-    session.fields.bookingConfirmed = true;
-    return;
-  }
+  while (cursor < workEnd) {
+    const slotStart = new Date(cursor);
+    const slotEnd = new Date(cursor.getTime() + slotMinutes * 60000);
 
-  const shortConfirmations = ["vai", "ya", "yah", "yup", "mm-hmm", "uh-huh"];
-  if (shortConfirmations.includes(lower)) {
-    session.fields.bookingConfirmed = true;
-  }
-}
+    const overlaps = events.some((evt) => {
+      if (!evt.start?.dateTime || !evt.end?.dateTime) return false;
+      const evtStart = new Date(evt.start.dateTime);
+      const evtEnd = new Date(evt.end.dateTime);
+      return slotStart < evtEnd && slotEnd > evtStart;
+    });
 
-function extractDateTimeFields(session, text) {
-  if (!session || !text) return;
-
-  const raw = String(text).trim();
-  const lower = raw.toLowerCase();
-
-  const numberWords = {
-    one: 1,
-    two: 2,
-    three: 3,
-    four: 4,
-    five: 5,
-    six: 6,
-    seven: 7,
-    eight: 8,
-    nine: 9,
-    ten: 10,
-    eleven: 11,
-    twelve: 12,
-    thirteen: 13,
-    fourteen: 14,
-    fifteen: 15,
-    sixteen: 16,
-    seventeen: 17,
-    eighteen: 18,
-    nineteen: 19,
-    twenty: 20,
-    thirty: 30,
-    first: 1,
-    second: 2,
-    third: 3,
-    fourth: 4,
-    fifth: 5,
-    sixth: 6,
-    seventh: 7,
-    eighth: 8,
-    ninth: 9,
-    tenth: 10,
-    eleventh: 11,
-    twelfth: 12,
-    thirteenth: 13,
-    fourteenth: 14,
-    fifteenth: 15,
-    sixteenth: 16,
-    seventeenth: 17,
-    eighteenth: 18,
-    nineteenth: 19,
-    twentieth: 20,
-    twentyfirst: 21,
-    "twenty-first": 21,
-    twentysecond: 22,
-    "twenty-second": 22,
-    twentythird: 23,
-    "twenty-third": 23,
-    twentyfourth: 24,
-    "twenty-fourth": 24,
-    twentyfifth: 25,
-    "twenty-fifth": 25,
-    twentysixth: 26,
-    "twenty-sixth": 26,
-    twentyseventh: 27,
-    "twenty-seventh": 27,
-    twentyeighth: 28,
-    "twenty-eighth": 28,
-    twentyninth: 29,
-    "twenty-ninth": 29,
-    thirtieth: 30,
-    thirtyfirst: 31,
-    "thirty-first": 31,
-  };
-
-  function parseWordDay(fragment) {
-    if (!fragment) return null;
-
-    let s = fragment
-      .toLowerCase()
-      .replace(/[^a-z-\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (!s) return null;
-
-    if (numberWords[s] != null) return numberWords[s];
-
-    const compact = s.replace(/\s+/g, "");
-    if (numberWords[compact] != null) return numberWords[compact];
-
-    const parts = s.split(/[\s-]+/).filter(Boolean);
-    if (!parts.length) return null;
-
-    let total = 0;
-    for (const p of parts) {
-      if (numberWords[p] == null) return null;
-      total += numberWords[p];
+    if (!overlaps && slotEnd <= workEnd) {
+      slots.push({
+        start: slotStart.toISOString(),
+        end: slotEnd.toISOString(),
+      });
     }
 
-    if (total >= 1 && total <= 31) return total;
+    cursor = new Date(cursor.getTime() + slotMinutes * 60000);
+  }
+
+  return slots;
+}
+
+async function createAppointmentEvent({
+  name,
+  phone,
+  address,
+  issue,
+  preferredDateRaw,
+  preferredTimeRaw,
+}) {
+  const parsed = parsePreferredDateTime(preferredDateRaw, preferredTimeRaw);
+  if (!parsed) {
+    throw new Error("Unable to parse preferred date/time from confirmation text.");
+  }
+
+  const event = {
+    summary: `Service Call - ${name || "Customer"}`,
+    location: address || "",
+    description: [
+      `Customer Name: ${name || ""}`,
+      `Phone: ${phone || ""}`,
+      `Address: ${address || ""}`,
+      `Issue: ${issue || ""}`,
+      `Booked by AI phone assistant for ${BUSINESS_NAME}.`,
+    ].join("\n"),
+    start: {
+      dateTime: parsed.start.toISOString(),
+      timeZone: parsed.timezone,
+    },
+    end: {
+      dateTime: parsed.end.toISOString(),
+      timeZone: parsed.timezone,
+    },
+  };
+
+  const res = await calendar.events.insert({
+    calendarId: GOOGLE_CALENDAR_ID,
+    requestBody: event,
+  });
+
+  return res.data;
+}
+
+async function maybeAutoCreateAppointment(callSid) {
+  const session = getOrCreateCallSession(callSid);
+  const ex = session.extracted;
+
+  if (ex.appointmentCreated) return null;
+  if (!ex.bookingConfirmed) return null;
+
+  if (
+    !ex.name ||
+    !ex.phone ||
+    !ex.address ||
+    !ex.issue ||
+    !ex.preferredDateRaw ||
+    !ex.preferredTimeRaw
+  ) {
     return null;
   }
 
-  // 1) 标准日期
-  const fullDatePatterns = [
-    /\b(20\d{2}-\d{2}-\d{2})\b/i,
-    /\b(\d{1,2}\/\d{1,2}\/20\d{2})\b/i,
-    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/i,
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/i,
-    /\b(today)\b/i,
-    /\b(tomorrow)\b/i,
-  ];
-
-  for (const p of fullDatePatterns) {
-    const m = raw.match(p);
-    if (m && !session.fields.preferredDate) {
-      session.fields.preferredDate = m[0].trim();
-      break;
-    }
-  }
-
-  // 2) March twenty-five
-  if (!session.fields.preferredDate) {
-    const monthWordPattern =
-      /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+([a-z-]+(?:\s+[a-z-]+)?)\b/i;
-
-    const mw = raw.match(monthWordPattern);
-    if (mw) {
-      const monthWord = mw[1];
-      const dayWord = mw[2];
-      const dayNum = parseWordDay(dayWord);
-
-      if (dayNum) {
-        session.fields.preferredDate = `${monthWord} ${dayNum}`;
-      } else {
-        session.fields.preferredDate = monthWord;
-      }
-    }
-  }
-
-  // 3) 只有月份
-  if (!session.fields.preferredDate) {
-    const monthOnlyPattern =
-      /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/i;
-
-    const monthOnly = raw.match(monthOnlyPattern);
-    if (monthOnly) {
-      session.fields.preferredDate = monthOnly[0].trim();
-    }
-  }
-
-  // 4) 标准时间
-  const normalTimePatterns = [
-    /\b(\d{1,2}:\d{2}\s?(am|pm))\b/i,
-    /\b(\d{1,2}\s?(am|pm))\b/i,
-    /\b(\d{1,2}:\d{2})\b/i,
-  ];
-
-  for (const p of normalTimePatterns) {
-    const m = raw.match(p);
-    if (m && !session.fields.preferredTime) {
-      session.fields.preferredTime = m[0].trim();
-      break;
-    }
-  }
-
-  // 5) from eight o'clock / at three o'clock p.m.
-  if (!session.fields.preferredTime) {
-    const wordClockPattern =
-      /\b(?:from\s+|at\s+|around\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b(?:\s+o'?clock)?(?:\s+in\s+the\s+(morning|afternoon|evening))?(?:\s+(a\.?m\.?|p\.?m\.?))?/i;
-
-    const wm = lower.match(wordClockPattern);
-    if (wm) {
-      const word = wm[1];
-      const daytime = wm[2] || "";
-      const ap = wm[3] || "";
-
-      let meridiem = "";
-
-      if (ap) {
-        meridiem = ap.toLowerCase().includes("a") ? "AM" : "PM";
-      } else if (daytime === "morning") {
-        meridiem = "AM";
-      } else if (daytime === "afternoon" || daytime === "evening") {
-        meridiem = "PM";
-      }
-
-      const hour = numberWords[word];
-      if (hour) {
-        session.fields.preferredTime = meridiem ? `${hour} ${meridiem}` : `${hour}`;
-      }
-    }
-  }
-
-  // 6) 8 in the morning
-  if (!session.fields.preferredTime) {
-    const numericDaytimePattern =
-      /\b(\d{1,2})(?::(\d{2}))?\s+in\s+the\s+(morning|afternoon|evening)\b/i;
-
-    const nm = raw.match(numericDaytimePattern);
-    if (nm) {
-      const hour = parseInt(nm[1], 10);
-      const minute = nm[2] ? nm[2] : "00";
-      const period = nm[3].toLowerCase() === "morning" ? "AM" : "PM";
-      session.fields.preferredTime = `${hour}:${minute} ${period}`;
-    }
-  }
-
-  // 7) eight in the morning
-  if (!session.fields.preferredTime) {
-    const wordDaytimePattern =
-      /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+in\s+the\s+(morning|afternoon|evening)\b/i;
-
-    const wd = lower.match(wordDaytimePattern);
-    if (wd) {
-      const hour = numberWords[wd[1]];
-      const period = wd[2].toLowerCase() === "morning" ? "AM" : "PM";
-      session.fields.preferredTime = `${hour} ${period}`;
-    }
-  }
-}
-
-function extractFieldsFromText(session, role, text) {
-  if (!session || !text) return;
-
-  const lower = text.toLowerCase();
-
-  if (!session.fields.intent) {
-    if (
-      lower.includes("install") ||
-      lower.includes("new heat pump") ||
-      lower.includes("quote") ||
-      lower.includes("estimate") ||
-      lower.includes("replace")
-    ) {
-      session.fields.intent = "new_installation";
-    } else if (
-      lower.includes("service") ||
-      lower.includes("repair") ||
-      lower.includes("error code") ||
-      lower.includes("not working") ||
-      lower.includes("broken") ||
-      lower.includes("no heat") ||
-      lower.includes("no cooling") ||
-      lower.includes("e1") ||
-      lower.includes("e2")
-    ) {
-      session.fields.intent = "service_or_repair";
-    } else if (
-      lower.includes("rebate") ||
-      lower.includes("grant") ||
-      lower.includes("program") ||
-      lower.includes("incentive") ||
-      lower.includes("efficiency")
-    ) {
-      session.fields.intent = "rebate_questions";
-    }
-  }
-
-  detectConfirmation(session, text);
-
-  const namePatterns = [
-    /my name is ([a-z ,.'-]+)/i,
-    /this is ([a-z ,.'-]+)/i,
-    /i am ([a-z ,.'-]+)/i,
-    /i'm ([a-z ,.'-]+)/i,
-    /name as ([a-z ,.'-]+)/i,
-  ];
-
-  for (const p of namePatterns) {
-    const m = text.match(p);
-    if (m && !session.fields.callerName) {
-      session.fields.callerName = m[1].trim();
-      break;
-    }
-  }
-
-  const phoneMatch = text.match(
-    /(\+?1?[\s\-().]*\d{3}[\s\-().]*\d{3}[\s\-().]*\d{4})/
-  );
-  if (phoneMatch && !session.fields.callbackNumber) {
-    session.fields.callbackNumber = phoneMatch[1].trim();
-  }
-
-  const addressMatch = text.match(
-    /\b\d{1,6}\s+[A-Za-z0-9.'-]+\s+(Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Lane|Ln|Court|Ct|Boulevard|Blvd|Highway|Hwy|Way|Place|Pl|Terrace|Ter)\b.*?/i
-  );
-  if (addressMatch && !session.fields.serviceAddress) {
-    session.fields.serviceAddress = addressMatch[0].trim();
-  }
-
-  extractDateTimeFields(session, text);
-
-  const looksLikeIssue =
-    lower.includes("not working") ||
-    lower.includes("broken") ||
-    lower.includes("no heat") ||
-    lower.includes("no cooling") ||
-    lower.includes("error code") ||
-    lower.includes("repair") ||
-    lower.includes("service") ||
-    lower.includes("heat pump") ||
-    lower.includes("outside machine") ||
-    lower.includes("inside it works") ||
-    lower.includes("e1") ||
-    lower.includes("e2");
-
-  const looksLikeOnlyDateTime =
-    lower.includes("o'clock") ||
-    lower.includes("am") ||
-    lower.includes("pm") ||
-    lower.includes("morning") ||
-    lower.includes("afternoon") ||
-    lower.includes("evening") ||
-    lower.includes("march") ||
-    lower.includes("april") ||
-    lower.includes("may") ||
-    lower.includes("june") ||
-    lower.includes("july") ||
-    lower.includes("august") ||
-    lower.includes("september") ||
-    lower.includes("october") ||
-    lower.includes("november") ||
-    lower.includes("december") ||
-    lower.includes("today") ||
-    lower.includes("tomorrow");
-
-  const looksLikeConfirmation =
-    lower === "yes" ||
-    lower === "correct" ||
-    lower === "right" ||
-    lower === "okay" ||
-    lower === "ok" ||
-    lower === "fine" ||
-    lower === "sure" ||
-    lower === "yep" ||
-    lower === "yeah" ||
-    lower === "vai";
-
-  if (looksLikeIssue && !looksLikeOnlyDateTime && !looksLikeConfirmation) {
-    session.fields.issueSummary = text.trim();
-  }
-}
-
-function normalizePreferredDate(rawDate) {
-  if (!rawDate) return "";
-
-  const value = String(rawDate).trim().toLowerCase();
-  const now = new Date();
-
-  if (value === "today") {
-    return now.toISOString().slice(0, 10);
-  }
-
-  if (value === "tomorrow") {
-    const d = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-    return d.toISOString().slice(0, 10);
-  }
-
-  const direct = new Date(rawDate);
-  if (!Number.isNaN(direct.getTime())) {
-    return direct.toISOString().slice(0, 10);
-  }
-
-  const monthMap = {
-    january: "01",
-    jan: "01",
-    february: "02",
-    feb: "02",
-    march: "03",
-    mar: "03",
-    april: "04",
-    apr: "04",
-    may: "05",
-    june: "06",
-    jun: "06",
-    july: "07",
-    jul: "07",
-    august: "08",
-    aug: "08",
-    september: "09",
-    sep: "09",
-    sept: "09",
-    october: "10",
-    oct: "10",
-    november: "11",
-    nov: "11",
-    december: "12",
-    dec: "12",
-  };
-
-  const md = value.match(
-    /\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+(\d{1,2})\b/i
-  );
-  if (md) {
-    const year = now.getFullYear();
-    const month = monthMap[md[1].toLowerCase()];
-    const day = String(parseInt(md[2], 10)).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  }
-
-  if (monthMap[value]) {
-    const year = now.getFullYear();
-    return `${year}-${monthMap[value]}-23`;
-  }
-
-  return "";
-}
-
-function normalizePreferredTime(rawTime) {
-  if (!rawTime) return "";
-
-  const value = String(rawTime).trim().toUpperCase();
-
-  const m1 = value.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
-  if (m1) {
-    const hh = parseInt(m1[1], 10);
-    const mm = m1[2] ? m1[2] : "00";
-    return `${hh}:${mm} ${m1[3].toUpperCase()}`;
-  }
-
-  const m2 = value.match(/^(\d{1,2})(?::(\d{2}))?$/);
-  if (m2) {
-    const hh = parseInt(m2[1], 10);
-    const mm = m2[2] ? m2[2] : "00";
-    return `${hh}:${mm}`;
-  }
-
-  return value;
-}
-
-function buildPreferredDateTime(fields) {
-  if (!fields) return "";
-
-  if (fields.preferredDateTime) return fields.preferredDateTime;
-
-  const normalizedDate = normalizePreferredDate(fields.preferredDate);
-  let timeRaw = normalizePreferredTime(fields.preferredTime);
-
-  if (!normalizedDate || !timeRaw) return "";
-
-  let hour = 0;
-  let minute = 0;
-
-  let match = timeRaw.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
-
-  if (match) {
-    hour = parseInt(match[1], 10);
-    minute = match[2] ? parseInt(match[2], 10) : 0;
-    const period = match[3].toUpperCase();
-
-    if (period === "PM" && hour !== 12) hour += 12;
-    if (period === "AM" && hour === 12) hour = 0;
-  } else {
-    match = timeRaw.match(/^(\d{1,2})(?::(\d{2}))?$/);
-    if (!match) return "";
-
-    hour = parseInt(match[1], 10);
-    minute = match[2] ? parseInt(match[2], 10) : 0;
-  }
-
-  const hh = String(hour).padStart(2, "0");
-  const mm = String(minute).padStart(2, "0");
-
-  return `${normalizedDate}T${hh}:${mm}:00-03:00`;
-}
-
-function mapIntentToServiceType(intent) {
-  if (intent === "new_installation") return "Heat Pump Estimate";
-  if (intent === "service_or_repair") return "Service Call";
-  if (intent === "rebate_questions") return "Rebate Consultation";
-  return "HVAC Appointment";
-}
-
-async function createAppointmentViaApi(
-  payload,
-  reqHost = `127.0.0.1:${process.env.PORT || 10000}`
-) {
-  const baseUrl = `http://${reqHost}`;
-
-  const res = await fetch(`${baseUrl}/appointments`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
+  const created = await createAppointmentEvent({
+    name: ex.name,
+    phone: ex.phone,
+    address: ex.address,
+    issue: ex.issue,
+    preferredDateRaw: ex.preferredDateRaw,
+    preferredTimeRaw: ex.preferredTimeRaw,
   });
 
-  const data = await res.json();
+  ex.appointmentCreated = true;
+  ex.appointmentEventId = created.id || "";
 
-  if (!res.ok) {
-    throw new Error(data.error || "Failed to create appointment");
-  }
-
-  return data;
+  return created;
 }
 
-async function maybeAutoCreateAppointment(
-  callSid,
-  reqHost = `127.0.0.1:${process.env.PORT || 10000}`
-) {
-  const session = liveSessions.get(callSid);
-  if (!session) return;
+// =========================
+// Realtime dashboard API
+// =========================
+app.get("/api/live-call/:callSid", (req, res) => {
+  const callSid = req.params.callSid;
+  const session = liveCalls.get(callSid);
 
-  console.log("AUTO BOOK CHECK:", {
-    callSid,
-    fields: session.fields,
-  });
-
-  const f = session.fields || {};
-
-  if (f.appointmentCreated) return;
-
-  const startDateTime = buildPreferredDateTime(f);
-
-  const hasRequired =
-    f.callerName &&
-    f.callbackNumber &&
-    f.serviceAddress &&
-    f.issueSummary &&
-    startDateTime &&
-    f.bookingConfirmed;
-
-  if (!hasRequired) return;
-
-  try {
-    const serviceType = mapIntentToServiceType(f.intent);
-
-    const result = await createAppointmentViaApi(
-      {
-        customerName: f.callerName,
-        phone: f.callbackNumber,
-        address: f.serviceAddress,
-        serviceType,
-        startDateTime,
-        durationMinutes: DEFAULT_APPOINTMENT_MINUTES,
-        notes: f.issueSummary,
-      },
-      reqHost
-    );
-
-    f.preferredDateTime = startDateTime;
-    f.appointmentCreated = true;
-    f.appointmentEventId = result?.event?.eventId || "";
-
-    session.summary =
-      buildCallSummary(session) +
-      (f.appointmentEventId
-        ? ` | Appointment Created: ${f.appointmentEventId}`
-        : "");
-    session.updatedAt = new Date().toISOString();
-
-    updateCallRecord(callSid, {
-      extractedFields: f,
-      appointmentCreated: true,
-      appointmentEventId: f.appointmentEventId,
-      summary: session.summary,
-    });
-
-    broadcastLiveState();
-    console.log("Appointment auto-created:", f.appointmentEventId);
-  } catch (err) {
-    console.error("Auto appointment creation failed:", err.message);
-  }
-}
-
-function appendTranscript(callSid, role, text) {
-  if (!callSid || !text) return;
-
-  const session = ensureLiveSession(callSid);
-  if (!session) return;
-
-  if (!Array.isArray(session.transcript)) {
-    session.transcript = [];
+  if (!session) {
+    return res.status(404).json({ ok: false, error: "Call not found" });
   }
 
-  const clean = String(text).replace(/\s+/g, " ").trim();
-  if (!clean) return;
-
-  const last = session.transcript[session.transcript.length - 1];
-
-  if (last && last.role === role) {
-    const needsSpace =
-      last.text &&
-      !last.text.endsWith(" ") &&
-      ![".", ",", "!", "?", ":", ";"].includes(clean[0]);
-
-    last.text = `${last.text}${needsSpace ? " " : ""}${clean}`.trim();
-    last.at = new Date().toISOString();
-  } else {
-    session.transcript.push({
-      role,
-      text: clean,
-      at: new Date().toISOString(),
-    });
-  }
-
-  session.updatedAt = new Date().toISOString();
-
-  if (role === "caller" || role === "assistant") {
-    extractFieldsFromText(session, role, clean);
-  }
-
-  if (role === "caller" || role === "assistant") {
-    const hostForInternalApi = `127.0.0.1:${process.env.PORT || 10000}`;
-    maybeAutoCreateAppointment(callSid, hostForInternalApi).catch((err) => {
-      console.error("maybeAutoCreateAppointment error:", err.message);
-    });
-  }
-
-  broadcastLiveState();
-}
-
-function buildCallSummary(session) {
-  if (!session) return "";
-
-  const fields = session.fields || {};
-  const parts = [];
-
-  if (fields.intent) parts.push(`Intent: ${fields.intent}`);
-  if (fields.callerName) parts.push(`Name: ${fields.callerName}`);
-  if (fields.callbackNumber) parts.push(`Callback: ${fields.callbackNumber}`);
-  if (fields.serviceAddress) parts.push(`Address: ${fields.serviceAddress}`);
-  if (fields.issueSummary) parts.push(`Issue: ${fields.issueSummary}`);
-  if (fields.preferredDate) parts.push(`Preferred Date: ${fields.preferredDate}`);
-  if (fields.preferredTime) parts.push(`Preferred Time: ${fields.preferredTime}`);
-  if (fields.bookingConfirmed) parts.push(`Confirmed: yes`);
-  if (fields.appointmentCreated) parts.push(`Appointment Created: yes`);
-  if (fields.appointmentEventId) parts.push(`Event ID: ${fields.appointmentEventId}`);
-
-  if (!parts.length) {
-    const transcriptText = Array.isArray(session.transcript)
-      ? session.transcript.map((t) => `[${t.role}] ${t.text}`).join(" ")
-      : "";
-    return transcriptText.slice(0, 500);
-  }
-
-  return parts.join(" | ");
-}
-
-function finalizeSession(callSid) {
-  const session = liveSessions.get(callSid);
-  if (!session) return;
-
-  session.activeSpeaker = "";
-  session.summary = buildCallSummary(session);
-
-  updateCallRecord(callSid, {
+  return res.json({
+    ok: true,
+    callSid: session.callSid,
+    streamSid: session.streamSid,
     transcript: session.transcript,
-    extractedFields: session.fields,
-    summary: session.summary || "",
-    liveStatus: session.status,
+    extracted: session.extracted,
+    callSummary: buildCallSummary(session.extracted),
   });
+});
 
-  broadcastLiveState();
-
-  setTimeout(() => {
-    liveSessions.delete(callSid);
-    broadcastLiveState();
-  }, 5 * 60 * 1000);
-}
-
-function buildMenuTwiml(host) {
-  const gatherActionUrl = `https://${host}/twilio/voice/menu`;
-
-  return `
-<Response>
-  <Say language="en-US" voice="alice">
-    Thank you for calling Owen H V A C Corp.
-  </Say>
-  <Pause length="1"/>
-  <Say language="en-US" voice="alice">
-    For a new heat pump installation, press 1.
-    For service or repair, press 2.
-    For rebate or grant questions, press 3.
-    To speak with our team directly, press 0.
-  </Say>
-  <Gather numDigits="1" action="${gatherActionUrl}" method="POST" timeout="8">
-    <Say language="en-US" voice="alice">
-      Please make your selection now.
-    </Say>
-  </Gather>
-  <Say language="en-US" voice="alice">
-    We did not receive your selection.
-    Please call again, or our team will follow up shortly.
-  </Say>
-  <Hangup/>
-</Response>`.trim();
-}
-
-function buildAiStreamTwiml(host) {
-  const streamUrl = `wss://${host}/twilio/stream`;
-
-  return `
-<Response>
-  <Connect>
-    <Stream url="${streamUrl}" />
-  </Connect>
-</Response>`.trim();
-}
-
-function parseDateRangeFromQuery(dateStr) {
-  const date = String(dateStr || "").trim();
-  if (!date) {
-    throw new Error("date is required, format: YYYY-MM-DD");
-  }
-
-  const start = new Date(`${date}T00:00:00-03:00`);
-  const end = new Date(`${date}T23:59:59-03:00`);
-
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    throw new Error("Invalid date format. Use YYYY-MM-DD");
-  }
-
-  return { start, end, date };
-}
-
-function attachRealtimeBridge(server) {
-  const wss = new WebSocketServer({
-    server,
-    path: "/twilio/stream",
-  });
-
-  wss.on("connection", (twilioWs) => {
-    console.log("=== Twilio stream connected ===");
-
-    let streamSid = null;
-    let callSid = null;
-    let openAiReady = false;
-    let twilioStarted = false;
-    let initialGreetingSent = false;
-
-    if (!OPENAI_API_KEY) {
-      console.error("OPENAI_API_KEY is missing");
-      try {
-        twilioWs.close();
-      } catch {}
-      return;
-    }
-
-    const openaiWs = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-realtime",
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "OpenAI-Beta": "realtime=v1",
-        },
-      }
-    );
-
-    function maybeStartInitialGreeting() {
-      if (!openAiReady || !twilioStarted || initialGreetingSent) return;
-      initialGreetingSent = true;
-
-      const initialResponse = {
-        type: "response.create",
-        response: {
-          output_modalities: ["audio", "text"],
-          instructions:
-            "Greet the caller briefly and say: Thank you for calling Owen HVAC Corp. Are you calling about a new installation, service or repair, or rebate questions?",
-        },
-      };
-
-      openaiWs.send(JSON.stringify(initialResponse));
-    }
-
-    openaiWs.on("open", () => {
-      console.log("=== OpenAI realtime connected ===");
-      openAiReady = true;
-
-      const sessionUpdate = {
-        type: "session.update",
-        session: {
-          modalities: ["audio", "text"],
-          instructions: HVAC_SYSTEM_PROMPT,
-          voice: "alloy",
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 500,
-            create_response: true,
-          },
-          input_audio_transcription: {
-            model: "gpt-4o-mini-transcribe",
-          },
-        },
-      };
-
-      openaiWs.send(JSON.stringify(sessionUpdate));
-      maybeStartInitialGreeting();
-    });
-
-    openaiWs.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-
-        if (msg.type) {
-          console.log("OpenAI raw event type:", msg.type);
-        }
-
-        if (
-          msg.type === "session.created" ||
-          msg.type === "session.updated" ||
-          msg.type === "response.done" ||
-          msg.type === "error"
-        ) {
-          console.log("OpenAI event:", msg.type);
-          if (msg.type === "error") {
-            console.error("OpenAI error payload:", JSON.stringify(msg));
-          }
-        }
-
-        if (msg.type === "response.audio_transcript.delta" && msg.delta) {
-          updateLiveSession(callSid, {
-            activeSpeaker: "assistant",
-          });
-
-          appendTranscript(callSid, "assistant", msg.delta);
-        }
-
-        if (
-          msg.type ===
-            "conversation.item.input_audio_transcription.completed" &&
-          msg.transcript
-        ) {
-          updateLiveSession(callSid, {
-            activeSpeaker: "caller",
-          });
-
-          appendTranscript(callSid, "caller", msg.transcript);
-        }
-
-        if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
-          updateLiveSession(callSid, {
-            activeSpeaker: "assistant",
-          });
-
-          const mediaMsg = {
-            event: "media",
-            streamSid,
-            media: {
-              payload: msg.delta,
-            },
-          };
-
-          twilioWs.send(JSON.stringify(mediaMsg));
-
-          twilioWs.send(
-            JSON.stringify({
-              event: "mark",
-              streamSid,
-              mark: { name: "ai-audio-chunk" },
-            })
-          );
-        }
-      } catch (err) {
-        console.error("Failed to parse OpenAI message:", err);
-      }
-    });
-
-    openaiWs.on("close", () => {
-      console.log("=== OpenAI realtime disconnected ===");
-    });
-
-    openaiWs.on("error", (err) => {
-      console.error("OpenAI websocket error:", err);
-    });
-
-    twilioWs.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-
-        if (msg.event === "start") {
-          streamSid = msg.start?.streamSid || null;
-          callSid =
-            msg.start?.callSid || msg.start?.customParameters?.CallSid || null;
-
-          twilioStarted = true;
-
-          if (callSid) {
-            ensureLiveSession(callSid, {
-              streamSid,
-              status: "in_progress",
-              selection: "ai_mode",
-            });
-            updateLiveSession(callSid, {
-              streamSid,
-              status: "in_progress",
-              selection: "ai_mode",
-            });
-            updateCallRecord(callSid, {
-              stage: "ai_stream_started",
-              streamSid,
-              selection: "ai_mode",
-            });
-          }
-
-          maybeStartInitialGreeting();
-        }
-
-        if (msg.event === "media" && msg.media?.payload) {
-          const audioAppend = {
-            type: "input_audio_buffer.append",
-            audio: msg.media.payload,
-          };
-
-          if (openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.send(JSON.stringify(audioAppend));
-          }
-        }
-
-        if (msg.event === "stop") {
-          if (callSid) {
-            updateLiveSession(callSid, {
-              status: "stream_stopped",
-              activeSpeaker: "",
-            });
-            updateCallRecord(callSid, {
-              stage: "ai_stream_stopped",
-            });
-          }
-
-          if (openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.close();
-          }
-        }
-      } catch (err) {
-        console.error("Failed to parse Twilio message:", err);
-      }
-    });
-
-    twilioWs.on("close", () => {
-      if (callSid) {
-        updateLiveSession(callSid, {
-          status: "stream_closed",
-          activeSpeaker: "",
-        });
-      }
-
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.close();
-      }
-    });
-
-    twilioWs.on("error", (err) => {
-      console.error("Twilio websocket error:", err);
-    });
-  });
-}
-
-ensureStorage();
-
+// =========================
+// Health
+// =========================
 app.get("/", (req, res) => {
-  res.send("Owen HVAC phone system is running.");
+  res.send("Owen HVAC AI phone server is running.");
 });
 
-app.get("/calls", (req, res) => {
-  const calls = readCalls().sort((a, b) => {
-    return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
-  });
-  res.json(calls);
-});
-
-app.get("/dashboard", (req, res) => {
-  res.redirect("/live");
-});
-
-app.get("/live/events", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  if (typeof res.flushHeaders === "function") {
-    res.flushHeaders();
-  }
-
-  const sendInitial = JSON.stringify({
-    type: "snapshot",
-    sessions: getLiveState(),
-  });
-  res.write(`data: ${sendInitial}\n\n`);
-
-  sseClients.add(res);
-
-  req.on("close", () => {
-    sseClients.delete(res);
-  });
-});
-
-app.get("/live", (req, res) => {
-  const html = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Owen HVAC Live Monitor</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: Arial, sans-serif;
-      background: #f4f6fb;
-      color: #111827;
-    }
-    .wrap {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 20px;
-    }
-    h1 {
-      margin: 0 0 8px;
-    }
-    .sub {
-      color: #6b7280;
-      margin-bottom: 16px;
-    }
-    .topbar {
-      display: grid;
-      grid-template-columns: 1fr 380px;
-      gap: 16px;
-      margin-bottom: 16px;
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-      padding: 16px;
-    }
-    .dial-box input, .dial-box select, .dial-box button {
-      width: 100%;
-      box-sizing: border-box;
-      margin-bottom: 10px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid #d1d5db;
-      font-size: 14px;
-    }
-    .dial-box button {
-      background: #111827;
-      color: white;
-      border: none;
-      cursor: pointer;
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: 360px 1fr;
-      gap: 16px;
-    }
-    .session-list {
-      max-height: 75vh;
-      overflow: auto;
-    }
-    .session-item {
-      border: 1px solid #e5e7eb;
-      border-radius: 12px;
-      padding: 12px;
-      margin-bottom: 10px;
-      cursor: pointer;
-    }
-    .session-item.active {
-      border-color: #2563eb;
-      background: #eff6ff;
-    }
-    .session-title {
-      font-weight: bold;
-      margin-bottom: 4px;
-    }
-    .muted {
-      color: #6b7280;
-      font-size: 13px;
-    }
-    .main-grid {
-      display: grid;
-      grid-template-columns: 1fr 320px;
-      gap: 16px;
-    }
-    .transcript-box {
-      max-height: 75vh;
-      overflow: auto;
-    }
-    .bubble {
-      padding: 10px 12px;
-      border-radius: 12px;
-      margin-bottom: 10px;
-      font-size: 14px;
-      line-height: 1.5;
-    }
-    .bubble.active {
-      outline: 3px solid #2563eb;
-      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
-    }
-    .caller {
-      background: #fef3c7;
-    }
-    .assistant {
-      background: #dbeafe;
-    }
-    .system {
-      background: #e5e7eb;
-    }
-    .field {
-      margin-bottom: 12px;
-    }
-    .field-label {
-      font-size: 12px;
-      color: #6b7280;
-      margin-bottom: 4px;
-    }
-    .field-value {
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
-      border-radius: 10px;
-      padding: 10px;
-      min-height: 18px;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .status {
-      display: inline-block;
-      padding: 4px 8px;
-      border-radius: 999px;
-      background: #dcfce7;
-      color: #166534;
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .small {
-      font-size: 12px;
-    }
-    @media (max-width: 1100px) {
-      .topbar, .layout, .main-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Owen HVAC Live Monitor</h1>
-    <div class="sub">Real-time phone call transcript + AI intake fields + outbound call launcher.</div>
-
-    <div class="topbar">
-      <div class="card">
-        <div><strong>System mode:</strong> ${APP_MODE}</div>
-        <div class="small muted" style="margin-top:8px;">
-          Open this page during a call to see transcript updates in real time.
-        </div>
-      </div>
-
-      <div class="card dial-box">
-        <h3 style="margin-top:0;">Place outbound AI call</h3>
-        <input id="dialTo" type="text" placeholder="+1902XXXXXXX" />
-        <select id="dialMode">
-          <option value="ai">AI mode</option>
-          <option value="menu">Menu mode</option>
-        </select>
-        <button id="dialBtn">Call now</button>
-        <div id="dialResult" class="muted small"></div>
-      </div>
-    </div>
-
-    <div class="layout">
-      <div class="card session-list" id="sessionList"></div>
-
-      <div class="main-grid">
-        <div class="card transcript-box">
-          <h3 style="margin-top:0;">Live Transcript</h3>
-          <div id="transcriptBox" class="muted">No active call selected.</div>
-        </div>
-
-        <div class="card">
-          <h3 style="margin-top:0;">Extracted Fields</h3>
-          <div class="field">
-            <div class="field-label">Call SID</div>
-            <div class="field-value" id="fieldCallSid"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">From</div>
-            <div class="field-value" id="fieldFrom"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">To</div>
-            <div class="field-value" id="fieldTo"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Status</div>
-            <div class="field-value" id="fieldStatus"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Intent</div>
-            <div class="field-value" id="fieldIntent"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Caller Name</div>
-            <div class="field-value" id="fieldName"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Callback Number</div>
-            <div class="field-value" id="fieldCallback"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Service Address</div>
-            <div class="field-value" id="fieldAddress"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Issue Summary</div>
-            <div class="field-value" id="fieldIssue"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Preferred Date</div>
-            <div class="field-value" id="fieldPreferredDate"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Preferred Time</div>
-            <div class="field-value" id="fieldPreferredTime"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Booking Confirmed</div>
-            <div class="field-value" id="fieldBookingConfirmed"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Appointment Created</div>
-            <div class="field-value" id="fieldAppointmentCreated"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Appointment Event ID</div>
-            <div class="field-value" id="fieldAppointmentEventId"></div>
-          </div>
-          <div class="field">
-            <div class="field-label">Call Summary</div>
-            <div class="field-value" id="fieldSummary"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let sessions = [];
-    let selectedCallSid = null;
-
-    function escapeHtml(value = "") {
-      return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
-
-    function renderSessionList() {
-      const el = document.getElementById("sessionList");
-
-      if (!sessions.length) {
-        el.innerHTML = '<div class="muted">No live or recent sessions.</div>';
-        return;
-      }
-
-      el.innerHTML = sessions.map(s => {
-        const activeClass = s.callSid === selectedCallSid ? "active" : "";
-        return \`
-          <div class="session-item \${activeClass}" onclick="selectSession('\${s.callSid}')">
-            <div class="session-title">\${escapeHtml(s.from || "Unknown caller")}</div>
-            <div class="muted">CallSid: \${escapeHtml(s.callSid || "-")}</div>
-            <div class="muted">Status: <span class="status">\${escapeHtml(s.status || "unknown")}</span></div>
-            <div class="muted">Intent: \${escapeHtml((s.fields && s.fields.intent) || "-")}</div>
-            <div class="muted">Summary: \${escapeHtml((s.summary || "").slice(0, 80) || "-")}</div>
-          </div>
-        \`;
-      }).join("");
-    }
-
-    function renderSelectedSession() {
-      const session = sessions.find(s => s.callSid === selectedCallSid);
-
-      const transcriptBox = document.getElementById("transcriptBox");
-
-      if (!session) {
-        transcriptBox.innerHTML = '<div class="muted">No active call selected.</div>';
-        document.getElementById("fieldCallSid").textContent = "";
-        document.getElementById("fieldFrom").textContent = "";
-        document.getElementById("fieldTo").textContent = "";
-        document.getElementById("fieldStatus").textContent = "";
-        document.getElementById("fieldIntent").textContent = "";
-        document.getElementById("fieldName").textContent = "";
-        document.getElementById("fieldCallback").textContent = "";
-        document.getElementById("fieldAddress").textContent = "";
-        document.getElementById("fieldIssue").textContent = "";
-        document.getElementById("fieldPreferredDate").textContent = "";
-        document.getElementById("fieldPreferredTime").textContent = "";
-        document.getElementById("fieldBookingConfirmed").textContent = "";
-        document.getElementById("fieldAppointmentCreated").textContent = "";
-        document.getElementById("fieldAppointmentEventId").textContent = "";
-        document.getElementById("fieldSummary").textContent = "";
-        return;
-      }
-
-      const transcript = Array.isArray(session.transcript) ? session.transcript : [];
-      const activeSpeaker = session.activeSpeaker || "";
-
-      transcriptBox.innerHTML = transcript.length
-        ? transcript.map((t, idx) => {
-            const cls = t.role === "caller" ? "caller" : t.role === "assistant" ? "assistant" : "system";
-            const isLast = idx === transcript.length - 1;
-            const activeClass = isLast && t.role === activeSpeaker ? "active" : "";
-
-            return \`
-              <div class="bubble \${cls} \${activeClass}">
-                <strong>\${escapeHtml(t.role)}:</strong><br/>
-                \${escapeHtml(t.text || "")}
-              </div>
-            \`;
-          }).join("")
-        : '<div class="muted">No transcript yet.</div>';
-
-      document.getElementById("fieldCallSid").textContent = session.callSid || "";
-      document.getElementById("fieldFrom").textContent = session.from || "";
-      document.getElementById("fieldTo").textContent = session.to || "";
-      document.getElementById("fieldStatus").textContent = session.status || "";
-      document.getElementById("fieldIntent").textContent = (session.fields && session.fields.intent) || "";
-      document.getElementById("fieldName").textContent = (session.fields && session.fields.callerName) || "";
-      document.getElementById("fieldCallback").textContent = (session.fields && session.fields.callbackNumber) || "";
-      document.getElementById("fieldAddress").textContent = (session.fields && session.fields.serviceAddress) || "";
-      document.getElementById("fieldIssue").textContent = (session.fields && session.fields.issueSummary) || "";
-      document.getElementById("fieldPreferredDate").textContent = (session.fields && session.fields.preferredDate) || "";
-      document.getElementById("fieldPreferredTime").textContent = (session.fields && session.fields.preferredTime) || "";
-      document.getElementById("fieldBookingConfirmed").textContent = (session.fields && String(session.fields.bookingConfirmed)) || "";
-      document.getElementById("fieldAppointmentCreated").textContent = (session.fields && String(session.fields.appointmentCreated)) || "";
-      document.getElementById("fieldAppointmentEventId").textContent = (session.fields && session.fields.appointmentEventId) || "";
-      document.getElementById("fieldSummary").textContent = session.summary || "";
-    }
-
-    function selectSession(callSid) {
-      selectedCallSid = callSid;
-      renderSessionList();
-      renderSelectedSession();
-    }
-
-    window.selectSession = selectSession;
-
-    function applySnapshot(data) {
-      sessions = Array.isArray(data.sessions) ? data.sessions : [];
-      if (!selectedCallSid && sessions.length) {
-        selectedCallSid = sessions[0].callSid;
-      }
-      if (selectedCallSid && !sessions.find(s => s.callSid === selectedCallSid)) {
-        selectedCallSid = sessions.length ? sessions[0].callSid : null;
-      }
-      renderSessionList();
-      renderSelectedSession();
-    }
-
-    const es = new EventSource("/live/events");
-    es.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === "snapshot") {
-          applySnapshot(data);
-        }
-      } catch (err) {
-        console.error(err);
-      }
-    };
-
-    document.getElementById("dialBtn").addEventListener("click", async () => {
-      const to = document.getElementById("dialTo").value.trim();
-      const mode = document.getElementById("dialMode").value;
-      const result = document.getElementById("dialResult");
-
-      result.textContent = "Calling...";
-
-      try {
-        const res = await fetch("/admin/call", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ to, mode })
-        });
-
-        const data = await res.json();
-
-        if (!res.ok) {
-          result.textContent = data.error || "Failed to place call.";
-          return;
-        }
-
-        result.textContent = "Call started. CallSid: " + (data.callSid || "");
-      } catch (err) {
-        result.textContent = "Request failed.";
-      }
-    });
-  </script>
-</body>
-</html>
-  `.trim();
-
-  res.type("text/html");
-  res.send(html);
-});
-
+// =========================
+// Calendar APIs
+// =========================
 app.get("/test/calendar", async (req, res) => {
   try {
-    const svc = getCalendarService();
-    const info = await svc.getCalendarInfo();
-    res.json({
-      ok: true,
-      calendar: info,
-    });
+    const data = await testCalendarConnection();
+    res.json({ ok: true, calendar: data });
   } catch (err) {
-    console.error("Calendar info test failed:", err);
+    console.error("Calendar test error:", err?.message || err);
     res.status(500).json({
       ok: false,
-      error: err.message,
-    });
-  }
-});
-
-app.get("/test/calendar/slots", async (req, res) => {
-  try {
-    const svc = getCalendarService();
-
-    if (req.query.date) {
-      const { start, end, date } = parseDateRangeFromQuery(req.query.date);
-      const slotMinutes = Number(
-        req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES
-      );
-      const maxSlots = Number(req.query.maxSlots || 5);
-
-      const slots = await svc.getAvailableSlots({
-        start,
-        end,
-        slotMinutes,
-        maxSlots,
-      });
-
-      return res.json({
-        ok: true,
-        date,
-        slotMinutes,
-        count: slots.length,
-        slots,
-      });
-    }
-
-    const now = new Date();
-    const end = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
-
-    const slots = await svc.getAvailableSlots({
-      start: now,
-      end,
-      maxSlots: 5,
-      slotMinutes: DEFAULT_APPOINTMENT_MINUTES,
-    });
-
-    res.json({
-      ok: true,
-      count: slots.length,
-      slots,
-    });
-  } catch (err) {
-    console.error("Calendar slots test failed:", err);
-    res.status(500).json({
-      ok: false,
-      error: err.message,
+      error: err?.message || "Calendar connection failed",
     });
   }
 });
 
 app.get("/appointments/availability", async (req, res) => {
   try {
-    const svc = getCalendarService();
-    const { start, end, date } = parseDateRangeFromQuery(req.query.date);
+    const date = req.query.date;
+    if (!date) {
+      return res.status(400).json({ ok: false, error: "Missing date" });
+    }
 
-    const slotMinutes = Number(
-      req.query.slotMinutes || DEFAULT_APPOINTMENT_MINUTES
-    );
-    const maxSlots = Number(req.query.maxSlots || 10);
-
-    const slots = await svc.getAvailableSlots({
-      start,
-      end,
-      slotMinutes,
-      maxSlots,
-    });
+    const events = await listEventsForDay(date);
+    const slots = generateSlotsForDay(date, events, 120);
 
     res.json({
       ok: true,
       date,
-      slotMinutes,
-      count: slots.length,
+      timezone: BUSINESS_TIMEZONE,
       slots,
     });
   } catch (err) {
-    console.error("Availability lookup failed:", err);
+    console.error("Availability error:", err?.message || err);
     res.status(500).json({
       ok: false,
-      error: err.message,
+      error: err?.message || "Failed to get availability",
     });
   }
 });
 
 app.post("/appointments", async (req, res) => {
   try {
-    const svc = getCalendarService();
-
     const {
-      customerName,
+      name,
       phone,
       address,
-      serviceType,
-      startDateTime,
-      durationMinutes,
-      notes,
-    } = req.body || {};
+      issue,
+      preferredDateRaw,
+      preferredTimeRaw,
+    } = req.body;
 
-    if (!customerName || !serviceType || !startDateTime) {
-      return res.status(400).json({
-        ok: false,
-        error: "customerName, serviceType, startDateTime are required",
-      });
-    }
-
-    const result = await svc.createAppointment({
-      customerName,
-      phone: phone || "",
-      address: address || "",
-      serviceType,
-      startDateTime,
-      durationMinutes: Number(durationMinutes || DEFAULT_APPOINTMENT_MINUTES),
-      notes: notes || "",
+    const event = await createAppointmentEvent({
+      name,
+      phone,
+      address,
+      issue,
+      preferredDateRaw,
+      preferredTimeRaw,
     });
 
     res.json({
       ok: true,
-      event: result,
+      eventId: event.id,
+      htmlLink: event.htmlLink,
+      event,
     });
   } catch (err) {
-    console.error("Create appointment failed:", err);
+    console.error("Create appointment error:", err?.message || err);
     res.status(500).json({
       ok: false,
-      error: err.message,
+      error: err?.message || "Failed to create appointment",
     });
   }
 });
 
-app.patch("/appointments/:eventId", async (req, res) => {
-  try {
-    const svc = getCalendarService();
-    const { eventId } = req.params;
+// =========================
+// Twilio voice webhook
+// =========================
+app.post("/twilio/voice", (req, res) => {
+  const callSid = req.body.CallSid || `call_${Date.now()}`;
+  getOrCreateCallSession(callSid);
 
-    if (!eventId) {
-      return res.status(400).json({
-        ok: false,
-        error: "eventId is required",
-      });
-    }
-
-    const result = await svc.updateAppointment(eventId, req.body || {});
-
-    res.json({
-      ok: true,
-      event: result,
-    });
-  } catch (err) {
-    console.error("Update appointment failed:", err);
-    res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
-});
-
-app.delete("/appointments/:eventId", async (req, res) => {
-  try {
-    const svc = getCalendarService();
-    const { eventId } = req.params;
-
-    if (!eventId) {
-      return res.status(400).json({
-        ok: false,
-        error: "eventId is required",
-      });
-    }
-
-    const result = await svc.cancelAppointment(eventId);
-
-    res.json({
-      ok: true,
-      result,
-    });
-  } catch (err) {
-    console.error("Delete appointment failed:", err);
-    res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
-});
-
-app.post("/admin/call", async (req, res) => {
-  try {
-    if (!twilioClient) {
-      return res.status(500).json({
-        error:
-          "Twilio client is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER.",
-      });
-    }
-
-    const to = String(req.body.to || "").trim();
-    const mode = String(req.body.mode || "ai").trim().toLowerCase();
-
-    if (!to) {
-      return res.status(400).json({ error: "Phone number is required." });
-    }
-
-    const host = req.get("host");
-    const voiceUrl =
-      mode === "menu"
-        ? `https://${host}/twilio/voice/outbound?mode=menu`
-        : `https://${host}/twilio/voice/outbound?mode=ai`;
-
-    const call = await twilioClient.calls.create({
-      to,
-      from: TWILIO_PHONE_NUMBER,
-      url: voiceUrl,
-      method: "POST",
-      statusCallback: `https://${host}/twilio/voice/status`,
-      statusCallbackMethod: "POST",
-    });
-
-    return res.json({
-      ok: true,
-      callSid: call.sid,
-    });
-  } catch (err) {
-    console.error("Outbound call failed:", err);
-    return res.status(500).json({
-      error: err.message || "Outbound call failed.",
-    });
-  }
-});
-
-app.post("/twilio/voice/incoming", (req, res) => {
-  const from = req.body.From || "";
-  const to = req.body.To || "";
-  const callSid = req.body.CallSid || "";
-  const host = req.get("host");
-  const appMode = (process.env.APP_MODE || "menu").toLowerCase();
-
-  saveCallRecord({
-    callSid,
-    from,
-    to,
-    stage: "incoming",
-    selection: appMode === "ai" ? "ai_mode" : "",
-    digits: "",
-    callStatus: "started",
-    direction: "incoming",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
-
-  ensureLiveSession(callSid, {
-    from,
-    to,
-    direction: "incoming",
-    status: "started",
-    startedAt: new Date().toISOString(),
-    selection: appMode === "ai" ? "ai_mode" : "",
-  });
-
-  updateLiveSession(callSid, {
-    from,
-    to,
-    direction: "incoming",
-    status: "started",
-    selection: appMode === "ai" ? "ai_mode" : "",
-  });
-
-  if (appMode === "ai") {
-    const twiml = buildAiStreamTwiml(host);
-    res.type("text/xml");
-    res.send(twiml);
-    return;
+  const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!wsUrl) {
+    return res
+      .status(500)
+      .send("Missing PUBLIC_WSS_URL or RENDER_EXTERNAL_URL in environment.");
   }
 
-  const twiml = buildMenuTwiml(host);
-  res.type("text/xml");
-  res.send(twiml);
-});
+  const streamUrl = wsUrl.startsWith("https://")
+    ? wsUrl.replace("https://", "wss://")
+    : wsUrl.startsWith("http://")
+    ? wsUrl.replace("http://", "ws://")
+    : wsUrl;
 
-app.post("/twilio/voice/outbound", (req, res) => {
-  const from = req.body.From || "";
-  const to = req.body.To || "";
-  const callSid = req.body.CallSid || "";
-  const host = req.get("host");
-  const mode = String(req.query.mode || "ai").toLowerCase();
-
-  saveCallRecord({
-    callSid,
-    from,
-    to,
-    stage: "outbound_started",
-    selection: mode === "ai" ? "ai_mode" : "",
-    digits: "",
-    callStatus: "started",
-    direction: "outbound",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
-
-  ensureLiveSession(callSid, {
-    from,
-    to,
-    direction: "outbound",
-    status: "started",
-    startedAt: new Date().toISOString(),
-    selection: mode === "ai" ? "ai_mode" : "",
-  });
-
-  updateLiveSession(callSid, {
-    from,
-    to,
-    direction: "outbound",
-    status: "started",
-    selection: mode === "ai" ? "ai_mode" : "",
-  });
-
-  if (mode === "ai") {
-    const twiml = buildAiStreamTwiml(host);
-    res.type("text/xml");
-    res.send(twiml);
-    return;
-  }
-
-  const twiml = buildMenuTwiml(host);
-  res.type("text/xml");
-  res.send(twiml);
-});
-
-app.post("/twilio/voice/menu", (req, res) => {
-  const digits = req.body.Digits || "";
-  const callSid = req.body.CallSid || "";
-
-  let selectionLabel = "invalid";
-  let twiml = "";
-
-  if (digits === "1") {
-    selectionLabel = "new_installation";
-    twiml = `
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="en-US" voice="alice">
-    Thank you. You selected new heat pump installation.
-  </Say>
-  <Pause length="1"/>
-  <Say language="en-US" voice="alice">
-    Our comfort advisor will contact you shortly to discuss your property address, current heating system, and installation options.
-  </Say>
-  <Hangup/>
-</Response>`.trim();
-  } else if (digits === "2") {
-    selectionLabel = "service_or_repair";
-    twiml = `
-<Response>
-  <Say language="en-US" voice="alice">
-    Thank you. You selected service or repair.
-  </Say>
-  <Pause length="1"/>
-  <Say language="en-US" voice="alice">
-    Our service team will contact you shortly.
-    Please have your equipment brand, model number, and service address ready.
-  </Say>
-  <Hangup/>
-</Response>`.trim();
-  } else if (digits === "3") {
-    selectionLabel = "rebate_questions";
-    twiml = `
-<Response>
-  <Say language="en-US" voice="alice">
-    Thank you. You selected rebate or grant questions.
-  </Say>
-  <Pause length="1"/>
-  <Say language="en-US" voice="alice">
-    A member of our team will follow up with you regarding available programs and application requirements.
-  </Say>
-  <Hangup/>
-</Response>`.trim();
-  } else if (digits === "0") {
-    selectionLabel = "transfer_to_agent";
-    twiml = `
-<Response>
-  <Say language="en-US" voice="alice">
-    Please hold while we transfer your call to our team.
-  </Say>
-  <Dial>${LIVE_AGENT_NUMBER}</Dial>
-</Response>`.trim();
+  <Say voice="alice">Hello, thank you for calling ${BUSINESS_NAME}. Please hold while I connect you.</Say>
+  <Connect>
+    <Stream url="${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}" />
+  </Connect>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
+// =========================
+// WebSocket servers
+// 1) /media-stream for Twilio
+// =========================
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const { url } = request;
+  if (url.startsWith("/media-stream")) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
   } else {
-    selectionLabel = "invalid";
-    twiml = `
-<Response>
-  <Say language="en-US" voice="alice">
-    Sorry, that was not a valid selection.
-  </Say>
-  <Pause length="1"/>
-  <Say language="en-US" voice="alice">
-    Please call again and press 1 for installation,
-    2 for service,
-    3 for rebate questions,
-    or 0 to speak with our team.
-  </Say>
-  <Hangup/>
-</Response>`.trim();
+    socket.destroy();
   }
-
-  updateCallRecord(callSid, {
-    stage: "menu_completed",
-    selection: selectionLabel,
-    digits,
-  });
-
-  ensureLiveSession(callSid);
-  updateLiveSession(callSid, {
-    status: "menu_completed",
-    activeSpeaker: "",
-    selection: selectionLabel,
-  });
-
-  const session = liveSessions.get(callSid);
-  if (session) {
-    session.fields.intent = selectionLabel;
-    session.updatedAt = new Date().toISOString();
-  }
-  broadcastLiveState();
-
-  res.type("text/xml");
-  res.send(twiml);
 });
 
-app.post("/twilio/voice/status", (req, res) => {
-  const callSid = req.body.CallSid || "";
-  const callStatus = req.body.CallStatus || "unknown";
-  const from = req.body.From || "";
-  const to = req.body.To || "";
+wss.on("connection", async (twilioWs, request) => {
+  const urlObj = new URL(request.url, `http://${request.headers.host}`);
+  const callSid = urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
+  const session = getOrCreateCallSession(callSid);
 
-  updateCallRecord(callSid, {
-    callStatus,
-    from,
-    to,
+  console.log(`Twilio media stream connected: ${callSid}`);
+
+  let streamSid = "";
+
+  // OpenAI Realtime WS
+  const openaiWs = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
+
+  openaiWs.on("open", () => {
+    console.log("Connected to OpenAI Realtime");
+
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        modalities: ["text", "audio"],
+        instructions: `
+You are the phone receptionist for ${BUSINESS_NAME}, an HVAC company.
+Your job is to speak naturally and help callers with service, repair, maintenance, quotes, and booking.
+
+Goals:
+1. Identify the caller's intent.
+2. Collect:
+   - full name
+   - callback number
+   - full service address
+   - short issue summary
+   - preferred appointment date
+   - preferred appointment time
+3. Once you have all details, read them back in one confirmation sentence using this style exactly:
+
+"Got it. You’d prefer an appointment on [DATE] at [TIME]. Just to confirm, I have your name as [NAME], your phone number as [PHONE], the address as [ADDRESS], and the issue is [ISSUE]. Is that all correct?"
+
+4. If the caller confirms, say:
+"Perfect. We’ve recorded your appointment request. A team member will follow up soon to confirm. Thanks for calling ${BUSINESS_NAME}."
+
+Rules:
+- Keep answers short and phone-friendly.
+- Ask one thing at a time if information is missing.
+- Do not invent customer details.
+- Use English unless caller speaks another language.
+- If the caller gives a preferred date/time, restate it clearly.
+- Once caller confirms all details are correct, that means booking is confirmed.
+        `.trim(),
+        voice: "alloy",
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        turn_detection: {
+          type: "server_vad",
+        },
+      },
+    };
+
+    openaiWs.send(JSON.stringify(sessionUpdate));
+
+    // 首句
+    openaiWs.send(
+      JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions: `Greet the caller and ask how you can help today.`,
+        },
+      })
+    );
   });
 
-  ensureLiveSession(callSid, { from, to });
-  updateLiveSession(callSid, {
-    from,
-    to,
-    status: callStatus,
+  openaiWs.on("message", async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+
+      // 返回音频给Twilio
+      if (data.type === "response.audio.delta" && data.delta) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: {
+              payload: data.delta,
+            },
+          })
+        );
+      }
+
+      // assistant 文本片段
+      if (data.type === "response.output_text.delta" && data.delta) {
+        session.lastAssistantText += data.delta;
+      }
+
+      // assistant 一轮结束
+      if (data.type === "response.done") {
+        const assistantText = cleanText(session.lastAssistantText);
+
+        if (assistantText) {
+          pushTranscript(callSid, "assistant", assistantText);
+          console.log("Assistant:", assistantText);
+
+          const parsed = parseAssistantConfirmation(assistantText);
+          mergeExtracted(session.extracted, parsed);
+
+          // 如果assistant明确是在确认详情
+          if (parsed.confirmationPromptSeen) {
+            // 可认为intent大概率是service_or_repair
+            if (!session.extracted.intent) {
+              session.extracted.intent = "service_or_repair";
+            }
+          }
+
+          // 如果assistant已经说“已记录预约请求”，也算用户确认完毕之后的结束语
+          if (/we[’']?ve recorded your appointment request/i.test(assistantText)) {
+            session.extracted.bookingConfirmed = true;
+          }
+
+          session.lastAssistantText = "";
+
+          // 自动创建预约
+          try {
+            const created = await maybeAutoCreateAppointment(callSid);
+            if (created) {
+              console.log("✅ Appointment created:", created.id);
+            }
+          } catch (err) {
+            console.error("Auto-create appointment failed:", err?.message || err);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("OpenAI message parse error:", err?.message || err);
+    }
   });
 
-  if (
-    ["completed", "failed", "busy", "no-answer", "canceled"].includes(
-      callStatus
-    )
-  ) {
-    finalizeSession(callSid);
-  }
+  openaiWs.on("close", () => {
+    console.log("OpenAI WS closed");
+  });
 
-  res.sendStatus(200);
+  openaiWs.on("error", (err) => {
+    console.error("OpenAI WS error:", err?.message || err);
+  });
+
+  twilioWs.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+
+      switch (data.event) {
+        case "start":
+          streamSid = data.start.streamSid;
+          session.streamSid = streamSid;
+          console.log("Twilio stream started:", streamSid);
+          break;
+
+        case "media":
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.send(
+              JSON.stringify({
+                type: "input_audio_buffer.append",
+                audio: data.media.payload,
+              })
+            );
+          }
+          break;
+
+        case "stop":
+          console.log("Twilio stream stopped:", callSid);
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.close();
+          }
+          break;
+
+        default:
+          break;
+      }
+    } catch (err) {
+      console.error("Twilio message error:", err?.message || err);
+    }
+  });
+
+  twilioWs.on("close", () => {
+    console.log("Twilio WS closed:", callSid);
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+  });
+
+  twilioWs.on("error", (err) => {
+    console.error("Twilio WS error:", err?.message || err);
+  });
 });
 
-const port = process.env.PORT || 10000;
-const server = http.createServer(app);
+// =========================
+// Manual update endpoint
+// 供你前端测试右侧表单写入
+// =========================
+app.post("/api/live-call/:callSid/update", async (req, res) => {
+  try {
+    const callSid = req.params.callSid;
+    const session = getOrCreateCallSession(callSid);
 
-attachRealtimeBridge(server);
+    mergeExtracted(session.extracted, req.body);
 
-server.listen(port, "0.0.0.0", () => {
-  console.log(`Server listening on port ${port}`);
+    if (req.body.bookingConfirmed === true) {
+      session.extracted.bookingConfirmed = true;
+    }
+
+    let created = null;
+    try {
+      created = await maybeAutoCreateAppointment(callSid);
+    } catch (err) {
+      console.error("Manual update auto-create failed:", err?.message || err);
+    }
+
+    res.json({
+      ok: true,
+      extracted: session.extracted,
+      createdEventId: created?.id || null,
+      callSummary: buildCallSummary(session.extracted),
+    });
+  } catch (err) {
+    console.error("Live call update error:", err?.message || err);
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Failed to update live call",
+    });
+  }
+});
+
+// =========================
+// optional: mark customer confirmation
+// 当你从caller转写里识别到 “correct / yes / that's right” 可调这个
+// =========================
+app.post("/api/live-call/:callSid/confirm", async (req, res) => {
+  try {
+    const callSid = req.params.callSid;
+    const session = getOrCreateCallSession(callSid);
+    session.extracted.bookingConfirmed = true;
+
+    let created = null;
+    try {
+      created = await maybeAutoCreateAppointment(callSid);
+    } catch (err) {
+      console.error("Confirm auto-create failed:", err?.message || err);
+    }
+
+    res.json({
+      ok: true,
+      bookingConfirmed: true,
+      appointmentCreated: session.extracted.appointmentCreated,
+      appointmentEventId: session.extracted.appointmentEventId,
+      createdEventId: created?.id || null,
+    });
+  } catch (err) {
+    console.error("Confirm endpoint error:", err?.message || err);
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Failed to confirm booking",
+    });
+  }
+});
+
+// =========================
+// Start
+// =========================
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
