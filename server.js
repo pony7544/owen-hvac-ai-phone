@@ -876,6 +876,7 @@ wss.on("connection", async (twilioWs, request) => {
   console.log(`Twilio media stream connected: initial=${activeCallSid}`);
 
   let streamSid = "";
+  let assistantTranscriptBuffer = "";
 
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -951,12 +952,41 @@ Rules:
   });
 
   openaiWs.on("message", async (message) => {
-  const data = JSON.parse(message.toString());
-  console.log("OpenAI event type:", data.type);
   try {
     const data = JSON.parse(message.toString());
 
-    // 🔊 AI音频输出
+    console.log("OpenAI event type:", data.type);
+
+    // ===== 来电者转写完成 =====
+    if (
+      data.type === "conversation.item.input_audio_transcription.completed" &&
+      data.transcript
+    ) {
+      const callerText = cleanText(data.transcript);
+      if (callerText) {
+        console.log("Caller:", callerText);
+        pushTranscript(activeCallSid, "caller", callerText);
+
+        try {
+          await refreshStructuredCallInfoDebounced(activeCallSid);
+        } catch (err) {
+          console.error("Structured extraction after caller failed:", err?.message || err);
+        }
+
+        try {
+          await maybeAutoCreateAppointment(activeCallSid);
+        } catch (err) {
+          console.error("Auto-create appointment after caller failed:", err?.message || err);
+        }
+      }
+    }
+
+    // ===== AI 语音转写文本增量 =====
+    if (data.type === "response.audio_transcript.delta" && data.delta) {
+      assistantTranscriptBuffer += data.delta;
+    }
+
+    // ===== AI 音频输出给 Twilio =====
     if (data.type === "response.audio.delta" && data.delta) {
       console.log("🔊 audio delta", {
         len: data.delta.length,
@@ -974,6 +1004,8 @@ Rules:
           })
         );
         console.log("✅ sent audio to Twilio");
+      } else {
+        console.log("❌ Twilio not ready or streamSid missing");
       }
     }
 
@@ -981,20 +1013,32 @@ Rules:
       console.log("🔊 audio done");
     }
 
+    // ===== AI 一轮响应结束，保存助手文本 =====
     if (data.type === "response.done") {
-      console.log("🤖 response done");
-    }
+      const assistantText = cleanText(assistantTranscriptBuffer);
+      console.log("🤖 response done", assistantText);
 
-    // 👇 你原来的逻辑继续放这里
-    if (
-      data.type === "conversation.item.input_audio_transcription.completed" &&
-      data.transcript
-    ) {
-      console.log("Caller:", data.transcript);
-    }
+      if (assistantText) {
+        pushTranscript(activeCallSid, "assistant", assistantText);
+        assistantTranscriptBuffer = "";
 
+        try {
+          await refreshStructuredCallInfoDebounced(activeCallSid);
+        } catch (err) {
+          console.error("Structured extraction after assistant failed:", err?.message || err);
+        }
+
+        try {
+          await maybeAutoCreateAppointment(activeCallSid);
+        } catch (err) {
+          console.error("Auto-create appointment failed:", err?.message || err);
+        }
+      } else {
+        assistantTranscriptBuffer = "";
+      }
+    }
   } catch (err) {
-    console.error("OpenAI message parse error:", err);
+    console.error("OpenAI message parse error:", err?.message || err);
   }
 });
 
