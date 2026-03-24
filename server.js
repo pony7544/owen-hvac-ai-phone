@@ -951,55 +951,17 @@ Rules:
   });
 
   openaiWs.on("message", async (message) => {
-if (data.type === "response.output_audio.delta" && data.delta) {
-  console.log(
-    "OpenAI audio delta:",
-    {
-      len: data.delta.length,
-      streamSid,
-      twilioReady: twilioWs.readyState,
-    }
-  );
+  try {
+    const data = JSON.parse(message.toString());
 
-  if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-    twilioWs.send(
-      JSON.stringify({
-        event: "media",
+    // 🔊 AI音频输出
+    if (data.type === "response.output_audio.delta" && data.delta) {
+      console.log("🔊 audio delta", {
+        len: data.delta.length,
         streamSid,
-        media: {
-          payload: data.delta,
-        },
-      })
-    );
-    console.log("Sent audio chunk to Twilio");
-  } else {
-    console.log("Skipped audio send because Twilio not ready or streamSid missing");
-  }
-}
+      });
 
-if (data.type === "response.output_audio.done") {
-  console.log("OpenAI output audio done");
-}
-
-if (data.type === "response.done") {
-  console.log("Assistant response done:", JSON.stringify(data, null, 2));
-}
-    try {
-      const data = JSON.parse(message.toString());
-
-      if (data.type === "error") {
-        console.error("OpenAI realtime error event:", JSON.stringify(data, null, 2));
-      }
-
-      if (data.type === "session.created") {
-        console.log("OpenAI session created");
-      }
-
-      if (data.type === "session.updated") {
-        console.log("OpenAI session updated");
-      }
-
-      if (data.type === "response.output_audio.delta" && data.delta) {
+      if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
         twilioWs.send(
           JSON.stringify({
             event: "media",
@@ -1009,65 +971,30 @@ if (data.type === "response.done") {
             },
           })
         );
+        console.log("✅ sent audio to Twilio");
       }
-
-      if (data.type === "response.output_text.delta" && data.delta) {
-        session.lastAssistantText += data.delta;
-      }
-
-      if (
-        data.type === "conversation.item.input_audio_transcription.completed" &&
-        data.transcript
-      ) {
-        console.log("Caller transcription:", data.transcript);
-
-        const callerText = cleanText(data.transcript);
-        if (callerText) {
-          pushTranscript(activeCallSid, "caller", callerText);
-
-          try {
-            await refreshStructuredCallInfoDebounced(activeCallSid);
-          } catch (err) {
-            console.error("Structured extraction after caller failed:", err?.message || err);
-          }
-
-          try {
-            await maybeAutoCreateAppointment(activeCallSid);
-          } catch (err) {
-            console.error("Auto-create appointment after caller failed:", err?.message || err);
-          }
-        }
-      }
-
-      if (data.type === "response.done") {
-        console.log("Assistant response done");
-
-        const assistantText = cleanText(session.lastAssistantText);
-        if (assistantText) {
-          pushTranscript(activeCallSid, "assistant", assistantText);
-          session.lastAssistantText = "";
-
-          try {
-            await refreshStructuredCallInfoDebounced(activeCallSid);
-          } catch (err) {
-            console.error("Structured extraction after assistant failed:", err?.message || err);
-          }
-
-          try {
-            await maybeAutoCreateAppointment(activeCallSid);
-          } catch (err) {
-            console.error("Auto-create appointment failed:", err?.message || err);
-          }
-        }
-      }
-    } catch (err) {
-      console.error("OpenAI message parse error:", err?.message || err);
     }
-  });
 
-  openaiWs.on("close", (code, reason) => {
-    console.log("OpenAI WS closed:", code, reason ? reason.toString() : "");
-  });
+    if (data.type === "response.output_audio.done") {
+      console.log("🔊 audio done");
+    }
+
+    if (data.type === "response.done") {
+      console.log("🤖 response done");
+    }
+
+    // 👇 你原来的逻辑继续放这里
+    if (
+      data.type === "conversation.item.input_audio_transcription.completed" &&
+      data.transcript
+    ) {
+      console.log("Caller:", data.transcript);
+    }
+
+  } catch (err) {
+    console.error("OpenAI message parse error:", err);
+  }
+});
 
   openaiWs.on("error", (err) => {
     console.error("OpenAI WS error:", err?.message || err);
