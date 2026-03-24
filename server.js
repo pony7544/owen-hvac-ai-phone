@@ -957,7 +957,7 @@ Rules:
     const data = JSON.parse(message.toString());
 
     // 🔊 AI音频输出
-    if (data.type === "response.output_audio.delta" && data.delta) {
+    if (data.type === "response.audio.delta" && data.delta) {
       console.log("🔊 audio delta", {
         len: data.delta.length,
         streamSid,
@@ -977,7 +977,7 @@ Rules:
       }
     }
 
-    if (data.type === "response.output_audio.done") {
+    if (data.type === "response.audio.done") {
       console.log("🔊 audio done");
     }
 
