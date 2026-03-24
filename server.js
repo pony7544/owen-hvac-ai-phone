@@ -86,6 +86,7 @@ const calendar = google.calendar({
 // In-memory call store
 // =========================
 const liveCalls = new Map();
+const streamToCallSid = new Map();
 /*
 liveCalls[callSid] = {
   callSid,
@@ -159,6 +160,88 @@ function getOrCreateCallSession(callSid) {
     });
   }
   return liveCalls.get(callSid);
+}
+
+function mergeCallSessions(targetSid, sourceSid) {
+  if (!targetSid && !sourceSid) return null;
+  if (!targetSid || !sourceSid || targetSid === sourceSid) {
+    return getOrCreateCallSession(targetSid || sourceSid);
+  }
+
+  const target = getOrCreateCallSession(targetSid);
+  const source = liveCalls.get(sourceSid);
+
+  if (!source) return target;
+
+  target.streamSid = target.streamSid || source.streamSid || "";
+  target.from = target.from || source.from || "";
+  target.to = target.to || source.to || "";
+  target.status = source.status || target.status;
+  target.updatedAt = new Date().toISOString();
+
+  if (Array.isArray(source.transcript) && source.transcript.length) {
+    target.transcript = [...target.transcript, ...source.transcript].sort(
+      (a, b) => new Date(a.ts) - new Date(b.ts)
+    );
+  }
+
+  target.lastAssistantText =
+    target.lastAssistantText || source.lastAssistantText || "";
+  target.extractionInFlight =
+    target.extractionInFlight || source.extractionInFlight || false;
+  target.lastExtractionAt = Math.max(
+    target.lastExtractionAt || 0,
+    source.lastExtractionAt || 0
+  );
+  target.mediaPacketCount =
+    (target.mediaPacketCount || 0) + (source.mediaPacketCount || 0);
+
+  target.extracted = {
+    ...source.extracted,
+    ...target.extracted,
+    intent: target.extracted.intent || source.extracted.intent || "",
+    callerName: target.extracted.callerName || source.extracted.callerName || "",
+    callbackNumber:
+      target.extracted.callbackNumber || source.extracted.callbackNumber || "",
+    serviceAddress:
+      target.extracted.serviceAddress || source.extracted.serviceAddress || "",
+    issueSummary:
+      target.extracted.issueSummary || source.extracted.issueSummary || "",
+    preferredDate:
+      target.extracted.preferredDate || source.extracted.preferredDate || "",
+    preferredTime:
+      target.extracted.preferredTime || source.extracted.preferredTime || "",
+    preferredDateTime:
+      target.extracted.preferredDateTime ||
+      source.extracted.preferredDateTime ||
+      "",
+    bookingConfirmed:
+      Boolean(target.extracted.bookingConfirmed) ||
+      Boolean(source.extracted.bookingConfirmed),
+    appointmentCreated:
+      Boolean(target.extracted.appointmentCreated) ||
+      Boolean(source.extracted.appointmentCreated),
+    appointmentEventId:
+      target.extracted.appointmentEventId ||
+      source.extracted.appointmentEventId ||
+      "",
+  };
+
+  if (source.streamSid) {
+    streamToCallSid.set(source.streamSid, targetSid);
+  }
+
+  liveCalls.delete(sourceSid);
+  return target;
+}
+
+function resolveStartCallSid(startData, fallbackCallSid = "") {
+  return (
+    startData?.callSid ||
+    startData?.customParameters?.callSid ||
+    fallbackCallSid ||
+    ""
+  );
 }
 
 function pushTranscript(callSid, role, text) {
@@ -783,15 +866,17 @@ server.on("upgrade", (request, socket, head) => {
 
 wss.on("connection", async (twilioWs, request) => {
   const urlObj = new URL(request.url, `http://${request.headers.host}`);
-  const callSid = urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
-  const session = getOrCreateCallSession(callSid);
 
-  console.log(`Twilio media stream connected: ${callSid}`);
+  const urlCallSid =
+    urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
+
+  let activeCallSid = urlCallSid;
+  let session = getOrCreateCallSession(activeCallSid);
+
+  console.log(`Twilio media stream connected: initial=${activeCallSid}`);
 
   let streamSid = "";
 
-  // Keep your currently working model string here.
-  // If your account uses a different enabled Realtime model, replace it.
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
     {
@@ -854,7 +939,6 @@ Rules:
 
     openaiWs.send(JSON.stringify(sessionUpdate));
 
-    // Initial greeting
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
@@ -882,7 +966,6 @@ Rules:
         console.log("OpenAI session updated");
       }
 
-      // Official audio output delta event
       if (data.type === "response.output_audio.delta" && data.delta) {
         twilioWs.send(
           JSON.stringify({
@@ -895,12 +978,10 @@ Rules:
         );
       }
 
-      // Some environments may still emit text delta
       if (data.type === "response.output_text.delta" && data.delta) {
         session.lastAssistantText += data.delta;
       }
 
-      // Caller transcription completed
       if (
         data.type === "conversation.item.input_audio_transcription.completed" &&
         data.transcript
@@ -909,39 +990,38 @@ Rules:
 
         const callerText = cleanText(data.transcript);
         if (callerText) {
-          pushTranscript(callSid, "caller", callerText);
+          pushTranscript(activeCallSid, "caller", callerText);
 
           try {
-            await refreshStructuredCallInfoDebounced(callSid);
+            await refreshStructuredCallInfoDebounced(activeCallSid);
           } catch (err) {
             console.error("Structured extraction after caller failed:", err?.message || err);
           }
 
           try {
-            await maybeAutoCreateAppointment(callSid);
+            await maybeAutoCreateAppointment(activeCallSid);
           } catch (err) {
             console.error("Auto-create appointment after caller failed:", err?.message || err);
           }
         }
       }
 
-      // Assistant finished
       if (data.type === "response.done") {
         console.log("Assistant response done");
 
         const assistantText = cleanText(session.lastAssistantText);
         if (assistantText) {
-          pushTranscript(callSid, "assistant", assistantText);
+          pushTranscript(activeCallSid, "assistant", assistantText);
           session.lastAssistantText = "";
 
           try {
-            await refreshStructuredCallInfoDebounced(callSid);
+            await refreshStructuredCallInfoDebounced(activeCallSid);
           } catch (err) {
             console.error("Structured extraction after assistant failed:", err?.message || err);
           }
 
           try {
-            await maybeAutoCreateAppointment(callSid);
+            await maybeAutoCreateAppointment(activeCallSid);
           } catch (err) {
             console.error("Auto-create appointment failed:", err?.message || err);
           }
@@ -965,20 +1045,45 @@ Rules:
       const data = JSON.parse(msg.toString());
 
       switch (data.event) {
-        case "start":
+        case "start": {
           console.log("Twilio stream start:", JSON.stringify(data.start, null, 2));
-          streamSid = data.start.streamSid;
+
+          streamSid = data.start?.streamSid || "";
+          const startCallSid = resolveStartCallSid(data.start, urlCallSid);
+
+          if (startCallSid && startCallSid !== activeCallSid) {
+            console.log(
+              `Rebinding media stream session from ${activeCallSid} -> ${startCallSid}`
+            );
+
+            mergeCallSessions(startCallSid, activeCallSid);
+            activeCallSid = startCallSid;
+            session = getOrCreateCallSession(activeCallSid);
+          }
+
+          if (streamSid) {
+            streamToCallSid.set(streamSid, activeCallSid);
+          }
+
           session.streamSid = streamSid;
           session.status = "in_progress";
           session.updatedAt = new Date().toISOString();
+
+          console.log({
+            urlCallSid,
+            startCallSid,
+            activeCallSid,
+            streamSid,
+          });
           break;
+        }
 
         case "media":
           session.mediaPacketCount += 1;
 
           if (session.mediaPacketCount % 50 === 0) {
             console.log(
-              `Incoming media packets for ${callSid}: ${session.mediaPacketCount}`
+              `Incoming media packets for ${activeCallSid}: ${session.mediaPacketCount}`
             );
           }
 
@@ -990,14 +1095,20 @@ Rules:
               })
             );
           } else {
-            console.log(`OpenAI WS not open for ${callSid}, state=${openaiWs.readyState}`);
+            console.log(
+              `OpenAI WS not open for ${activeCallSid}, state=${openaiWs.readyState}`
+            );
           }
           break;
 
         case "stop":
-          console.log(`Twilio stream stop for ${callSid}`);
+          console.log(`Twilio stream stop for ${activeCallSid}`);
           session.status = "stream_closed";
           session.updatedAt = new Date().toISOString();
+
+          if (streamSid) {
+            streamToCallSid.delete(streamSid);
+          }
 
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.close();
@@ -1013,9 +1124,13 @@ Rules:
   });
 
   twilioWs.on("close", () => {
-    console.log(`Twilio WS closed: ${callSid}`);
+    console.log(`Twilio WS closed: ${activeCallSid}`);
     session.status = "stream_closed";
     session.updatedAt = new Date().toISOString();
+
+    if (streamSid) {
+      streamToCallSid.delete(streamSid);
+    }
 
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
