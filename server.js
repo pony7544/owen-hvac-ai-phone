@@ -951,6 +951,39 @@ Rules:
   });
 
   openaiWs.on("message", async (message) => {
+if (data.type === "response.output_audio.delta" && data.delta) {
+  console.log(
+    "OpenAI audio delta:",
+    {
+      len: data.delta.length,
+      streamSid,
+      twilioReady: twilioWs.readyState,
+    }
+  );
+
+  if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+    twilioWs.send(
+      JSON.stringify({
+        event: "media",
+        streamSid,
+        media: {
+          payload: data.delta,
+        },
+      })
+    );
+    console.log("Sent audio chunk to Twilio");
+  } else {
+    console.log("Skipped audio send because Twilio not ready or streamSid missing");
+  }
+}
+
+if (data.type === "response.output_audio.done") {
+  console.log("OpenAI output audio done");
+}
+
+if (data.type === "response.done") {
+  console.log("Assistant response done:", JSON.stringify(data, null, 2));
+}
     try {
       const data = JSON.parse(message.toString());
 
