@@ -951,6 +951,8 @@ Rules:
   });
 
   openaiWs.on("message", async (message) => {
+  const data = JSON.parse(message.toString());
+  console.log("OpenAI event type:", data.type);
   try {
     const data = JSON.parse(message.toString());
 
