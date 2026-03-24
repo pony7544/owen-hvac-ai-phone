@@ -5,6 +5,7 @@ const http = require("http");
 const path = require("path");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
+const session = require("express-session");
 const { google } = require("googleapis");
 const OpenAI = require("openai");
 
@@ -13,6 +14,22 @@ const server = http.createServer(app);
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "replace_this_session_secret",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false,
+      maxAge: 1000 * 60 * 60 * 12, // 12小时
+    },
+  })
+);
+
+app.use("/public", express.static(path.join(__dirname, "public")));
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 10000;
@@ -34,13 +51,9 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 
-if (!OPENAI_API_KEY) {
-  console.warn("Missing OPENAI_API_KEY");
-}
+const LIVE_ADMIN_USER = process.env.LIVE_ADMIN_USER || "admin";
+const LIVE_ADMIN_PASS = process.env.LIVE_ADMIN_PASS || "ChangeThisPassword123!";
 
-// =========================
-// OpenAI SDK
-// =========================
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
@@ -64,26 +77,30 @@ const calendar = google.calendar({
 
 // =========================
 // In-memory session store
-// production建议换Redis
 // =========================
 const liveCalls = new Map();
 /*
 liveCalls[callSid] = {
   callSid,
   streamSid,
+  from,
+  to,
+  status,
+  createdAt,
+  updatedAt,
   transcript: [],
   lastAssistantText: "",
-  lastCallerText: "",
   extractionInFlight: false,
   lastExtractionAt: 0,
   extracted: {
     intent: "",
-    name: "",
-    phone: "",
-    address: "",
-    issue: "",
-    preferredDateRaw: "",   // YYYY-MM-DD
-    preferredTimeRaw: "",   // HH:MM
+    callerName: "",
+    callbackNumber: "",
+    serviceAddress: "",
+    issueSummary: "",
+    preferredDate: "",      // YYYY-MM-DD
+    preferredTime: "",      // HH:MM
+    preferredDateTime: "",
     bookingConfirmed: false,
     appointmentCreated: false,
     appointmentEventId: "",
@@ -94,33 +111,6 @@ liveCalls[callSid] = {
 // =========================
 // Helpers
 // =========================
-function getOrCreateCallSession(callSid) {
-  if (!liveCalls.has(callSid)) {
-    liveCalls.set(callSid, {
-      callSid,
-      streamSid: "",
-      transcript: [],
-      lastAssistantText: "",
-      lastCallerText: "",
-      extractionInFlight: false,
-      lastExtractionAt: 0,
-      extracted: {
-        intent: "",
-        name: "",
-        phone: "",
-        address: "",
-        issue: "",
-        preferredDateRaw: "",
-        preferredTimeRaw: "",
-        bookingConfirmed: false,
-        appointmentCreated: false,
-        appointmentEventId: "",
-      },
-    });
-  }
-  return liveCalls.get(callSid);
-}
-
 function cleanText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
@@ -128,6 +118,38 @@ function cleanText(s) {
 function normalizePhone(phone) {
   if (!phone) return "";
   return phone.replace(/[^\d+]/g, "").trim();
+}
+
+function getOrCreateCallSession(callSid) {
+  if (!liveCalls.has(callSid)) {
+    liveCalls.set(callSid, {
+      callSid,
+      streamSid: "",
+      from: "",
+      to: "",
+      status: "new",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      transcript: [],
+      lastAssistantText: "",
+      extractionInFlight: false,
+      lastExtractionAt: 0,
+      extracted: {
+        intent: "",
+        callerName: "",
+        callbackNumber: "",
+        serviceAddress: "",
+        issueSummary: "",
+        preferredDate: "",
+        preferredTime: "",
+        preferredDateTime: "",
+        bookingConfirmed: false,
+        appointmentCreated: false,
+        appointmentEventId: "",
+      },
+    });
+  }
+  return liveCalls.get(callSid);
 }
 
 function pushTranscript(callSid, role, text) {
@@ -140,67 +162,28 @@ function pushTranscript(callSid, role, text) {
     text: cleaned,
     ts: new Date().toISOString(),
   });
+  session.updatedAt = new Date().toISOString();
 }
 
-function buildCallSummary(extracted) {
-  return [
-    `Intent: ${extracted.intent || ""}`,
-    `Name: ${extracted.name || ""}`,
-    `Callback: ${extracted.phone || ""}`,
-    `Address: ${extracted.address || ""}`,
-    `Issue: ${extracted.issue || ""}`,
-    `Preferred Date: ${extracted.preferredDateRaw || ""}`,
-    `Preferred Time: ${extracted.preferredTimeRaw || ""}`,
-    `Confirmed: ${extracted.bookingConfirmed ? "yes" : "no"}`,
-    `Appointment Created: ${extracted.appointmentCreated ? "yes" : "no"}`,
-    `Event ID: ${extracted.appointmentEventId || ""}`,
-  ].join(" | ");
-}
-
-function mergeManualUpdate(target, incoming) {
-  const allowed = [
-    "intent",
-    "name",
-    "phone",
-    "address",
-    "issue",
-    "preferredDateRaw",
-    "preferredTimeRaw",
-    "bookingConfirmed",
-  ];
-
-  for (const key of allowed) {
-    if (incoming[key] !== undefined && incoming[key] !== null) {
-      target[key] = incoming[key];
-    }
-  }
-}
-
-function normalizeExtractedFromModel(data = {}) {
-  const intent =
-    typeof data.intent === "string" ? data.intent.trim() : "";
-  const name =
-    typeof data.name === "string" ? data.name.trim() : "";
-  const phone =
-    typeof data.phone === "string" ? normalizePhone(data.phone) : "";
-  const address =
-    typeof data.address === "string" ? data.address.trim() : "";
-  const issue =
-    typeof data.issue === "string" ? data.issue.trim() : "";
-  const preferredDateRaw =
-    typeof data.preferred_date === "string" ? data.preferred_date.trim() : "";
-  const preferredTimeRaw =
-    typeof data.preferred_time === "string" ? data.preferred_time.trim() : "";
-
+function buildCallSummary(call) {
+  const f = call.extracted || {};
   return {
-    intent,
-    name,
-    phone,
-    address,
-    issue,
-    preferredDateRaw,
-    preferredTimeRaw,
-    bookingConfirmed: Boolean(data.booking_confirmed),
+    callSid: call.callSid,
+    from: call.from || "",
+    to: call.to || "",
+    status: call.status || "",
+    createdAt: call.createdAt || "",
+    updatedAt: call.updatedAt || "",
+    intent: f.intent || "",
+    callerName: f.callerName || "",
+    callbackNumber: f.callbackNumber || "",
+    serviceAddress: f.serviceAddress || "",
+    issueSummary: f.issueSummary || "",
+    preferredDate: f.preferredDate || "",
+    preferredTime: f.preferredTime || "",
+    bookingConfirmed: !!f.bookingConfirmed,
+    appointmentCreated: !!f.appointmentCreated,
+    appointmentEventId: f.appointmentEventId || "",
   };
 }
 
@@ -282,27 +265,24 @@ function generateSlotsForDay(dateStr, events, slotMinutes = 120) {
   return slots;
 }
 
-async function createAppointmentEvent({
-  name,
-  phone,
-  address,
-  issue,
-  preferredDateRaw,
-  preferredTimeRaw,
-}) {
-  const parsed = parsePreferredDateTime(preferredDateRaw, preferredTimeRaw);
+async function createAppointmentEvent(callSid) {
+  const session = getOrCreateCallSession(callSid);
+  const f = session.extracted;
+
+  const parsed = parsePreferredDateTime(f.preferredDate, f.preferredTime);
   if (!parsed) {
     throw new Error("Unable to parse normalized preferred date/time.");
   }
 
   const event = {
-    summary: `Service Call - ${name || "Customer"}`,
-    location: address || "",
+    summary: `Service Call - ${f.callerName || "Customer"}`,
+    location: f.serviceAddress || "",
     description: [
-      `Customer Name: ${name || ""}`,
-      `Phone: ${phone || ""}`,
-      `Address: ${address || ""}`,
-      `Issue: ${issue || ""}`,
+      `Customer Name: ${f.callerName || ""}`,
+      `Phone: ${f.callbackNumber || ""}`,
+      `Address: ${f.serviceAddress || ""}`,
+      `Issue: ${f.issueSummary || ""}`,
+      `Call SID: ${callSid}`,
       `Booked by AI phone assistant for ${BUSINESS_NAME}.`,
     ].join("\n"),
     start: {
@@ -320,49 +300,59 @@ async function createAppointmentEvent({
     requestBody: event,
   });
 
+  session.extracted.appointmentCreated = true;
+  session.extracted.appointmentEventId = res.data.id || "";
+  session.updatedAt = new Date().toISOString();
+
   return res.data;
 }
 
 async function maybeAutoCreateAppointment(callSid) {
   const session = getOrCreateCallSession(callSid);
-  const ex = session.extracted;
+  const f = session.extracted;
 
-  if (ex.appointmentCreated) return null;
-  if (!ex.bookingConfirmed) return null;
+  if (f.appointmentCreated) return null;
+  if (!f.bookingConfirmed) return null;
 
   if (
-    !ex.name ||
-    !ex.phone ||
-    !ex.address ||
-    !ex.issue ||
-    !ex.preferredDateRaw ||
-    !ex.preferredTimeRaw
+    !f.callerName ||
+    !f.callbackNumber ||
+    !f.serviceAddress ||
+    !f.issueSummary ||
+    !f.preferredDate ||
+    !f.preferredTime
   ) {
     return null;
   }
 
-  const created = await createAppointmentEvent({
-    name: ex.name,
-    phone: ex.phone,
-    address: ex.address,
-    issue: ex.issue,
-    preferredDateRaw: ex.preferredDateRaw,
-    preferredTimeRaw: ex.preferredTimeRaw,
-  });
-
-  ex.appointmentCreated = true;
-  ex.appointmentEventId = created.id || "";
-
-  return created;
+  return await createAppointmentEvent(callSid);
 }
 
-// =========================
-// Structured extraction
-// =========================
+function normalizeExtractedFromModel(data = {}) {
+  const preferredDate =
+    typeof data.preferred_date === "string" ? data.preferred_date.trim() : "";
+  const preferredTime =
+    typeof data.preferred_time === "string" ? data.preferred_time.trim() : "";
+
+  return {
+    intent: typeof data.intent === "string" ? data.intent.trim() : "",
+    callerName: typeof data.name === "string" ? data.name.trim() : "",
+    callbackNumber:
+      typeof data.phone === "string" ? normalizePhone(data.phone) : "",
+    serviceAddress:
+      typeof data.address === "string" ? data.address.trim() : "",
+    issueSummary:
+      typeof data.issue === "string" ? data.issue.trim() : "",
+    preferredDate,
+    preferredTime,
+    preferredDateTime:
+      preferredDate && preferredTime ? `${preferredDate} ${preferredTime}` : "",
+    bookingConfirmed: Boolean(data.booking_confirmed),
+  };
+}
+
 async function extractCallInfoWithOpenAI({ transcript, nowIso, timezone }) {
-  const transcriptText = transcript
-    .map((x) => `${x.role}: ${x.text}`)
-    .join("\n");
+  const transcriptText = transcript.map((x) => `${x.role}: ${x.text}`).join("\n");
 
   const response = await openai.responses.create({
     model: "gpt-5-mini",
@@ -389,7 +379,7 @@ Rules:
 - If the assistant only asks for confirmation, that does not mean confirmed.
 - If the caller says "correct", "yes", "that's right", "正确", or equivalent after the summary, set booking_confirmed=true.
 - intent must be one of:
-  service_or_repair, quote_request, maintenance, general_inquiry, other, or empty string.
+  service_or_repair, quote_request, maintenance, new_installation, general_inquiry, other, or empty string.
             `.trim(),
           },
         ],
@@ -457,13 +447,15 @@ async function refreshStructuredCallInfo(callSid) {
   const normalized = normalizeExtractedFromModel(modelData);
 
   session.extracted.intent = normalized.intent;
-  session.extracted.name = normalized.name;
-  session.extracted.phone = normalized.phone;
-  session.extracted.address = normalized.address;
-  session.extracted.issue = normalized.issue;
-  session.extracted.preferredDateRaw = normalized.preferredDateRaw;
-  session.extracted.preferredTimeRaw = normalized.preferredTimeRaw;
+  session.extracted.callerName = normalized.callerName;
+  session.extracted.callbackNumber = normalized.callbackNumber;
+  session.extracted.serviceAddress = normalized.serviceAddress;
+  session.extracted.issueSummary = normalized.issueSummary;
+  session.extracted.preferredDate = normalized.preferredDate;
+  session.extracted.preferredTime = normalized.preferredTime;
+  session.extracted.preferredDateTime = normalized.preferredDateTime;
   session.extracted.bookingConfirmed = normalized.bookingConfirmed;
+  session.updatedAt = new Date().toISOString();
 
   return session.extracted;
 }
@@ -484,39 +476,179 @@ async function refreshStructuredCallInfoDebounced(callSid, minIntervalMs = 1000)
   session.lastExtractionAt = now;
 
   try {
-    const extracted = await refreshStructuredCallInfo(callSid);
-    return extracted;
+    return await refreshStructuredCallInfo(callSid);
   } finally {
     session.extractionInFlight = false;
   }
 }
 
-// =========================
-// Realtime dashboard API
-// =========================
-app.get("/api/live-call/:callSid", (req, res) => {
-  const callSid = req.params.callSid;
-  const session = liveCalls.get(callSid);
+function requireLiveAuth(req, res, next) {
+  if (req.session && req.session.liveAuthed) {
+    return next();
+  }
+  return res.redirect("/login");
+}
 
-  if (!session) {
+function requireApiAuth(req, res, next) {
+  if (req.session && req.session.liveAuthed) {
+    return next();
+  }
+  return res.status(401).json({ ok: false, error: "Unauthorized" });
+}
+
+// =========================
+// Page routes
+// =========================
+app.get("/", (req, res) => {
+  res.send("Owen HVAC AI phone server is running.");
+});
+
+app.get("/login", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "login.html"));
+});
+
+app.post("/login", (req, res) => {
+  const username = cleanText(req.body.username);
+  const password = req.body.password || "";
+
+  if (username === LIVE_ADMIN_USER && password === LIVE_ADMIN_PASS) {
+    req.session.liveAuthed = true;
+    req.session.liveUser = username;
+    return res.redirect("/live");
+  }
+
+  return res.status(401).send(`
+    <html>
+      <body style="font-family: Arial; padding: 24px;">
+        <h3>Login failed</h3>
+        <p>Invalid username or password.</p>
+        <p><a href="/login">Back to login</a></p>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.redirect("/login");
+  });
+});
+
+app.get("/live", requireLiveAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "live.html"));
+});
+
+// =========================
+// Live dashboard APIs
+// =========================
+app.get("/api/live/calls", requireApiAuth, (req, res) => {
+  const calls = Array.from(liveCalls.values())
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .map((c) => buildCallSummary(c));
+
+  res.json({
+    ok: true,
+    calls,
+  });
+});
+
+app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
+  const callSid = req.params.callSid;
+  const call = liveCalls.get(callSid);
+
+  if (!call) {
     return res.status(404).json({ ok: false, error: "Call not found" });
   }
 
   return res.json({
     ok: true,
-    callSid: session.callSid,
-    streamSid: session.streamSid,
-    transcript: session.transcript,
-    extracted: session.extracted,
-    callSummary: buildCallSummary(session.extracted),
+    call: {
+      callSid: call.callSid,
+      from: call.from,
+      to: call.to,
+      status: call.status,
+      streamSid: call.streamSid,
+      createdAt: call.createdAt,
+      updatedAt: call.updatedAt,
+      transcript: call.transcript,
+      extracted: call.extracted,
+    },
   });
 });
 
-// =========================
-// Health
-// =========================
-app.get("/", (req, res) => {
-  res.send("Owen HVAC AI phone server is running.");
+app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
+  try {
+    const cal = await testCalendarConnection();
+
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const dd = String(today.getDate()).padStart(2, "0");
+    const date = `${yyyy}-${mm}-${dd}`;
+
+    const events = await listEventsForDay(date);
+    const slots = generateSlotsForDay(date, events, 120);
+
+    res.json({
+      ok: true,
+      connected: true,
+      calendarId: cal.id || GOOGLE_CALENDAR_ID,
+      summary: cal.summary || "",
+      timeZone: cal.timeZone || BUSINESS_TIMEZONE,
+      todayDate: date,
+      todayEventCount: events.length,
+      todayAvailableSlots: slots.length,
+      slots,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      connected: false,
+      error: err?.message || "Calendar status failed",
+    });
+  }
+});
+
+app.post("/api/live-call/:callSid/reextract", requireApiAuth, async (req, res) => {
+  try {
+    const callSid = req.params.callSid;
+    const extracted = await refreshStructuredCallInfo(callSid);
+
+    let created = null;
+    try {
+      created = await maybeAutoCreateAppointment(callSid);
+    } catch (err) {
+      console.error("Reextract auto-create failed:", err?.message || err);
+    }
+
+    res.json({
+      ok: true,
+      extracted,
+      createdEventId: created?.id || null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Re-extract failed",
+    });
+  }
+});
+
+app.post("/api/live-call/:callSid/create-appointment", requireApiAuth, async (req, res) => {
+  try {
+    const event = await createAppointmentEvent(req.params.callSid);
+    res.json({
+      ok: true,
+      eventId: event.id,
+      htmlLink: event.htmlLink,
+      event,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Create appointment failed",
+    });
+  }
 });
 
 // =========================
@@ -527,7 +659,6 @@ app.get("/test/calendar", async (req, res) => {
     const data = await testCalendarConnection();
     res.json({ ok: true, calendar: data });
   } catch (err) {
-    console.error("Calendar test error:", err?.message || err);
     res.status(500).json({
       ok: false,
       error: err?.message || "Calendar connection failed",
@@ -552,7 +683,6 @@ app.get("/appointments/availability", async (req, res) => {
       slots,
     });
   } catch (err) {
-    console.error("Availability error:", err?.message || err);
     res.status(500).json({
       ok: false,
       error: err?.message || "Failed to get availability",
@@ -560,47 +690,19 @@ app.get("/appointments/availability", async (req, res) => {
   }
 });
 
-app.post("/appointments", async (req, res) => {
-  try {
-    const {
-      name,
-      phone,
-      address,
-      issue,
-      preferredDateRaw,
-      preferredTimeRaw,
-    } = req.body;
-
-    const event = await createAppointmentEvent({
-      name,
-      phone,
-      address,
-      issue,
-      preferredDateRaw,
-      preferredTimeRaw,
-    });
-
-    res.json({
-      ok: true,
-      eventId: event.id,
-      htmlLink: event.htmlLink,
-      event,
-    });
-  } catch (err) {
-    console.error("Create appointment error:", err?.message || err);
-    res.status(500).json({
-      ok: false,
-      error: err?.message || "Failed to create appointment",
-    });
-  }
-});
-
 // =========================
-// Twilio voice webhook
+// Twilio webhook routes
 // =========================
-app.post("/twilio/voice", (req, res) => {
+function twilioVoiceHandler(req, res) {
   const callSid = req.body.CallSid || `call_${Date.now()}`;
-  getOrCreateCallSession(callSid);
+  const from = req.body.From || "";
+  const to = req.body.To || "";
+
+  const session = getOrCreateCallSession(callSid);
+  session.from = from;
+  session.to = to;
+  session.status = "initiated";
+  session.updatedAt = new Date().toISOString();
 
   const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
   if (!wsUrl) {
@@ -624,6 +726,23 @@ app.post("/twilio/voice", (req, res) => {
 </Response>`;
 
   res.type("text/xml").send(twiml);
+}
+
+app.post("/twilio/voice", twilioVoiceHandler);
+app.post("/twilio/voice/incoming", twilioVoiceHandler);
+
+app.post("/twilio/voice/status", (req, res) => {
+  const callSid = req.body.CallSid || "";
+  if (callSid) {
+    const session = getOrCreateCallSession(callSid);
+    session.status = req.body.CallStatus || session.status;
+    session.from = req.body.From || session.from;
+    session.to = req.body.To || session.to;
+    session.updatedAt = new Date().toISOString();
+  }
+
+  console.log("Twilio Status Callback:", req.body);
+  res.sendStatus(200);
 });
 
 // =========================
@@ -724,7 +843,6 @@ Rules:
     try {
       const data = JSON.parse(message.toString());
 
-      // 音频回传给Twilio
       if (data.type === "response.audio.delta" && data.delta) {
         twilioWs.send(
           JSON.stringify({
@@ -737,42 +855,31 @@ Rules:
         );
       }
 
-      // assistant文本增量
       if (data.type === "response.output_text.delta" && data.delta) {
         session.lastAssistantText += data.delta;
       }
 
-      // assistant一轮说完
       if (data.type === "response.done") {
         const assistantText = cleanText(session.lastAssistantText);
 
         if (assistantText) {
           pushTranscript(callSid, "assistant", assistantText);
-          console.log("Assistant:", assistantText);
           session.lastAssistantText = "";
 
           try {
-            const extracted = await refreshStructuredCallInfoDebounced(callSid);
-            console.log("Structured extracted after assistant:", extracted);
+            await refreshStructuredCallInfoDebounced(callSid);
           } catch (err) {
-            console.error(
-              "Structured extraction after assistant failed:",
-              err?.message || err
-            );
+            console.error("Structured extraction after assistant failed:", err?.message || err);
           }
 
           try {
-            const created = await maybeAutoCreateAppointment(callSid);
-            if (created) {
-              console.log("✅ Appointment created:", created.id);
-            }
+            await maybeAutoCreateAppointment(callSid);
           } catch (err) {
             console.error("Auto-create appointment failed:", err?.message || err);
           }
         }
       }
 
-      // 可选：如果Realtime返回用户转写事件，抓进去
       if (
         data.type === "conversation.item.input_audio_transcription.completed" &&
         data.transcript
@@ -780,28 +887,17 @@ Rules:
         const callerText = cleanText(data.transcript);
         if (callerText) {
           pushTranscript(callSid, "caller", callerText);
-          console.log("Caller:", callerText);
 
           try {
-            const extracted = await refreshStructuredCallInfoDebounced(callSid);
-            console.log("Structured extracted after caller:", extracted);
+            await refreshStructuredCallInfoDebounced(callSid);
           } catch (err) {
-            console.error(
-              "Structured extraction after caller failed:",
-              err?.message || err
-            );
+            console.error("Structured extraction after caller failed:", err?.message || err);
           }
 
           try {
-            const created = await maybeAutoCreateAppointment(callSid);
-            if (created) {
-              console.log("✅ Appointment created:", created.id);
-            }
+            await maybeAutoCreateAppointment(callSid);
           } catch (err) {
-            console.error(
-              "Auto-create appointment after caller failed:",
-              err?.message || err
-            );
+            console.error("Auto-create appointment after caller failed:", err?.message || err);
           }
         }
       }
@@ -826,7 +922,8 @@ Rules:
         case "start":
           streamSid = data.start.streamSid;
           session.streamSid = streamSid;
-          console.log("Twilio stream started:", streamSid);
+          session.status = "in_progress";
+          session.updatedAt = new Date().toISOString();
           break;
 
         case "media":
@@ -841,7 +938,8 @@ Rules:
           break;
 
         case "stop":
-          console.log("Twilio stream stopped:", callSid);
+          session.status = "stream_closed";
+          session.updatedAt = new Date().toISOString();
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.close();
           }
@@ -856,7 +954,8 @@ Rules:
   });
 
   twilioWs.on("close", () => {
-    console.log("Twilio WS closed:", callSid);
+    session.status = "stream_closed";
+    session.updatedAt = new Date().toISOString();
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
@@ -865,114 +964,6 @@ Rules:
   twilioWs.on("error", (err) => {
     console.error("Twilio WS error:", err?.message || err);
   });
-});
-app.post("/twilio/voice/status", (req, res) => {
-  console.log("📞 Twilio Status Callback:", req.body);
-
-  // 你可以在这里记录通话状态
-  // 例如：
-  // CallSid
-  // CallStatus (queued, ringing, in-progress, completed)
-  // From / To
-
-  res.sendStatus(200); // 很关键，必须返回 200
-});
-// =========================
-// Manual update endpoint
-// =========================
-app.post("/api/live-call/:callSid/update", async (req, res) => {
-  try {
-    const callSid = req.params.callSid;
-    const session = getOrCreateCallSession(callSid);
-
-    mergeManualUpdate(session.extracted, req.body);
-
-    if (req.body.phone) {
-      session.extracted.phone = normalizePhone(req.body.phone);
-    }
-
-    let created = null;
-    try {
-      created = await maybeAutoCreateAppointment(callSid);
-    } catch (err) {
-      console.error("Manual update auto-create failed:", err?.message || err);
-    }
-
-    res.json({
-      ok: true,
-      extracted: session.extracted,
-      createdEventId: created?.id || null,
-      callSummary: buildCallSummary(session.extracted),
-    });
-  } catch (err) {
-    console.error("Live call update error:", err?.message || err);
-    res.status(500).json({
-      ok: false,
-      error: err?.message || "Failed to update live call",
-    });
-  }
-});
-
-// =========================
-// Force re-extract endpoint
-// =========================
-app.post("/api/live-call/:callSid/reextract", async (req, res) => {
-  try {
-    const callSid = req.params.callSid;
-    const extracted = await refreshStructuredCallInfo(callSid);
-
-    let created = null;
-    try {
-      created = await maybeAutoCreateAppointment(callSid);
-    } catch (err) {
-      console.error("Reextract auto-create failed:", err?.message || err);
-    }
-
-    res.json({
-      ok: true,
-      extracted,
-      createdEventId: created?.id || null,
-      callSummary: buildCallSummary(extracted),
-    });
-  } catch (err) {
-    console.error("Reextract error:", err?.message || err);
-    res.status(500).json({
-      ok: false,
-      error: err?.message || "Failed to re-extract call info",
-    });
-  }
-});
-
-// =========================
-// Manual confirm endpoint
-// =========================
-app.post("/api/live-call/:callSid/confirm", async (req, res) => {
-  try {
-    const callSid = req.params.callSid;
-    const session = getOrCreateCallSession(callSid);
-    session.extracted.bookingConfirmed = true;
-
-    let created = null;
-    try {
-      created = await maybeAutoCreateAppointment(callSid);
-    } catch (err) {
-      console.error("Confirm auto-create failed:", err?.message || err);
-    }
-
-    res.json({
-      ok: true,
-      bookingConfirmed: true,
-      appointmentCreated: session.extracted.appointmentCreated,
-      appointmentEventId: session.extracted.appointmentEventId,
-      createdEventId: created?.id || null,
-    });
-  } catch (err) {
-    console.error("Confirm endpoint error:", err?.message || err);
-    res.status(500).json({
-      ok: false,
-      error: err?.message || "Failed to confirm booking",
-    });
-  }
 });
 
 // =========================
