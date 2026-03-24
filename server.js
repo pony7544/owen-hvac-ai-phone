@@ -893,7 +893,7 @@ wss.on("connection", async (twilioWs, request) => {
     const sessionUpdate = {
       type: "session.update",
       session: {
-        modalities: ["audio"],
+        modalities: ["audio","text"],
         instructions: `
 You are the phone receptionist for ${BUSINESS_NAME}, an HVAC company.
 
@@ -943,7 +943,7 @@ Rules:
       JSON.stringify({
         type: "response.create",
         response: {
-          modalities: ["audio"],
+          modalities: ["audio","text"],
           instructions: "Greet the caller and ask how you can help today.",
         },
       })
