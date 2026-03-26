@@ -307,6 +307,12 @@ app.get("/logout", (req, res) => {
   });
 });
 
+app.post("/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.redirect("/login");
+  });
+});
+
 app.get("/live", requireLiveAuth, (req, res) => {
   const liveHtmlPath = path.join(__dirname, "public", "live.html");
   res.sendFile(liveHtmlPath, (err) => {
@@ -438,6 +444,30 @@ app.get("/appointments/availability", async (req, res) => {
     });
   } catch (err) {
     res.json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
+  try {
+    const todayDate = getTodayDateInBusinessTimezone();
+    const calendar = await testCalendarConnection();
+    const events = await listEventsForDay(todayDate);
+    const slots = generateSlotsForDay(todayDate, events, 120);
+
+    res.json({
+      connected: true,
+      calendarId: calendar?.id || GOOGLE_CALENDAR_ID,
+      summary: calendar?.summary || "",
+      timeZone: calendar?.timeZone || BUSINESS_TIMEZONE,
+      todayDate,
+      todayEventCount: Array.isArray(events) ? events.length : 0,
+      todayAvailableSlots: Array.isArray(slots) ? slots.length : 0,
+    });
+  } catch (err) {
+    res.status(500).json({
+      connected: false,
+      error: err.message || "Calendar status failed",
+    });
   }
 });
 
