@@ -323,84 +323,9 @@ function sendOpenAIEvent(ws, event) {
   }
 }
 
-async function startCallRecording(callSid) {
-  if (!twilioClient || !callSid) return null;
 
-  const sessionObj = getOrCreateCallSession(callSid);
 
-  if (sessionObj.recording?.recordingSid || sessionObj.recording?.starting) {
-    return sessionObj.recording || null;
-  }
 
-  sessionObj.recording = {
-    ...(sessionObj.recording || {}),
-    starting: true,
-    status: "starting",
-    available: false,
-    createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
-    expiresAt:
-      sessionObj.recording?.expiresAt ||
-      addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
-  };
-  sessionObj.updatedAt = new Date().toISOString();
-
-  const statusCallback = buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH);
-
-  try {
-    const recording = await twilioClient.calls(callSid).recordings.create({
-      recordingStatusCallback: statusCallback,
-      recordingStatusCallbackEvent: ["in-progress", "completed", "absent"],
-      recordingChannels: "dual",
-      recordingTrack: "both",
-      trim: "do-not-trim",
-    });
-
-    sessionObj.recording = {
-      ...(sessionObj.recording || {}),
-      starting: false,
-      status: recording.status || "in-progress",
-      recordingSid: recording.sid,
-      available: false,
-      createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
-      expiresAt:
-        sessionObj.recording?.expiresAt ||
-        addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
-    };
-    sessionObj.updatedAt = new Date().toISOString();
-
-    return sessionObj.recording;
-  } catch (err) {
-    sessionObj.recording = {
-      ...(sessionObj.recording || {}),
-      starting: false,
-      status: "failed",
-      available: false,
-      error: err.message || "Failed to start recording",
-    };
-    sessionObj.updatedAt = new Date().toISOString();
-    throw err;
-  }
-}
-
-async function deleteRecordingIfExpired(sessionObj) {
-  if (!twilioClient || !sessionObj?.recording?.recordingSid) return false;
-  if (sessionObj.recording.deletedAt) return false;
-
-  const expiresAt = sessionObj.recording.expiresAt
-    ? new Date(sessionObj.recording.expiresAt).getTime()
-    : 0;
-
-  if (!expiresAt || Date.now() < expiresAt) return false;
-
-  await twilioClient.recordings(sessionObj.recording.recordingSid).remove();
-
-  sessionObj.recording.deletedAt = new Date().toISOString();
-  sessionObj.recording.available = false;
-  sessionObj.recording.status = "deleted";
-  sessionObj.updatedAt = new Date().toISOString();
-
-  return true;
-}
 
 
 
@@ -688,38 +613,6 @@ app.post(TWILIO_STATUS_PATH, (req, res) => {
   res.sendStatus(200);
 });
 
-app.post(RECORDING_STATUS_PATH, (req, res) => {
-  const callSid = cleanText(req.body.CallSid || "");
-  const recordingSid = cleanText(req.body.RecordingSid || "");
-  const recordingUrl = cleanText(req.body.RecordingUrl || "");
-  const recordingStatus = cleanText(req.body.RecordingStatus || "");
-  const recordingDuration = parseInt(req.body.RecordingDuration || "0", 10) || 0;
-
-  if (callSid) {
-    const sessionObj = getOrCreateCallSession(callSid);
-    sessionObj.recording = {
-      ...(sessionObj.recording || {}),
-      recordingSid: recordingSid || sessionObj.recording?.recordingSid || "",
-      status: recordingStatus || sessionObj.recording?.status || "",
-      durationSec: recordingDuration,
-      createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
-      completedAt:
-        recordingStatus === "completed"
-          ? new Date().toISOString()
-          : sessionObj.recording?.completedAt || "",
-      expiresAt:
-        sessionObj.recording?.expiresAt ||
-        addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
-      available: recordingStatus === "completed",
-      sourceUrl: recordingUrl || sessionObj.recording?.sourceUrl || "",
-    };
-    sessionObj.updatedAt = new Date().toISOString();
-    ensureRecordingSession(activeCallSid);
-  }
-
-  console.log("Twilio Recording Callback:", req.body);
-  res.sendStatus(200);
-});
 
 // =========================
 // WebSocket server for Twilio Media Streams
@@ -953,12 +846,7 @@ wss.on("connection", async (twilioWs, request) => {
             streamToCallSid.set(streamSid, activeCallSid);
           }
 
-          try {
-            await startCallRecording(activeCallSid);
-          } catch (err) {
-            console.error("start recording error:", err?.message || err);
-          }
-
+          
           break;
         }
 
