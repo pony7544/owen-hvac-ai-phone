@@ -959,7 +959,7 @@ setTimeout(() => {
 // =========================
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-  ensureRecordingSession(activeCallSid);
+ 
   if (PUBLIC_BASE_URL) {
     console.log("Voice webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH));
     console.log("Status webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH));
