@@ -401,19 +401,7 @@ async function deleteRecordingIfExpired(sessionObj) {
   return true;
 }
 
-async function cleanupExpiredRecordings() {
-  const calls = Array.from(liveCalls.values());
-  for (const sessionObj of calls) {
-    try {
-      await deleteRecordingIfExpired(sessionObj);
-    } catch (err) {
-      console.error(
-        `cleanup recording failed for ${sessionObj.callSid}:`,
-        err?.message || err
-      );
-    }
-  }
-}
+
 
 // =========================
 // Page Routes
