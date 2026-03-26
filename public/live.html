@@ -207,9 +207,9 @@
     <div class="title">Owen HVAC Live Dashboard</div>
     <div class="top-actions">
       <button class="btn btn-light" id="refreshBtn">Refresh</button>
-      <form method="POST" action="/logout" style="margin:0;">
-        <button class="btn btn-dark" type="submit">Logout</button>
-      </form>
+      <a href="/logout" style="text-decoration:none;">
+      <button class="btn btn-dark" type="button">Logout</button>
+    </a>>
     </div>
   </div>
 
@@ -367,7 +367,7 @@
     }
 
     async function loadCalls() {
-      const data = await fetchJson("/api/live/calls");
+      const data = await fetchJson("/api/live-calls");
       callsCache = data.calls || [];
       renderCalls(callsCache);
 
@@ -420,8 +420,8 @@
 
     async function reextractCurrent() {
       if (!selectedCallSid) return;
-      await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/reextract`, {
-        method: "POST"
+      await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/refresh-extraction`, {
+      method: "POST"
       });
       await loadCallDetail(selectedCallSid);
       await loadCalls();
@@ -434,7 +434,7 @@
         const data = await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/create-appointment`, {
           method: "POST"
         });
-        alert(`Appointment created. Event ID: ${data.eventId}`);
+        alert(`Appointment created successfully.`);
       } catch (err) {
         alert(err.message || "Failed to create appointment");
       }
