@@ -705,13 +705,13 @@ wss.on("connection", (twilioWs, req) => {
       }
     });
 
-    openaiWs.on("close", () => {
-      console.log("OpenAI WS closed", code, reason?.toString());
-      openaiReady = false;
-      try {
-        twilioWs.close();
-      } catch {}
-    });
+openaiWs.on("close", (code, reason) => {
+  console.log("OpenAI WS closed:", code, reason ? reason.toString() : "");
+  openaiReady = false;
+  try {
+    twilioWs.close();
+  } catch {}
+});
 
     openaiWs.on("error", (err) => {
       console.error("OpenAI WS error:", err);
