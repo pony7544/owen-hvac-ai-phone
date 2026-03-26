@@ -1,6 +1,5 @@
 require("dotenv").config();
 
-const { createRecordingService } = require("./services/recording.service");
 const express = require("express");
 const http = require("http");
 const path = require("path");
@@ -8,6 +7,23 @@ const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const session = require("express-session");
 const twilio = require("twilio");
+
+const {
+  liveCalls,
+  streamToCallSid,
+  cleanText,
+  normalizePhone,
+  getOrCreateCallSession,
+  mergeCallSessions,
+  resolveStartCallSid,
+  pushTranscript,
+  buildCallSummary,
+} = require("./services/call-session.service");
+
+const { createCalendarService } = require("./services/calendar.service");
+const { createExtractionService } = require("./services/extraction.service");
+const { createRecordingService } = require("./services/recording.service");
+
 const recordingService = createRecordingService({
   recordingsDir: path.join(__dirname, "recordings"),
   retentionDays: parseInt(process.env.RECORDING_RETENTION_DAYS || "90", 10),
@@ -24,21 +40,6 @@ const {
   streamRecordingMedia,
   cleanupExpiredRecordings,
 } = recordingService;
-
-const {
-  liveCalls,
-  streamToCallSid,
-  cleanText,
-  normalizePhone,
-  getOrCreateCallSession,
-  mergeCallSessions,
-  resolveStartCallSid,
-  pushTranscript,
-  buildCallSummary,
-} = require("./services/call-session.service");
-
-const { createCalendarService } = require("./services/calendar.service");
-const { createExtractionService } = require("./services/extraction.service");
 
 const app = express();
 const server = http.createServer(app);
