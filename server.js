@@ -50,7 +50,8 @@ const PORT = process.env.PORT || 10000;
 // =========================
 // ENV
 // =========================
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "Owen HVAC Corp";
 const BUSINESS_PHONE = process.env.BUSINESS_PHONE || "";
 const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || "America/Halifax";
@@ -59,33 +60,42 @@ const DEFAULT_APPOINTMENT_MINUTES = parseInt(
   10
 );
 
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 
 const LIVE_ADMIN_USER = process.env.LIVE_ADMIN_USER || "admin";
 const LIVE_ADMIN_PASS = process.env.LIVE_ADMIN_PASS || "ChangeThisPassword123!";
 
-if (!OPENAI_API_KEY) {
-  console.warn("Missing OPENAI_API_KEY");
-}
-
-// Realtime model / voice config
+// 保留你原文件可用的 realtime 写法
 const REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-mini-realtime-preview";
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "alloy";
 
-// Public URL for Twilio media stream + status callback
+// 这里保留你原来的 PUBLIC_WSS_URL 优先级思路
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL ||
   process.env.RENDER_EXTERNAL_URL ||
   process.env.BASE_URL ||
   "";
 
-const MEDIA_STREAM_PATH = "/media-stream";
+const PUBLIC_WSS_URL =
+  process.env.PUBLIC_WSS_URL ||
+  (PUBLIC_BASE_URL.startsWith("https://")
+    ? PUBLIC_BASE_URL.replace(/^https:\/\//i, "wss://")
+    : PUBLIC_BASE_URL.startsWith("http://")
+    ? PUBLIC_BASE_URL.replace(/^http:\/\//i, "ws://")
+    : "");
+
 const TWILIO_VOICE_PATH = "/twilio/voice";
-const TWILIO_STATUS_PATH = "/twilio/status";
+const TWILIO_VOICE_INCOMING_PATH = "/twilio/voice/incoming";
+const TWILIO_STATUS_PATH = "/twilio/voice/status";
+const MEDIA_STREAM_PATH = "/media-stream";
+
+if (!OPENAI_API_KEY) {
+  console.warn("Missing OPENAI_API_KEY");
+}
 
 // =========================
 // Services
@@ -122,7 +132,7 @@ const {
 } = extractionService;
 
 // =========================
-// Auth helpers
+// Helpers
 // =========================
 function requireLiveAuth(req, res, next) {
   if (req.session && req.session.liveAuthed) {
@@ -138,26 +148,12 @@ function requireApiAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "Unauthorized" });
 }
 
-// =========================
-// General helpers
-// =========================
 function escapeXml(str = "") {
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-function buildWsUrlFromBase(baseUrl, pathName) {
-  if (!baseUrl) return "";
-  if (baseUrl.startsWith("https://")) {
-    return baseUrl.replace(/^https:\/\//i, "wss://") + pathName;
-  }
-  if (baseUrl.startsWith("http://")) {
-    return baseUrl.replace(/^http:\/\//i, "ws://") + pathName;
-  }
-  return "";
 }
 
 function buildHttpUrl(baseUrl, pathName) {
@@ -189,6 +185,20 @@ function safeJsonParse(raw, fallback = null) {
   }
 }
 
+function getTodayDateInBusinessTimezone() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BUSINESS_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const year = parts.find((p) => p.type === "year")?.value || "2000";
+  const month = parts.find((p) => p.type === "month")?.value || "01";
+  const day = parts.find((p) => p.type === "day")?.value || "01";
+  return `${year}-${month}-${day}`;
+}
+
 function getCallPublicData(sessionObj) {
   return {
     callSid: sessionObj.callSid,
@@ -206,14 +216,6 @@ function getCallPublicData(sessionObj) {
   };
 }
 
-function findCallSidByStreamOrCall(streamSid, callSid) {
-  if (callSid) return callSid;
-  if (streamSid && streamToCallSid.has(streamSid)) {
-    return streamToCallSid.get(streamSid);
-  }
-  return "";
-}
-
 function getLatestCalls(limit = 20) {
   return Array.from(liveCalls.values())
     .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))
@@ -221,11 +223,61 @@ function getLatestCalls(limit = 20) {
     .map(getCallPublicData);
 }
 
+function buildSystemPrompt() {
+  return `
+You are the phone receptionist for ${BUSINESS_NAME}, an HVAC company.
+Your job is to speak naturally and help callers with:
+- service
+- repair
+- maintenance
+- installation quote requests
+- general HVAC questions
+
+Conversation goals:
+1. Understand the caller's intent.
+2. Collect, if relevant:
+   - full name
+   - callback number
+   - full service address
+   - short issue summary
+   - preferred appointment date
+   - preferred appointment time
+3. Read the details back clearly for confirmation.
+4. If the caller confirms, let them know the request has been recorded and a team member will follow up.
+
+Rules:
+- Keep responses short and phone-friendly.
+- Ask one thing at a time when information is missing.
+- Do not invent customer details.
+- Use English unless the caller speaks another language.
+- Speak naturally as a receptionist.
+`.trim();
+}
+
+function sendOpenAIEvent(ws, event) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(event));
+  }
+}
+
 // =========================
-// Page routes
+// Page Routes
 // =========================
 app.get("/", (req, res) => {
   res.send("Owen HVAC AI phone server is running.");
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "owen-hvac-ai-phone",
+    time: new Date().toISOString(),
+    publicBaseUrl: PUBLIC_BASE_URL,
+    publicWssUrl: PUBLIC_WSS_URL,
+    voiceWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH),
+    statusWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH),
+    mediaStreamPath: MEDIA_STREAM_PATH,
+  });
 });
 
 app.get("/login", (req, res) => {
@@ -260,7 +312,6 @@ app.get("/live", requireLiveAuth, (req, res) => {
   res.sendFile(liveHtmlPath, (err) => {
     if (!err) return;
 
-    // fallback simple dashboard if live.html doesn't exist
     res.send(`
       <!doctype html>
       <html>
@@ -276,12 +327,8 @@ app.get("/live", requireLiveAuth, (req, res) => {
       </head>
       <body>
         <h2>Owen HVAC Live Calls</h2>
-        <div class="row">
-          <a href="/logout">Logout</a>
-        </div>
-        <div class="row">
-          <button onclick="loadCalls()">Refresh</button>
-        </div>
+        <div class="row"><a href="/logout">Logout</a></div>
+        <div class="row"><button onclick="loadCalls()">Refresh</button></div>
         <pre id="out">Loading...</pre>
         <script>
           async function loadCalls() {
@@ -300,7 +347,7 @@ app.get("/live", requireLiveAuth, (req, res) => {
 });
 
 // =========================
-// Admin / live APIs
+// Live APIs
 // =========================
 app.get("/api/live-calls", requireApiAuth, (req, res) => {
   return res.json({
@@ -364,34 +411,22 @@ app.post(
 // =========================
 app.get("/test/calendar", async (req, res) => {
   try {
-    const calendarInfo = await testCalendarConnection();
-    return res.json({
-      ok: true,
-      calendar: calendarInfo,
-    });
+    const data = await testCalendarConnection();
+    res.json({ ok: true, calendar: data });
   } catch (err) {
-    console.error("calendar test error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Calendar test failed",
-    });
+    res.json({ ok: false, error: err.message });
   }
 });
 
 app.get("/appointments/availability", async (req, res) => {
   try {
-    const date = cleanText(req.query.date);
-    if (!date) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing required query param: date" });
-    }
-
+    const date = cleanText(req.query.date || getTodayDateInBusinessTimezone());
     const slotMinutes = parseInt(req.query.slotMinutes || "120", 10);
+
     const events = await listEventsForDay(date);
     const slots = generateSlotsForDay(date, events, slotMinutes);
 
-    return res.json({
+    res.json({
       ok: true,
       date,
       slotMinutes,
@@ -402,436 +437,363 @@ app.get("/appointments/availability", async (req, res) => {
       })),
     });
   } catch (err) {
-    console.error("availability error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Failed to get availability",
-    });
+    res.json({ ok: false, error: err.message });
   }
 });
 
 // =========================
-// Twilio voice webhook
+// Twilio Voice Webhook
 // =========================
-app.post(TWILIO_VOICE_PATH, (req, res) => {
-  try {
-    const callSid = cleanText(req.body.CallSid || req.body.callSid || "");
-    const from = cleanText(req.body.From || "");
-    const to = cleanText(req.body.To || "");
+function twilioVoiceHandler(req, res) {
+  const callSid = cleanText(req.body.CallSid || `call_${Date.now()}`);
+  const from = cleanText(req.body.From || "");
+  const to = cleanText(req.body.To || "");
 
-    const sessionObj = getOrCreateCallSession(callSid);
-    sessionObj.from = from || sessionObj.from;
-    sessionObj.to = to || sessionObj.to;
-    sessionObj.status = "initiated";
-    sessionObj.updatedAt = new Date().toISOString();
+  const sessionObj = getOrCreateCallSession(callSid);
+  sessionObj.from = from || sessionObj.from;
+  sessionObj.to = to || sessionObj.to;
+  sessionObj.status = "initiated";
+  sessionObj.updatedAt = new Date().toISOString();
 
-    const wsUrl = buildWsUrlFromBase(PUBLIC_BASE_URL, MEDIA_STREAM_PATH);
-    if (!wsUrl) {
-      console.error("PUBLIC_BASE_URL / RENDER_EXTERNAL_URL is not configured");
-    }
+  const streamBase =
+    PUBLIC_WSS_URL ||
+    (req.headers.host ? `wss://${req.headers.host}` : "");
 
-    const twiml = `
+  const streamUrl = `${streamBase}${MEDIA_STREAM_PATH}?callSid=${encodeURIComponent(
+    callSid
+  )}`;
+
+  const twiml = `
 <Response>
-  <Say voice="alice">Hello. You have reached ${escapeXml(
+  <Say voice="alice">Hello, you have reached ${escapeXml(
     BUSINESS_NAME
-  )}. Please hold while I connect you to our AI assistant.</Say>
+  )}. Please hold while I connect you.</Say>
   <Connect>
-    <Stream url="${escapeXml(wsUrl)}">
-      <Parameter name="callSid" value="${escapeXml(callSid)}" />
-      <Parameter name="from" value="${escapeXml(from)}" />
-      <Parameter name="to" value="${escapeXml(to)}" />
-      <Parameter name="businessName" value="${escapeXml(BUSINESS_NAME)}" />
-      <Parameter name="businessPhone" value="${escapeXml(BUSINESS_PHONE)}" />
-      <Parameter name="businessTimezone" value="${escapeXml(
-        BUSINESS_TIMEZONE
-      )}" />
-    </Stream>
+    <Stream url="${escapeXml(streamUrl)}" />
   </Connect>
-</Response>`.trim();
+</Response>
+`.trim();
 
-    res.type("text/xml").send(twiml);
-  } catch (err) {
-    console.error("twilio voice webhook error:", err);
-    res.type("text/xml").send(`
-<Response>
-  <Say voice="alice">Sorry, there was a temporary issue. Please try again later.</Say>
-  <Hangup />
-</Response>`.trim());
-  }
-});
+  res.type("text/xml").send(twiml);
+}
+
+app.post(TWILIO_VOICE_PATH, twilioVoiceHandler);
+app.post(TWILIO_VOICE_INCOMING_PATH, twilioVoiceHandler);
 
 app.post(TWILIO_STATUS_PATH, (req, res) => {
-  try {
-    console.log("Twilio Status Callback:", req.body);
-
-    const callSid = cleanText(req.body.CallSid || "");
-    const callStatus = cleanText(req.body.CallStatus || "");
-
-    if (callSid) {
-      const sessionObj = getOrCreateCallSession(callSid);
-      sessionObj.status = callStatus || sessionObj.status;
-      sessionObj.updatedAt = new Date().toISOString();
-    }
-
-    return res.status(204).send();
-  } catch (err) {
-    console.error("twilio status error:", err);
-    return res.status(204).send();
+  const callSid = req.body.CallSid || "";
+  if (callSid) {
+    const sessionObj = getOrCreateCallSession(callSid);
+    sessionObj.status = req.body.CallStatus || sessionObj.status;
+    sessionObj.from = req.body.From || sessionObj.from;
+    sessionObj.to = req.body.To || sessionObj.to;
+    sessionObj.updatedAt = new Date().toISOString();
   }
+  console.log("Twilio Status Callback:", req.body);
+  res.sendStatus(200);
 });
 
 // =========================
-// Realtime bridge helpers
-// =========================
-function buildSystemPrompt(sessionObj) {
-  const knownName = sessionObj.extracted?.callerName || "";
-  const knownPhone = sessionObj.extracted?.callbackNumber || "";
-  const knownAddress = sessionObj.extracted?.serviceAddress || "";
-  const knownIssue = sessionObj.extracted?.issueSummary || "";
-
-  return `
-You are the phone receptionist for ${BUSINESS_NAME}, an HVAC company.
-
-Your goals:
-1. Greet the caller naturally.
-2. Collect:
-   - caller full name
-   - callback phone number
-   - service address
-   - reason for call / HVAC issue
-3. Be concise and conversational.
-4. Repeat back details to confirm accuracy.
-5. If one field is already known, do not ask for it again unless needed.
-6. Never invent appointment times.
-7. Do not claim an appointment is booked unless the system confirms it.
-
-Known info:
-- Name: ${knownName}
-- Phone: ${knownPhone}
-- Address: ${knownAddress}
-- Issue: ${knownIssue}
-
-Business timezone: ${BUSINESS_TIMEZONE}
-
-When speaking:
-- Be friendly and short.
-- Ask one thing at a time when possible.
-- If the caller asks for service or quote, gather required information first.
-`.trim();
-}
-
-function sendOpenAIEvent(ws, event) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(event));
-  }
-}
-
-function sendTwilioAudio(ws, streamSid, base64Audio) {
-  if (ws.readyState !== WebSocket.OPEN || !streamSid || !base64Audio) return;
-  ws.send(
-    JSON.stringify({
-      event: "media",
-      streamSid,
-      media: {
-        payload: base64Audio,
-      },
-    })
-  );
-}
-
-function sendTwilioMark(ws, streamSid, name = "responsePart") {
-  if (ws.readyState !== WebSocket.OPEN || !streamSid) return;
-  ws.send(
-    JSON.stringify({
-      event: "mark",
-      streamSid,
-      mark: { name },
-    })
-  );
-}
-
-async function maybeSyncExtractionAndBooking(callSid) {
-  try {
-    await refreshStructuredCallInfoDebounced(callSid);
-    await maybeAutoCreateAppointment(callSid);
-  } catch (err) {
-    console.error("maybeSyncExtractionAndBooking error:", err);
-  }
-}
-
-// =========================
-// WebSocket server
+// WebSocket server for Twilio Media Streams
 // =========================
 const wss = new WebSocket.Server({ noServer: true });
 
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === MEDIA_STREAM_PATH) {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
+server.on("upgrade", (request, socket, head) => {
+  const { url } = request || {};
+  if (url && url.startsWith(MEDIA_STREAM_PATH)) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
     });
-    return;
+  } else {
+    socket.destroy();
   }
-  socket.destroy();
 });
 
-wss.on("connection", (twilioWs, req) => {
-  console.log("Twilio media stream connected");
+wss.on("connection", async (twilioWs, request) => {
+  const urlObj = new URL(request.url, `http://${request.headers.host}`);
+  const urlCallSid =
+    urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
+
+  let activeCallSid = urlCallSid;
+  let sessionObj = getOrCreateCallSession(activeCallSid);
+
+  console.log(`Twilio media stream connected: initial=${activeCallSid}`);
 
   let streamSid = "";
-  let callSid = "";
-  let openaiWs = null;
-  let openaiReady = false;
+  let assistantTranscriptBuffer = "";
 
-  function ensureSession() {
-    if (!callSid) return null;
-    return getOrCreateCallSession(callSid);
-  }
+  const openaiWs = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
+      REALTIME_MODEL
+    )}`,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
 
-  function connectOpenAI() {
-    openaiWs = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
-        REALTIME_MODEL
-      )}`,
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "OpenAI-Beta": "realtime=v1",
+  openaiWs.on("open", () => {
+    console.log("Connected to OpenAI Realtime");
+
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        modalities: ["audio", "text"],
+        instructions: buildSystemPrompt(),
+        voice: REALTIME_VOICE,
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        input_audio_transcription: {
+          model: "gpt-4o-mini-transcribe",
         },
-      }
-    );
+        turn_detection: {
+          type: "server_vad",
+          silence_duration_ms: 700,
+          prefix_padding_ms: 300,
+        },
+      },
+    };
 
-    openaiWs.on("open", () => {
-      console.log("Connected to OpenAI Realtime");
-      openaiReady = true;
+    sendOpenAIEvent(openaiWs, sessionUpdate);
 
-      const sessionObj = ensureSession();
-
-      sendOpenAIEvent(openaiWs, {
-  type: "session.update",
-  session: {
-    modalities: ["audio"],
-    instructions: buildSystemPrompt(
-      sessionObj || { extracted: {}, transcript: [] }
-    ),
-    voice: REALTIME_VOICE,
-    input_audio_format: "g711_ulaw",
-    output_audio_format: "g711_ulaw",
-    input_audio_transcription: {
-      model: "gpt-4o-mini-transcribe",
-    },
-    turn_detection: {
-      type: "server_vad",
-    },
-    temperature: 0.6,
-  },
-});
-
-sendOpenAIEvent(openaiWs, {
-  type: "response.create",
-  response: {
-    modalities: ["audio"],
-    instructions:
-      "Greet the caller and start collecting their name, callback number, service address, and reason for calling.",
-  },
-});
+    sendOpenAIEvent(openaiWs, {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions: "Greet the caller and ask how you can help today.",
+      },
     });
+  });
 
-    openaiWs.on("message", async (raw) => {
-      const event = safeJsonParse(raw.toString(), {});
-      if (!event || !event.type) return;
+  openaiWs.on("message", async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      console.log("OpenAI event type:", data.type);
 
-      // Debug if needed:
-      // console.log("OpenAI event:", event.type);
+      if (
+        data.type === "conversation.item.input_audio_transcription.completed" &&
+        data.transcript
+      ) {
+        const callerText = cleanText(data.transcript);
+        if (callerText) {
+          console.log("Caller:", callerText);
+          pushTranscript(activeCallSid, "caller", callerText);
 
-      switch (event.type) {
-        case "response.audio.delta": {
-          if (event.delta) {
-            sendTwilioAudio(twilioWs, streamSid, event.delta);
+          try {
+            await refreshStructuredCallInfoDebounced(activeCallSid);
+          } catch (err) {
+            console.error(
+              "Structured extraction after caller failed:",
+              err?.message || err
+            );
           }
-          break;
-        }
 
-        case "response.audio.done": {
-          sendTwilioMark(twilioWs, streamSid, "responseAudioDone");
-          break;
-        }
-
-        case "response.output_text.delta": {
-          const sessionObj = ensureSession();
-          if (sessionObj && event.delta) {
-            sessionObj.lastAssistantText =
-              (sessionObj.lastAssistantText || "") + event.delta;
-            sessionObj.updatedAt = new Date().toISOString();
+          try {
+            await maybeAutoCreateAppointment(activeCallSid);
+          } catch (err) {
+            console.error(
+              "Auto-create appointment after caller failed:",
+              err?.message || err
+            );
           }
-          break;
         }
+      }
 
-        case "response.output_text.done": {
-          const sessionObj = ensureSession();
-          if (sessionObj && sessionObj.lastAssistantText) {
-            pushTranscript(callSid, "assistant", sessionObj.lastAssistantText);
-            sessionObj.lastAssistantText = "";
-            await maybeSyncExtractionAndBooking(callSid);
+      if (data.type === "response.audio_transcript.delta" && data.delta) {
+        assistantTranscriptBuffer += data.delta;
+      }
+
+      if (data.type === "response.audio.delta" && data.delta) {
+        console.log("🔊 audio delta", {
+          len: data.delta.length,
+          streamSid,
+        });
+
+        if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+          twilioWs.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: {
+                payload: data.delta,
+              },
+            })
+          );
+          console.log("✅ sent audio to Twilio");
+        } else {
+          console.log("❌ Twilio not ready or streamSid missing");
+        }
+      }
+
+      if (data.type === "response.audio.done") {
+        console.log("🔊 audio done");
+      }
+
+      if (data.type === "response.done") {
+        const assistantText = cleanText(assistantTranscriptBuffer);
+        console.log("🤖 response done", assistantText);
+
+        if (assistantText) {
+          pushTranscript(activeCallSid, "assistant", assistantText);
+          assistantTranscriptBuffer = "";
+
+          try {
+            await refreshStructuredCallInfoDebounced(activeCallSid);
+          } catch (err) {
+            console.error(
+              "Structured extraction after assistant failed:",
+              err?.message || err
+            );
           }
-          break;
-        }
 
-        case "conversation.item.input_audio_transcription.completed": {
-          const text = cleanText(event.transcript || "");
-          if (text && callSid) {
-            pushTranscript(callSid, "user", text);
-            await maybeSyncExtractionAndBooking(callSid);
+          try {
+            await maybeAutoCreateAppointment(activeCallSid);
+          } catch (err) {
+            console.error(
+              "Auto-create appointment failed:",
+              err?.message || err
+            );
           }
+        } else {
+          assistantTranscriptBuffer = "";
+        }
+      }
+
+      if (data.type === "error") {
+        console.error(
+          "OpenAI realtime error event:",
+          JSON.stringify(data, null, 2)
+        );
+      }
+    } catch (err) {
+      console.error("OpenAI message parse error:", err?.message || err);
+    }
+  });
+
+  openaiWs.on("error", (err) => {
+    console.error("OpenAI WS error:", err?.message || err);
+  });
+
+  openaiWs.on("close", (code, reason) => {
+    console.log("OpenAI WS closed:", code, reason ? reason.toString() : "");
+    try {
+      if (twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.close();
+      }
+    } catch {}
+  });
+
+  twilioWs.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+
+      switch (data.event) {
+        case "start": {
+          console.log(
+            "Twilio stream start:",
+            JSON.stringify(data.start, null, 2)
+          );
+
+          streamSid = data.start?.streamSid || "";
+
+          const startCallSid = resolveStartCallSid(data.start, urlCallSid);
+          if (startCallSid && startCallSid !== activeCallSid) {
+            console.log(
+              `Merging call session from ${activeCallSid} -> ${startCallSid}`
+            );
+            sessionObj = mergeCallSessions(startCallSid, activeCallSid);
+            activeCallSid = startCallSid;
+          } else {
+            sessionObj = getOrCreateCallSession(activeCallSid);
+          }
+
+          sessionObj.streamSid = streamSid || sessionObj.streamSid;
+          sessionObj.status = "in-progress";
+          sessionObj.from =
+            cleanText(data.start?.customParameters?.from || "") ||
+            sessionObj.from;
+          sessionObj.to =
+            cleanText(data.start?.customParameters?.to || "") || sessionObj.to;
+          sessionObj.updatedAt = new Date().toISOString();
+
+          if (streamSid) {
+            streamToCallSid.set(streamSid, activeCallSid);
+          }
+
           break;
         }
 
-        case "input_audio_buffer.speech_started":
-        case "input_audio_buffer.speech_stopped":
-        case "response.created":
-        case "response.done":
-        case "session.created":
-        case "session.updated":
-        case "conversation.item.created":
-        case "rate_limits.updated":
+        case "media": {
+          if (activeCallSid) {
+            const call = getOrCreateCallSession(activeCallSid);
+            call.mediaPacketCount = (call.mediaPacketCount || 0) + 1;
+            call.updatedAt = new Date().toISOString();
+          }
+
+          if (
+            data.media?.payload &&
+            openaiWs.readyState === WebSocket.OPEN
+          ) {
+            openaiWs.send(
+              JSON.stringify({
+                type: "input_audio_buffer.append",
+                audio: data.media.payload,
+              })
+            );
+          }
+
+          break;
+        }
+
+        case "mark":
           break;
 
-        case "error": {
-          console.error("OpenAI realtime error event:", event);
+        case "stop": {
+          console.log("Twilio stream stop");
+          if (activeCallSid && liveCalls.has(activeCallSid)) {
+            const call = liveCalls.get(activeCallSid);
+            call.status = "completed";
+            call.updatedAt = new Date().toISOString();
+          }
+
+          try {
+            if (openaiWs.readyState === WebSocket.OPEN) {
+              openaiWs.close();
+            }
+          } catch {}
+
           break;
         }
 
         default:
           break;
       }
-    });
-
-openaiWs.on("close", (code, reason) => {
-  console.log("OpenAI WS closed:", code, reason ? reason.toString() : "");
-  openaiReady = false;
-  try {
-    twilioWs.close();
-  } catch {}
-});
-
-    openaiWs.on("error", (err) => {
-      console.error("OpenAI WS error:", err);
-      openaiReady = false;
-    });
-  }
-
-  connectOpenAI();
-
-  twilioWs.on("message", async (message) => {
-    const data = safeJsonParse(message.toString(), {});
-    if (!data || !data.event) return;
-
-    switch (data.event) {
-      case "connected":
-        break;
-
-      case "start": {
-        streamSid = data.start?.streamSid || "";
-        const startCallSid = resolveStartCallSid(data.start, "");
-        const customCallSid = cleanText(
-          data.start?.customParameters?.callSid || ""
-        );
-        callSid = startCallSid || customCallSid || callSid || "";
-
-        if (streamSid && callSid) {
-          streamToCallSid.set(streamSid, callSid);
-        }
-
-        const sessionObj = getOrCreateCallSession(callSid || `stream_${streamSid}`);
-        if (!callSid) {
-          callSid = sessionObj.callSid;
-        }
-
-        sessionObj.streamSid = streamSid || sessionObj.streamSid;
-        sessionObj.from =
-          cleanText(data.start?.customParameters?.from || "") || sessionObj.from;
-        sessionObj.to =
-          cleanText(data.start?.customParameters?.to || "") || sessionObj.to;
-        sessionObj.status = "in-progress";
-        sessionObj.updatedAt = new Date().toISOString();
-
-        break;
-      }
-
-      case "media": {
-        if (callSid) {
-          const sessionObj = getOrCreateCallSession(callSid);
-          sessionObj.mediaPacketCount = (sessionObj.mediaPacketCount || 0) + 1;
-          sessionObj.updatedAt = new Date().toISOString();
-        }
-
-        if (openaiWs && openaiReady && data.media?.payload) {
-          sendOpenAIEvent(openaiWs, {
-            type: "input_audio_buffer.append",
-            audio: data.media.payload,
-          });
-        }
-        break;
-      }
-
-      case "mark":
-        break;
-
-      case "stop": {
-        const resolvedCallSid = findCallSidByStreamOrCall(streamSid, callSid);
-        if (resolvedCallSid) {
-          const sessionObj = getOrCreateCallSession(resolvedCallSid);
-          sessionObj.status = "completed";
-          sessionObj.updatedAt = new Date().toISOString();
-        }
-
-        try {
-          if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.close();
-          }
-        } catch {}
-
-        break;
-      }
-
-      default:
-        break;
+    } catch (err) {
+      console.error("Twilio WS message error:", err?.message || err);
     }
   });
 
   twilioWs.on("close", () => {
-    const resolvedCallSid = findCallSidByStreamOrCall(streamSid, callSid);
-    if (resolvedCallSid) {
-      const sessionObj = getOrCreateCallSession(resolvedCallSid);
-      sessionObj.updatedAt = new Date().toISOString();
-      if (sessionObj.status === "in-progress") {
-        sessionObj.status = "completed";
+    console.log("Twilio WS closed");
+    if (activeCallSid && liveCalls.has(activeCallSid)) {
+      const call = liveCalls.get(activeCallSid);
+      if (call.status === "in-progress") {
+        call.status = "completed";
       }
+      call.updatedAt = new Date().toISOString();
     }
 
     try {
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      if (openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.close();
       }
     } catch {}
   });
 
   twilioWs.on("error", (err) => {
-    console.error("Twilio WS error:", err);
-  });
-});
-
-// =========================
-// Optional utility route
-// =========================
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "owen-hvac-ai-phone",
-    time: new Date().toISOString(),
-    publicBaseUrl: PUBLIC_BASE_URL,
-    wsUrl: buildWsUrlFromBase(PUBLIC_BASE_URL, MEDIA_STREAM_PATH),
-    voiceWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH),
-    statusWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH),
+    console.error("Twilio WS error:", err?.message || err);
   });
 });
 
@@ -843,8 +805,8 @@ server.listen(PORT, () => {
   if (PUBLIC_BASE_URL) {
     console.log("Voice webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH));
     console.log("Status webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH));
-    console.log("Media stream:", buildWsUrlFromBase(PUBLIC_BASE_URL, MEDIA_STREAM_PATH));
-  } else {
-    console.log("PUBLIC_BASE_URL not set");
+  }
+  if (PUBLIC_WSS_URL) {
+    console.log("Media stream base:", PUBLIC_WSS_URL + MEDIA_STREAM_PATH);
   }
 });
