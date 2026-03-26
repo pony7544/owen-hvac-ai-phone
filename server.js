@@ -6,6 +6,7 @@ const path = require("path");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const session = require("express-session");
+const twilio = require("twilio");
 
 const {
   liveCalls,
@@ -68,12 +69,10 @@ const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 const LIVE_ADMIN_USER = process.env.LIVE_ADMIN_USER || "admin";
 const LIVE_ADMIN_PASS = process.env.LIVE_ADMIN_PASS || "ChangeThisPassword123!";
 
-// 保留你原文件可用的 realtime 写法
 const REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "alloy";
 
-// 这里保留你原来的 PUBLIC_WSS_URL 优先级思路
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL ||
   process.env.RENDER_EXTERNAL_URL ||
@@ -88,13 +87,29 @@ const PUBLIC_WSS_URL =
     ? PUBLIC_BASE_URL.replace(/^http:\/\//i, "ws://")
     : "");
 
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const RECORDING_RETENTION_DAYS = parseInt(
+  process.env.RECORDING_RETENTION_DAYS || "90",
+  10
+);
+
 const TWILIO_VOICE_PATH = "/twilio/voice";
 const TWILIO_VOICE_INCOMING_PATH = "/twilio/voice/incoming";
 const TWILIO_STATUS_PATH = "/twilio/voice/status";
+const RECORDING_STATUS_PATH = "/twilio/voice/recording-status";
 const MEDIA_STREAM_PATH = "/media-stream";
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
 
 if (!OPENAI_API_KEY) {
   console.warn("Missing OPENAI_API_KEY");
+}
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+  console.warn("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN");
 }
 
 // =========================
@@ -199,6 +214,12 @@ function getTodayDateInBusinessTimezone() {
   return `${year}-${month}-${day}`;
 }
 
+function addDaysIso(dateLike, days) {
+  const d = new Date(dateLike || Date.now());
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString();
+}
+
 function getCallPublicData(sessionObj) {
   return {
     callSid: sessionObj.callSid,
@@ -213,6 +234,30 @@ function getCallPublicData(sessionObj) {
     extracted: sessionObj.extracted || {},
     transcript: Array.isArray(sessionObj.transcript) ? sessionObj.transcript : [],
     summary: buildCallSummary(sessionObj),
+
+    recording: sessionObj.recording
+      ? {
+          enabled: true,
+          status: sessionObj.recording.status || "",
+          recordingSid: sessionObj.recording.recordingSid || "",
+          durationSec: sessionObj.recording.durationSec || 0,
+          createdAt: sessionObj.recording.createdAt || "",
+          completedAt: sessionObj.recording.completedAt || "",
+          expiresAt: sessionObj.recording.expiresAt || "",
+          deletedAt: sessionObj.recording.deletedAt || "",
+          available: !!sessionObj.recording.available,
+        }
+      : {
+          enabled: false,
+          status: "not-started",
+          recordingSid: "",
+          durationSec: 0,
+          createdAt: "",
+          completedAt: "",
+          expiresAt: "",
+          deletedAt: "",
+          available: false,
+        },
   };
 }
 
@@ -260,6 +305,99 @@ function sendOpenAIEvent(ws, event) {
   }
 }
 
+async function startCallRecording(callSid) {
+  if (!twilioClient || !callSid) return null;
+
+  const sessionObj = getOrCreateCallSession(callSid);
+
+  if (sessionObj.recording?.recordingSid || sessionObj.recording?.starting) {
+    return sessionObj.recording || null;
+  }
+
+  sessionObj.recording = {
+    ...(sessionObj.recording || {}),
+    starting: true,
+    status: "starting",
+    available: false,
+    createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
+    expiresAt:
+      sessionObj.recording?.expiresAt ||
+      addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
+  };
+  sessionObj.updatedAt = new Date().toISOString();
+
+  const statusCallback = buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH);
+
+  try {
+    const recording = await twilioClient.calls(callSid).recordings.create({
+      recordingStatusCallback: statusCallback,
+      recordingStatusCallbackEvent: ["in-progress", "completed", "absent"],
+      recordingChannels: "dual",
+      recordingTrack: "both",
+      trim: "do-not-trim",
+    });
+
+    sessionObj.recording = {
+      ...(sessionObj.recording || {}),
+      starting: false,
+      status: recording.status || "in-progress",
+      recordingSid: recording.sid,
+      available: false,
+      createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
+      expiresAt:
+        sessionObj.recording?.expiresAt ||
+        addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
+    };
+    sessionObj.updatedAt = new Date().toISOString();
+
+    return sessionObj.recording;
+  } catch (err) {
+    sessionObj.recording = {
+      ...(sessionObj.recording || {}),
+      starting: false,
+      status: "failed",
+      available: false,
+      error: err.message || "Failed to start recording",
+    };
+    sessionObj.updatedAt = new Date().toISOString();
+    throw err;
+  }
+}
+
+async function deleteRecordingIfExpired(sessionObj) {
+  if (!twilioClient || !sessionObj?.recording?.recordingSid) return false;
+  if (sessionObj.recording.deletedAt) return false;
+
+  const expiresAt = sessionObj.recording.expiresAt
+    ? new Date(sessionObj.recording.expiresAt).getTime()
+    : 0;
+
+  if (!expiresAt || Date.now() < expiresAt) return false;
+
+  await twilioClient.recordings(sessionObj.recording.recordingSid).remove();
+
+  sessionObj.recording.deletedAt = new Date().toISOString();
+  sessionObj.recording.available = false;
+  sessionObj.recording.status = "deleted";
+  sessionObj.updatedAt = new Date().toISOString();
+
+  return true;
+}
+
+async function cleanupExpiredRecordings() {
+  const calls = Array.from(liveCalls.values());
+  for (const sessionObj of calls) {
+    try {
+      await deleteRecordingIfExpired(sessionObj);
+    } catch (err) {
+      console.error(
+        `cleanup recording failed for ${sessionObj.callSid}:`,
+        err?.message || err
+      );
+    }
+  }
+}
+
 // =========================
 // Page Routes
 // =========================
@@ -276,6 +414,7 @@ app.get("/health", (req, res) => {
     publicWssUrl: PUBLIC_WSS_URL,
     voiceWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH),
     statusWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH),
+    recordingWebhook: buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH),
     mediaStreamPath: MEDIA_STREAM_PATH,
   });
 });
@@ -412,6 +551,96 @@ app.post(
   }
 );
 
+app.get("/api/live-call/:callSid/recording", requireApiAuth, (req, res) => {
+  const callSid = req.params.callSid;
+  const sessionObj = liveCalls.get(callSid);
+
+  if (!sessionObj) {
+    return res.status(404).json({ ok: false, error: "Call not found" });
+  }
+
+  const rec = sessionObj.recording || null;
+
+  return res.json({
+    ok: true,
+    recording: rec
+      ? {
+          available: !!rec.available && !rec.deletedAt,
+          status: rec.status || "",
+          recordingSid: rec.recordingSid || "",
+          durationSec: rec.durationSec || 0,
+          expiresAt: rec.expiresAt || "",
+          deletedAt: rec.deletedAt || "",
+          streamUrl:
+            rec.available && !rec.deletedAt
+              ? `/api/live-call/${encodeURIComponent(callSid)}/recording/media`
+              : "",
+        }
+      : {
+          available: false,
+          status: "not-started",
+          recordingSid: "",
+          durationSec: 0,
+          expiresAt: "",
+          deletedAt: "",
+          streamUrl: "",
+        },
+  });
+});
+
+app.get(
+  "/api/live-call/:callSid/recording/media",
+  requireApiAuth,
+  async (req, res) => {
+    try {
+      const callSid = req.params.callSid;
+      const sessionObj = liveCalls.get(callSid);
+
+      if (!sessionObj) {
+        return res.status(404).json({ ok: false, error: "Call not found" });
+      }
+
+      const rec = sessionObj.recording;
+      if (!rec?.recordingSid || rec.deletedAt) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Recording not available" });
+      }
+
+      const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+        TWILIO_ACCOUNT_SID
+      )}/Recordings/${encodeURIComponent(rec.recordingSid)}.mp3`;
+
+      const auth = Buffer.from(
+        `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+      ).toString("base64");
+
+      const response = await fetch(mediaUrl, {
+        headers: {
+          Authorization: `Basic ${auth}`,
+        },
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        return res.status(response.status).send(text);
+      }
+
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "private, max-age=60");
+
+      const arrayBuffer = await response.arrayBuffer();
+      return res.send(Buffer.from(arrayBuffer));
+    } catch (err) {
+      console.error("recording media proxy error:", err);
+      return res.status(500).json({
+        ok: false,
+        error: err.message || "Failed to load recording media",
+      });
+    }
+  }
+);
+
 // =========================
 // Calendar APIs
 // =========================
@@ -486,8 +715,7 @@ function twilioVoiceHandler(req, res) {
   sessionObj.updatedAt = new Date().toISOString();
 
   const streamBase =
-    PUBLIC_WSS_URL ||
-    (req.headers.host ? `wss://${req.headers.host}` : "");
+    PUBLIC_WSS_URL || (req.headers.host ? `wss://${req.headers.host}` : "");
 
   const streamUrl = `${streamBase}${MEDIA_STREAM_PATH}?callSid=${encodeURIComponent(
     callSid
@@ -497,7 +725,7 @@ function twilioVoiceHandler(req, res) {
 <Response>
   <Say voice="alice">Hello, you have reached ${escapeXml(
     BUSINESS_NAME
-  )}. Please hold while I connect you.</Say>
+  )}. This call may be recorded for quality and training purposes. Please hold while I connect you.</Say>
   <Connect>
     <Stream url="${escapeXml(streamUrl)}" />
   </Connect>
@@ -520,6 +748,38 @@ app.post(TWILIO_STATUS_PATH, (req, res) => {
     sessionObj.updatedAt = new Date().toISOString();
   }
   console.log("Twilio Status Callback:", req.body);
+  res.sendStatus(200);
+});
+
+app.post(RECORDING_STATUS_PATH, (req, res) => {
+  const callSid = cleanText(req.body.CallSid || "");
+  const recordingSid = cleanText(req.body.RecordingSid || "");
+  const recordingUrl = cleanText(req.body.RecordingUrl || "");
+  const recordingStatus = cleanText(req.body.RecordingStatus || "");
+  const recordingDuration = parseInt(req.body.RecordingDuration || "0", 10) || 0;
+
+  if (callSid) {
+    const sessionObj = getOrCreateCallSession(callSid);
+    sessionObj.recording = {
+      ...(sessionObj.recording || {}),
+      recordingSid: recordingSid || sessionObj.recording?.recordingSid || "",
+      status: recordingStatus || sessionObj.recording?.status || "",
+      durationSec: recordingDuration,
+      createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
+      completedAt:
+        recordingStatus === "completed"
+          ? new Date().toISOString()
+          : sessionObj.recording?.completedAt || "",
+      expiresAt:
+        sessionObj.recording?.expiresAt ||
+        addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
+      available: recordingStatus === "completed",
+      sourceUrl: recordingUrl || sessionObj.recording?.sourceUrl || "",
+    };
+    sessionObj.updatedAt = new Date().toISOString();
+  }
+
+  console.log("Twilio Recording Callback:", req.body);
   res.sendStatus(200);
 });
 
@@ -681,10 +941,7 @@ wss.on("connection", async (twilioWs, request) => {
           try {
             await maybeAutoCreateAppointment(activeCallSid);
           } catch (err) {
-            console.error(
-              "Auto-create appointment failed:",
-              err?.message || err
-            );
+            console.error("Auto-create appointment failed:", err?.message || err);
           }
         } else {
           assistantTranscriptBuffer = "";
@@ -752,6 +1009,12 @@ wss.on("connection", async (twilioWs, request) => {
             streamToCallSid.set(streamSid, activeCallSid);
           }
 
+          try {
+            await startCallRecording(activeCallSid);
+          } catch (err) {
+            console.error("start recording error:", err?.message || err);
+          }
+
           break;
         }
 
@@ -762,10 +1025,7 @@ wss.on("connection", async (twilioWs, request) => {
             call.updatedAt = new Date().toISOString();
           }
 
-          if (
-            data.media?.payload &&
-            openaiWs.readyState === WebSocket.OPEN
-          ) {
+          if (data.media?.payload && openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(
               JSON.stringify({
                 type: "input_audio_buffer.append",
@@ -828,6 +1088,16 @@ wss.on("connection", async (twilioWs, request) => {
 });
 
 // =========================
+// Background cleanup
+// =========================
+setTimeout(() => {
+  cleanupExpiredRecordings().catch(console.error);
+  setInterval(() => {
+    cleanupExpiredRecordings().catch(console.error);
+  }, 24 * 60 * 60 * 1000);
+}, 60 * 1000);
+
+// =========================
 // Start
 // =========================
 server.listen(PORT, () => {
@@ -835,6 +1105,10 @@ server.listen(PORT, () => {
   if (PUBLIC_BASE_URL) {
     console.log("Voice webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH));
     console.log("Status webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH));
+    console.log(
+      "Recording webhook:",
+      buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH)
+    );
   }
   if (PUBLIC_WSS_URL) {
     console.log("Media stream base:", PUBLIC_WSS_URL + MEDIA_STREAM_PATH);
