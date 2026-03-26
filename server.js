@@ -73,7 +73,7 @@ if (!OPENAI_API_KEY) {
 
 // Realtime model / voice config
 const REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-mini-realtime-preview";
 const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "alloy";
 
 // Public URL for Twilio media stream + status callback
@@ -706,7 +706,7 @@ wss.on("connection", (twilioWs, req) => {
     });
 
     openaiWs.on("close", () => {
-      console.log("OpenAI WS closed");
+      console.log("OpenAI WS closed", code, reason?.toString());
       openaiReady = false;
       try {
         twilioWs.close();
