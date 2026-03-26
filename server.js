@@ -607,33 +607,33 @@ wss.on("connection", (twilioWs, req) => {
       const sessionObj = ensureSession();
 
       sendOpenAIEvent(openaiWs, {
-        type: "session.update",
-        session: {
-          modalities: ["audio", "text"],
-          instructions: buildSystemPrompt(
-            sessionObj || { extracted: {}, transcript: [] }
-          ),
-          voice: REALTIME_VOICE,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: {
-            model: "gpt-4o-mini-transcribe",
-          },
-          turn_detection: {
-            type: "server_vad",
-          },
-          temperature: 0.6,
-        },
-      });
+  type: "session.update",
+  session: {
+    modalities: ["audio"],
+    instructions: buildSystemPrompt(
+      sessionObj || { extracted: {}, transcript: [] }
+    ),
+    voice: REALTIME_VOICE,
+    input_audio_format: "g711_ulaw",
+    output_audio_format: "g711_ulaw",
+    input_audio_transcription: {
+      model: "gpt-4o-mini-transcribe",
+    },
+    turn_detection: {
+      type: "server_vad",
+    },
+    temperature: 0.6,
+  },
+});
 
-      sendOpenAIEvent(openaiWs, {
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          instructions:
-            "Greet the caller and start collecting their name, callback number, service address, and reason for calling.",
-        },
-      });
+sendOpenAIEvent(openaiWs, {
+  type: "response.create",
+  response: {
+    modalities: ["audio"],
+    instructions:
+      "Greet the caller and start collecting their name, callback number, service address, and reason for calling.",
+  },
+});
     });
 
     openaiWs.on("message", async (raw) => {
