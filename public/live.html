@@ -1,116 +1,160 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Live Dashboard - Owen HVAC</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Owen HVAC Live Dashboard</title>
   <style>
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       margin: 0;
-      font-family: Arial, sans-serif;
-      background: #f3f6fb;
-      color: #1f2937;
+      font-family: Inter, Arial, sans-serif;
+      background: #f5f7fb;
+      color: #111827;
     }
+
     .topbar {
-      height: 64px;
-      background: white;
-      border-bottom: 1px solid #e5e7eb;
+      height: 72px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 18px;
-      position: sticky;
-      top: 0;
-      z-index: 20;
+      padding: 0 20px;
+      background: #111827;
+      color: #fff;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
     }
+
     .title {
-      font-size: 20px;
+      font-size: 22px;
       font-weight: 700;
+      letter-spacing: 0.2px;
     }
+
     .top-actions {
       display: flex;
-      gap: 10px;
       align-items: center;
+      gap: 10px;
     }
+
     .btn {
       border: 0;
-      border-radius: 10px;
+      border-radius: 12px;
       padding: 10px 14px;
-      cursor: pointer;
       font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.18s ease;
     }
-    .btn-dark {
-      background: #0f172a;
-      color: white;
+
+    .btn:hover {
+      transform: translateY(-1px);
     }
+
     .btn-light {
-      background: white;
-      border: 1px solid #d1d5db;
+      background: #fff;
+      color: #111827;
+    }
+
+    .btn-dark {
+      background: #2563eb;
+      color: #fff;
+    }
+
+    .btn-muted {
+      background: #e5e7eb;
       color: #111827;
     }
 
     .layout {
       display: grid;
-      grid-template-columns: 320px 1fr 360px;
+      grid-template-columns: 320px 1fr 380px;
       gap: 16px;
       padding: 16px;
-      height: calc(100vh - 64px);
+      height: calc(100vh - 72px);
     }
 
     .panel {
-      background: white;
-      border-radius: 16px;
-      border: 1px solid #e5e7eb;
-      min-height: 0;
+      background: #fff;
+      border-radius: 18px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      overflow: hidden;
       display: flex;
       flex-direction: column;
-      overflow: hidden;
+      min-height: 0;
     }
 
     .panel-header {
-      padding: 14px 16px;
-      border-bottom: 1px solid #eef2f7;
+      padding: 18px 18px 12px;
+      font-size: 18px;
       font-weight: 700;
-      font-size: 16px;
+      border-bottom: 1px solid #eef2f7;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
     }
 
     .panel-body {
-      padding: 14px 16px;
+      padding: 16px 18px 18px;
       overflow: auto;
       min-height: 0;
-      flex: 1;
     }
 
     .call-card {
-      border: 1px solid #dbe3ef;
+      border: 1px solid #e5e7eb;
       border-radius: 14px;
-      padding: 12px;
+      padding: 14px;
       margin-bottom: 12px;
       cursor: pointer;
-      transition: 0.15s ease;
+      transition: 0.16s ease;
       background: #fff;
     }
+
     .call-card:hover {
-      border-color: #9fb4d1;
-      background: #fbfdff;
-    }
-    .call-card.active {
-      border-color: #3b82f6;
+      border-color: #93c5fd;
       background: #f8fbff;
     }
-    .call-line {
-      margin: 4px 0;
-      font-size: 14px;
-      word-break: break-all;
+
+    .call-card.active {
+      border-color: #2563eb;
+      background: #eff6ff;
+      box-shadow: inset 0 0 0 1px #2563eb;
     }
+
+    .call-line {
+      font-size: 13px;
+      line-height: 1.45;
+      margin-bottom: 4px;
+      color: #374151;
+      word-break: break-word;
+    }
+
     .tag {
       display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
+      padding: 3px 8px;
       font-size: 12px;
-      background: #e8f3ff;
+      border-radius: 999px;
+      background: #e5edff;
       color: #1d4ed8;
+      font-weight: 700;
+    }
+
+    .tag-green {
+      background: #ecfdf5;
+      color: #047857;
+    }
+
+    .tag-yellow {
+      background: #fff7ed;
+      color: #c2410c;
+    }
+
+    .tag-gray {
+      background: #f3f4f6;
+      color: #4b5563;
     }
 
     .transcript-wrap {
@@ -118,6 +162,7 @@
       flex-direction: column;
       gap: 12px;
     }
+
     .bubble {
       padding: 14px;
       border-radius: 14px;
@@ -126,27 +171,34 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+
     .bubble.assistant {
       background: #dfeaf9;
     }
+
     .bubble.caller {
       background: #f3e9b7;
     }
+
     .bubble-role {
       font-weight: 700;
       margin-bottom: 6px;
       opacity: 0.85;
+      text-transform: capitalize;
     }
 
     .field {
       margin-bottom: 14px;
     }
+
     .field label {
       display: block;
       margin-bottom: 6px;
       color: #6b7280;
       font-size: 13px;
+      font-weight: 600;
     }
+
     .field-value {
       min-height: 42px;
       border: 1px solid #d7dce5;
@@ -155,6 +207,7 @@
       padding: 10px 12px;
       font-size: 14px;
       word-break: break-word;
+      line-height: 1.45;
     }
 
     .calendar-box {
@@ -171,6 +224,7 @@
       color: #047857;
       font-size: 12px;
       margin-left: 8px;
+      white-space: nowrap;
     }
 
     .empty {
@@ -185,9 +239,27 @@
       flex-wrap: wrap;
     }
 
+    .recording-box {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid #eef2f7;
+    }
+
+    audio {
+      width: 100%;
+      margin-top: 12px;
+    }
+
+    .small-note {
+      font-size: 12px;
+      color: #6b7280;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+
     @media (max-width: 1280px) {
       .layout {
-        grid-template-columns: 280px 1fr 320px;
+        grid-template-columns: 280px 1fr 340px;
       }
     }
 
@@ -196,6 +268,7 @@
         grid-template-columns: 1fr;
         height: auto;
       }
+
       .panel {
         min-height: 320px;
       }
@@ -208,8 +281,8 @@
     <div class="top-actions">
       <button class="btn btn-light" id="refreshBtn">Refresh</button>
       <a href="/logout" style="text-decoration:none;">
-      <button class="btn btn-dark" type="button">Logout</button>
-    </a>>
+        <button class="btn btn-dark" type="button">Logout</button>
+      </a>
     </div>
   </div>
 
@@ -217,7 +290,7 @@
     <div class="panel">
       <div class="panel-header">Calls</div>
       <div class="panel-body" id="callsList">
-        <div class="empty">Loading calls...</div>
+        <div class="empty">Loading calls.</div>
       </div>
     </div>
 
@@ -231,7 +304,7 @@
     <div class="panel">
       <div class="panel-header">
         Extracted Fields
-        <span class="mini-status" id="calendarConnectedTag">Calendar: ...</span>
+        <span class="mini-status" id="calendarConnectedTag">Calendar: Checking</span>
       </div>
       <div class="panel-body">
         <div class="field"><label>Call SID</label><div class="field-value" id="fCallSid"></div></div>
@@ -252,16 +325,26 @@
         <div class="actions">
           <button class="btn btn-light" id="reextractBtn">Re-extract</button>
           <button class="btn btn-dark" id="createAppointmentBtn">Create Appointment</button>
+          <button class="btn btn-muted" id="playRecordingBtn">Play Recording</button>
+        </div>
+
+        <div class="recording-box">
+          <div style="font-weight:700; margin-bottom:12px;">Call Recording</div>
+          <div class="field"><label>Recording Status</label><div class="field-value" id="rStatus"></div></div>
+          <div class="field"><label>Duration (sec)</label><div class="field-value" id="rDuration"></div></div>
+          <div class="field"><label>Expires At</label><div class="field-value" id="rExpiresAt"></div></div>
+          <div class="field"><label>Deleted At</label><div class="field-value" id="rDeletedAt"></div></div>
+          <audio id="recordingPlayer" controls style="display:none;"></audio>
+          <div class="small-note">Select a call, then click Play Recording.</div>
         </div>
 
         <div class="calendar-box">
-          <div style="font-weight:700; margin-bottom:12px;">Google Calendar Status</div>
-
+          <div style="font-weight:700; margin-bottom:12px;">Calendar Status</div>
           <div class="field"><label>Connected</label><div class="field-value" id="cConnected"></div></div>
           <div class="field"><label>Calendar ID</label><div class="field-value" id="cCalendarId"></div></div>
           <div class="field"><label>Summary</label><div class="field-value" id="cSummary"></div></div>
-          <div class="field"><label>Timezone</label><div class="field-value" id="cTimezone"></div></div>
-          <div class="field"><label>Today Date</label><div class="field-value" id="cTodayDate"></div></div>
+          <div class="field"><label>Time Zone</label><div class="field-value" id="cTimezone"></div></div>
+          <div class="field"><label>Today's Date</label><div class="field-value" id="cTodayDate"></div></div>
           <div class="field"><label>Today's Event Count</label><div class="field-value" id="cEventCount"></div></div>
           <div class="field"><label>Today's Available Slots</label><div class="field-value" id="cAvailableSlots"></div></div>
           <div class="field"><label>Last Error</label><div class="field-value" id="cError"></div></div>
@@ -275,7 +358,17 @@
     let callsCache = [];
 
     function setText(id, value) {
-      document.getElementById(id).textContent = value || "";
+      const el = document.getElementById(id);
+      if (el) el.textContent = value || "";
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
     }
 
     async function fetchJson(url, options) {
@@ -291,21 +384,34 @@
       return await res.json();
     }
 
+    function getStatusTagClass(status) {
+      const s = String(status || "").toLowerCase();
+      if (s.includes("complete") || s.includes("connected") || s.includes("ready")) return "tag tag-green";
+      if (s.includes("fail") || s.includes("error") || s.includes("deleted")) return "tag tag-yellow";
+      if (!s) return "tag tag-gray";
+      return "tag";
+    }
+
     function renderCalls(calls) {
       const root = document.getElementById("callsList");
+
       if (!calls.length) {
         root.innerHTML = `<div class="empty">No calls yet.</div>`;
         return;
       }
 
-      root.innerHTML = calls.map(call => `
-        <div class="call-card ${selectedCallSid === call.callSid ? 'active' : ''}" data-callsid="${call.callSid}">
-          <div class="call-line" style="font-size:22px; font-weight:700;">${call.from || "Unknown"}</div>
-          <div class="call-line">CallSid: ${call.callSid}</div>
-          <div class="call-line">Status: <span class="tag">${call.status || ""}</span></div>
-          <div class="call-line">Intent: ${call.intent || ""}</div>
-        </div>
-      `).join("");
+      root.innerHTML = calls.map(call => {
+        const extracted = call.extracted || {};
+        const displayIntent = extracted.intent || call.intent || "";
+        return `
+          <div class="call-card ${selectedCallSid === call.callSid ? "active" : ""}" data-callsid="${escapeHtml(call.callSid || "")}">
+            <div class="call-line" style="font-size:20px; font-weight:700;">${escapeHtml(call.from || "Unknown")}</div>
+            <div class="call-line">CallSid: ${escapeHtml(call.callSid || "")}</div>
+            <div class="call-line">Status: <span class="${getStatusTagClass(call.status)}">${escapeHtml(call.status || "")}</span></div>
+            <div class="call-line">Intent: ${escapeHtml(displayIntent || "")}</div>
+          </div>
+        `;
+      }).join("");
 
       root.querySelectorAll(".call-card").forEach(el => {
         el.addEventListener("click", () => {
@@ -322,7 +428,7 @@
 
       header.textContent = `Live Transcript${call ? ` - ${call.callSid}` : ""}`;
 
-      if (!call || !call.transcript || !call.transcript.length) {
+      if (!call || !Array.isArray(call.transcript) || !call.transcript.length) {
         panel.innerHTML = `<div class="empty">No transcript yet.</div>`;
         return;
       }
@@ -330,9 +436,9 @@
       panel.innerHTML = `
         <div class="transcript-wrap">
           ${call.transcript.map(item => `
-            <div class="bubble ${item.role === 'assistant' ? 'assistant' : 'caller'}">
-              <div class="bubble-role">${item.role}:</div>
-              <div>${escapeHtml(item.text)}</div>
+            <div class="bubble ${item.role === "assistant" ? "assistant" : "caller"}">
+              <div class="bubble-role">${escapeHtml(item.role || "caller")}:</div>
+              <div>${escapeHtml(item.text || "")}</div>
             </div>
           `).join("")}
         </div>
@@ -343,8 +449,8 @@
     function renderFields(call) {
       if (!call) {
         [
-          "fCallSid","fFrom","fTo","fStatus","fIntent","fName","fPhone","fAddress",
-          "fIssue","fDate","fTime","fConfirmed","fApptCreated","fApptEventId"
+          "fCallSid","fFrom","fTo","fStatus","fIntent","fName","fPhone",
+          "fAddress","fIssue","fDate","fTime","fConfirmed","fApptCreated","fApptEventId"
         ].forEach(id => setText(id, ""));
         return;
       }
@@ -354,7 +460,7 @@
       setText("fFrom", call.from || "");
       setText("fTo", call.to || "");
       setText("fStatus", call.status || "");
-      setText("fIntent", f.intent || "");
+      setText("fIntent", f.intent || call.intent || "");
       setText("fName", f.callerName || "");
       setText("fPhone", f.callbackNumber || "");
       setText("fAddress", f.serviceAddress || "");
@@ -364,6 +470,33 @@
       setText("fConfirmed", String(!!f.bookingConfirmed));
       setText("fApptCreated", String(!!f.appointmentCreated));
       setText("fApptEventId", f.appointmentEventId || "");
+    }
+
+    function renderRecording(call) {
+      const rec = call?.recording || null;
+      const player = document.getElementById("recordingPlayer");
+
+      if (!rec) {
+        setText("rStatus", "");
+        setText("rDuration", "");
+        setText("rExpiresAt", "");
+        setText("rDeletedAt", "");
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+        player.style.display = "none";
+        return;
+      }
+
+      setText("rStatus", rec.status || "");
+      setText("rDuration", String(rec.durationSec || ""));
+      setText("rExpiresAt", rec.expiresAt || "");
+      setText("rDeletedAt", rec.deletedAt || "");
+
+      player.pause();
+      player.removeAttribute("src");
+      player.load();
+      player.style.display = "none";
     }
 
     async function loadCalls() {
@@ -386,6 +519,7 @@
         const data = await fetchJson(`/api/live-call/${encodeURIComponent(callSid)}`);
         renderTranscript(data.call);
         renderFields(data.call);
+        renderRecording(data.call);
       } catch (err) {
         if (showErrors) {
           console.error(err);
@@ -421,7 +555,7 @@
     async function reextractCurrent() {
       if (!selectedCallSid) return;
       await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/refresh-extraction`, {
-      method: "POST"
+        method: "POST"
       });
       await loadCallDetail(selectedCallSid);
       await loadCalls();
@@ -434,7 +568,7 @@
         const data = await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/create-appointment`, {
           method: "POST"
         });
-        alert(`Appointment created successfully.`);
+        alert(`Appointment created successfully.${data.event?.id ? ` Event ID: ${data.event.id}` : ""}`);
       } catch (err) {
         alert(err.message || "Failed to create appointment");
       }
@@ -443,11 +577,31 @@
       await loadCalendarStatus();
     }
 
-    function escapeHtml(str) {
-      return (str || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+    async function playCurrentRecording() {
+      if (!selectedCallSid) return;
+
+      try {
+        const data = await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/recording`);
+        const rec = data.recording || {};
+
+        setText("rStatus", rec.status || "");
+        setText("rDuration", String(rec.durationSec || ""));
+        setText("rExpiresAt", rec.expiresAt || "");
+        setText("rDeletedAt", rec.deletedAt || "");
+
+        if (!rec.available || !rec.streamUrl) {
+          alert("Recording is not ready yet.");
+          return;
+        }
+
+        const player = document.getElementById("recordingPlayer");
+        player.src = rec.streamUrl;
+        player.style.display = "block";
+        await player.play();
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Failed to play recording");
+      }
     }
 
     document.getElementById("refreshBtn").addEventListener("click", async () => {
@@ -457,6 +611,7 @@
 
     document.getElementById("reextractBtn").addEventListener("click", reextractCurrent);
     document.getElementById("createAppointmentBtn").addEventListener("click", createAppointmentCurrent);
+    document.getElementById("playRecordingBtn").addEventListener("click", playCurrentRecording);
 
     async function tick() {
       await loadCalls();
