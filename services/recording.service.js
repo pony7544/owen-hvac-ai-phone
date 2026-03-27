@@ -3,458 +3,560 @@ const fsp = require("fs/promises");
 const path = require("path");
 const { spawn } = require("child_process");
 
-function createRecordingService({
-  recordingsDir,
-  retentionDays = 90,
-  getOrCreateCallSession,
-  liveCalls,
-  sampleRate = 8000,
-  ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg",
-  mp3Bitrate = process.env.RECORDING_MP3_BITRATE || "32k",
-}) {
-  fs.mkdirSync(recordingsDir, { recursive: true });
+const RECORDINGS_DIR = path.join(__dirname, "..", "recordings");
+const RECORDING_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-  function addDaysIso(dateLike, days) {
-    const d = new Date(dateLike || Date.now());
-    d.setUTCDate(d.getUTCDate() + days);
-    return d.toISOString();
+const recordingSessions = new Map();
+
+/**
+ * 文件路径工具
+ */
+function getRecordingPaths(callSid) {
+  return {
+    dir: RECORDINGS_DIR,
+    callerUlawPath: path.join(RECORDINGS_DIR, `${callSid}.caller.ulaw`),
+    assistantUlawPath: path.join(RECORDINGS_DIR, `${callSid}.assistant.ulaw`),
+    callerWavPath: path.join(RECORDINGS_DIR, `${callSid}.caller.wav`),
+    assistantWavPath: path.join(RECORDINGS_DIR, `${callSid}.assistant.wav`),
+    mixedWavPath: path.join(RECORDINGS_DIR, `${callSid}.mixed.wav`),
+    mixedMp3Path: path.join(RECORDINGS_DIR, `${callSid}.mixed.mp3`),
+    metaPath: path.join(RECORDINGS_DIR, `${callSid}.meta.json`),
+  };
+}
+
+async function ensureRecordingsDir() {
+  await fsp.mkdir(RECORDINGS_DIR, { recursive: true });
+}
+
+/**
+ * 当前通话录音会话
+ */
+function ensureRecordingSession(callSid) {
+  if (!callSid) return null;
+
+  const existing = recordingSessions.get(callSid);
+  if (existing) return existing;
+
+  const paths = getRecordingPaths(callSid);
+  const session = {
+    callSid,
+    ...paths,
+    status: "recording", // recording | finalizing | completed | failed | deleted
+    startedAt: new Date().toISOString(),
+    finalizedAt: null,
+    deletedAt: null,
+    durationSec: 0,
+    error: null,
+  };
+
+  recordingSessions.set(callSid, session);
+  return session;
+}
+
+function getRecordingSession(callSid) {
+  return recordingSessions.get(callSid) || null;
+}
+
+/**
+ * 持久化 metadata
+ */
+async function writeMeta(callSid, patch = {}) {
+  await ensureRecordingsDir();
+  const paths = getRecordingPaths(callSid);
+
+  let prev = {};
+  try {
+    const raw = await fsp.readFile(paths.metaPath, "utf8");
+    prev = JSON.parse(raw);
+  } catch (_) {}
+
+  const next = {
+    callSid,
+    ...prev,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await fsp.writeFile(paths.metaPath, JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
+async function readMeta(callSid) {
+  const paths = getRecordingPaths(callSid);
+  try {
+    const raw = await fsp.readFile(paths.metaPath, "utf8");
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
   }
+}
 
-  function mulawByteToPcm16(muLawByte) {
-    muLawByte = ~muLawByte & 0xff;
-
-    const sign = muLawByte & 0x80;
-    const exponent = (muLawByte >> 4) & 0x07;
-    const mantissa = muLawByte & 0x0f;
-
-    let sample = ((mantissa << 3) + 0x84) << exponent;
-    sample -= 0x84;
-
-    return sign ? -sample : sample;
+/**
+ * 判断文件是否存在
+ */
+async function fileExists(filePath) {
+  try {
+    await fsp.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
   }
+}
 
-  function decodeMulawBufferToPcm16Buffer(muLawBuffer) {
-    const out = Buffer.alloc(muLawBuffer.length * 2);
-    for (let i = 0; i < muLawBuffer.length; i++) {
-      const pcm = mulawByteToPcm16(muLawBuffer[i]);
-      out.writeInt16LE(pcm, i * 2);
-    }
-    return out;
+/**
+ * 追加 caller μ-law 音频
+ * Twilio inbound media 常见是 mulaw/8000 base64
+ */
+async function appendCallerAudio(callSid, base64Audio) {
+  if (!callSid || !base64Audio) return;
+
+  await ensureRecordingsDir();
+  const session = ensureRecordingSession(callSid);
+  const chunk = Buffer.from(base64Audio, "base64");
+
+  await fsp.appendFile(session.callerUlawPath, chunk);
+
+  await writeMeta(callSid, {
+    callSid,
+    status: "recording",
+    startedAt: session.startedAt,
+    callerBytes: (await safeStatSize(session.callerUlawPath)) || 0,
+  });
+}
+
+/**
+ * 追加 assistant μ-law 音频
+ * 如果你发送给 Twilio 的也是 mulaw/8000 base64，这里可直接复用
+ */
+async function appendAssistantAudio(callSid, base64Audio) {
+  if (!callSid || !base64Audio) return;
+
+  await ensureRecordingsDir();
+  const session = ensureRecordingSession(callSid);
+  const chunk = Buffer.from(base64Audio, "base64");
+
+  await fsp.appendFile(session.assistantUlawPath, chunk);
+
+  await writeMeta(callSid, {
+    callSid,
+    status: "recording",
+    startedAt: session.startedAt,
+    assistantBytes: (await safeStatSize(session.assistantUlawPath)) || 0,
+  });
+}
+
+async function safeStatSize(filePath) {
+  try {
+    const st = await fsp.stat(filePath);
+    return st.size;
+  } catch {
+    return 0;
   }
+}
 
-  function mixPcm16MonoBuffers(bufA, bufB) {
-    const samplesA = Math.floor(bufA.length / 2);
-    const samplesB = Math.floor(bufB.length / 2);
-    const maxSamples = Math.max(samplesA, samplesB);
-
-    const out = Buffer.alloc(maxSamples * 2);
-
-    for (let i = 0; i < maxSamples; i++) {
-      const a = i < samplesA ? bufA.readInt16LE(i * 2) : 0;
-      const b = i < samplesB ? bufB.readInt16LE(i * 2) : 0;
-
-      let mixed = a + b;
-
-      if (mixed > 32767) mixed = 32767;
-      if (mixed < -32768) mixed = -32768;
-
-      out.writeInt16LE(mixed, i * 2);
-    }
-
-    return out;
-  }
-
-  function buildWavHeader(
-    dataLength,
-    wavSampleRate = 8000,
-    channels = 1,
-    bitsPerSample = 16
-  ) {
-    const byteRate = (wavSampleRate * channels * bitsPerSample) / 8;
-    const blockAlign = (channels * bitsPerSample) / 8;
-    const buffer = Buffer.alloc(44);
-
-    buffer.write("RIFF", 0);
-    buffer.writeUInt32LE(36 + dataLength, 4);
-    buffer.write("WAVE", 8);
-    buffer.write("fmt ", 12);
-    buffer.writeUInt32LE(16, 16);
-    buffer.writeUInt16LE(1, 20);
-    buffer.writeUInt16LE(channels, 22);
-    buffer.writeUInt32LE(wavSampleRate, 24);
-    buffer.writeUInt32LE(byteRate, 28);
-    buffer.writeUInt16LE(blockAlign, 32);
-    buffer.writeUInt16LE(bitsPerSample, 34);
-    buffer.write("data", 36);
-    buffer.writeUInt32LE(dataLength, 40);
-
-    return buffer;
-  }
-
-  async function writeWavFile(filePath, pcm16Buffer) {
-    const header = buildWavHeader(pcm16Buffer.length, sampleRate, 1, 16);
-    await fsp.writeFile(filePath, Buffer.concat([header, pcm16Buffer]));
-  }
-
-  function pcmStats(pcmBuf) {
-    const samples = Math.floor(pcmBuf.length / 2);
-    if (!samples) {
-      return { samples: 0, peak: 0, rms: 0, nonZero: 0, nonZeroPct: 0 };
-    }
-
-    let peak = 0;
-    let sumSq = 0;
-    let nonZero = 0;
-
-    for (let i = 0; i < samples; i++) {
-      const v = pcmBuf.readInt16LE(i * 2);
-      const a = Math.abs(v);
-      if (a > peak) peak = a;
-      if (a > 500) nonZero++;
-      sumSq += v * v;
-    }
-
-    return {
-      samples,
-      peak,
-      rms: Math.round(Math.sqrt(sumSq / samples)),
-      nonZero,
-      nonZeroPct: Math.round((nonZero / samples) * 10000) / 100,
-    };
-  }
-
-  function runFfmpeg(args) {
-    return new Promise((resolve, reject) => {
-      const child = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-
-      let stderr = "";
-      let stdout = "";
-
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk.toString();
-      });
-
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
-      });
-
-      child.on("error", (err) => {
-        reject(err);
-      });
-
-      child.on("close", (code) => {
-        if (code === 0) {
-          resolve({ stdout, stderr });
-        } else {
-          reject(
-            new Error(
-              `ffmpeg exited with code ${code}. ${stderr || stdout || ""}`.trim()
-            )
-          );
-        }
-      });
+/**
+ * ffmpeg 执行器
+ */
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", args, {
+      stdio: ["ignore", "pipe", "pipe"],
     });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+
+    proc.on("error", (err) => {
+      reject(err);
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(
+          new Error(`ffmpeg exited with code ${code}\n${stderr || stdout}`)
+        );
+      }
+    });
+  });
+}
+
+/**
+ * μ-law 转 wav
+ */
+async function convertUlawToWav(inputPath, outputPath) {
+  if (!(await fileExists(inputPath))) {
+    throw new Error(`Input ulaw file not found: ${inputPath}`);
   }
 
-  async function convertWavToMp3(wavPath, mp3Path) {
-    await runFfmpeg([
-      "-y",
-      "-i",
-      wavPath,
-      "-codec:a",
-      "libmp3lame",
-      "-b:a",
-      mp3Bitrate,
-      "-ar",
-      String(sampleRate),
-      "-ac",
-      "1",
-      mp3Path,
-    ]);
+  await runFfmpeg([
+    "-y",
+    "-f",
+    "mulaw",
+    "-ar",
+    "8000",
+    "-ac",
+    "1",
+    "-i",
+    inputPath,
+    outputPath,
+  ]);
+}
+
+/**
+ * 混音
+ */
+async function mixWavsToWav(callerWavPath, assistantWavPath, mixedWavPath) {
+  const hasCaller = await fileExists(callerWavPath);
+  const hasAssistant = await fileExists(assistantWavPath);
+
+  if (!hasCaller && !hasAssistant) {
+    throw new Error("No caller or assistant wav exists to mix");
   }
 
-  function ensureRecordingSession(callSid) {
-    const sessionObj = getOrCreateCallSession(callSid);
+  if (hasCaller && !hasAssistant) {
+    await fsp.copyFile(callerWavPath, mixedWavPath);
+    return;
+  }
 
-    if (!sessionObj.recording) {
-      const safeBaseName = String(callSid).replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (!hasCaller && hasAssistant) {
+    await fsp.copyFile(assistantWavPath, mixedWavPath);
+    return;
+  }
 
-      sessionObj.recording = {
-        status: "recording",
-        available: false,
-        createdAt: new Date().toISOString(),
-        completedAt: "",
-        expiresAt: addDaysIso(new Date(), retentionDays),
-        deletedAt: "",
-        durationSec: 0,
-        fileName: `${safeBaseName}.mixed.mp3`,
+  await runFfmpeg([
+    "-y",
+    "-i",
+    callerWavPath,
+    "-i",
+    assistantWavPath,
+    "-filter_complex",
+    "amix=inputs=2:duration=longest:dropout_transition=0",
+    "-ar",
+    "8000",
+    "-ac",
+    "1",
+    mixedWavPath,
+  ]);
+}
 
-        callerChunks: [],
-        assistantChunks: [],
+/**
+ * wav 转 mp3
+ */
+async function convertWavToMp3(inputPath, outputPath) {
+  if (!(await fileExists(inputPath))) {
+    throw new Error(`Mixed wav not found: ${inputPath}`);
+  }
 
-        callerMulawPath: path.join(recordingsDir, `${safeBaseName}.caller.ulaw`),
-        assistantMulawPath: path.join(recordingsDir, `${safeBaseName}.assistant.ulaw`),
+  await runFfmpeg([
+    "-y",
+    "-i",
+    inputPath,
+    "-codec:a",
+    "libmp3lame",
+    "-b:a",
+    "64k",
+    outputPath,
+  ]);
+}
 
-        callerWavPath: path.join(recordingsDir, `${safeBaseName}.caller.wav`),
-        assistantWavPath: path.join(recordingsDir, `${safeBaseName}.assistant.wav`),
-        mixedWavPath: path.join(recordingsDir, `${safeBaseName}.mixed.wav`),
-        mixedMp3Path: path.join(recordingsDir, `${safeBaseName}.mixed.mp3`),
-      };
+/**
+ * 估算时长（基于 mulaw 8000Hz 单声道，1 byte/sample）
+ */
+async function estimateDurationSecFromUlaw(filePath) {
+  try {
+    const st = await fsp.stat(filePath);
+    return Math.ceil(st.size / 8000);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 结束录音并生成 wav/mp3
+ */
+async function finalizeRecording(callSid) {
+  if (!callSid) return null;
+
+  await ensureRecordingsDir();
+
+  const session = ensureRecordingSession(callSid);
+  session.status = "finalizing";
+
+  await writeMeta(callSid, {
+    status: "finalizing",
+    finalizedAt: null,
+    deletedAt: null,
+    error: null,
+  });
+
+  try {
+    const hasCallerUlaw = await fileExists(session.callerUlawPath);
+    const hasAssistantUlaw = await fileExists(session.assistantUlawPath);
+
+    if (!hasCallerUlaw && !hasAssistantUlaw) {
+      throw new Error("No raw recording chunks found");
     }
 
-    return sessionObj.recording;
-  }
-
-  async function appendCallerAudio(callSid, base64Payload) {
-    if (!callSid || !base64Payload) return;
-    const rec = ensureRecordingSession(callSid);
-    rec.callerChunks.push(Buffer.from(base64Payload, "base64"));
-  }
-
-  async function appendAssistantAudio(callSid, base64Payload) {
-    if (!callSid || !base64Payload) return;
-    const rec = ensureRecordingSession(callSid);
-    rec.assistantChunks.push(Buffer.from(base64Payload, "base64"));
-  }
-
-  async function safeUnlink(filePath) {
-    if (!filePath) return;
-    try {
-      await fsp.unlink(filePath);
-    } catch (err) {
-      if (err.code !== "ENOENT") throw err;
+    if (hasCallerUlaw) {
+      await convertUlawToWav(session.callerUlawPath, session.callerWavPath);
     }
-  }
 
-  async function finalizeRecording(callSid) {
-    if (!callSid) return null;
-
-    const sessionObj = getOrCreateCallSession(callSid);
-    const rec = sessionObj.recording;
-
-    if (!rec) return null;
-    if (rec.available && rec.mixedMp3Path) return rec;
-    if (rec.finalizing) return rec;
-
-    rec.finalizing = true;
-    rec.status = "finalizing";
-
-    try {
-      const callerMulaw = Buffer.concat(rec.callerChunks || []);
-      const assistantMulaw = Buffer.concat(rec.assistantChunks || []);
-
-      console.log("REC SIZE DEBUG raw", {
-        callSid,
-        callerMulawBytes: callerMulaw.length,
-        assistantMulawBytes: assistantMulaw.length,
-        callerSecApprox: Math.round((callerMulaw.length / sampleRate) * 100) / 100,
-        assistantSecApprox:
-          Math.round((assistantMulaw.length / sampleRate) * 100) / 100,
-      });
-
-      await fsp.writeFile(rec.callerMulawPath, callerMulaw);
-      await fsp.writeFile(rec.assistantMulawPath, assistantMulaw);
-
-      const callerPcm = decodeMulawBufferToPcm16Buffer(callerMulaw);
-      const assistantPcm = decodeMulawBufferToPcm16Buffer(assistantMulaw);
-      const mixedPcm = mixPcm16MonoBuffers(callerPcm, assistantPcm);
-
-      console.log("PCM ENERGY DEBUG", {
-        callSid,
-        caller: pcmStats(callerPcm),
-        assistant: pcmStats(assistantPcm),
-      });
-
-      console.log("REC SIZE DEBUG pcm", {
-        callSid,
-        callerPcmBytes: callerPcm.length,
-        assistantPcmBytes: assistantPcm.length,
-        mixedPcmBytes: mixedPcm.length,
-        mixedSecApprox:
-          Math.round(((mixedPcm.length / 2 / sampleRate) * 100)) / 100,
-      });
-
-      await writeWavFile(rec.callerWavPath, callerPcm);
-      await writeWavFile(rec.assistantWavPath, assistantPcm);
-      await writeWavFile(rec.mixedWavPath, mixedPcm);
-
-      await convertWavToMp3(rec.mixedWavPath, rec.mixedMp3Path);
-
-      const mixedWavStat = await fsp.stat(rec.mixedWavPath);
-      const mixedMp3Stat = await fsp.stat(rec.mixedMp3Path);
-
-      console.log("REC FILE DEBUG", {
-        callSid,
-        mixedWavBytes: mixedWavStat.size,
-        mixedMp3Bytes: mixedMp3Stat.size,
-      });
-
-      rec.durationSec =
-        Math.round(((mixedPcm.length / 2 / sampleRate) * 100)) / 100;
-      rec.available = true;
-      rec.status = "completed";
-      rec.completedAt = new Date().toISOString();
-
-      rec.callerChunks = [];
-      rec.assistantChunks = [];
-
-      // 先保留诊断文件，确认问题后再改回删除
-      // await safeUnlink(rec.callerMulawPath);
-      // await safeUnlink(rec.assistantMulawPath);
-      // await safeUnlink(rec.callerWavPath);
-      // await safeUnlink(rec.assistantWavPath);
-      // await safeUnlink(rec.mixedWavPath);
-
-      sessionObj.updatedAt = new Date().toISOString();
-      return rec;
-    } catch (err) {
-      rec.status = "failed";
-      rec.error = err.message || "Failed to finalize recording";
-      sessionObj.updatedAt = new Date().toISOString();
-      throw err;
-    } finally {
-      rec.finalizing = false;
+    if (hasAssistantUlaw) {
+      await convertUlawToWav(
+        session.assistantUlawPath,
+        session.assistantWavPath
+      );
     }
+
+    await mixWavsToWav(
+      session.callerWavPath,
+      session.assistantWavPath,
+      session.mixedWavPath
+    );
+
+    await convertWavToMp3(session.mixedWavPath, session.mixedMp3Path);
+
+    const callerDur = await estimateDurationSecFromUlaw(session.callerUlawPath);
+    const assistantDur = await estimateDurationSecFromUlaw(
+      session.assistantUlawPath
+    );
+    const durationSec = Math.max(callerDur, assistantDur);
+
+    session.status = "completed";
+    session.finalizedAt = new Date().toISOString();
+    session.durationSec = durationSec;
+    session.error = null;
+
+    await writeMeta(callSid, {
+      status: "completed",
+      finalizedAt: session.finalizedAt,
+      durationSec,
+      mixedMp3Path: session.mixedMp3Path,
+      mixedWavPath: session.mixedWavPath,
+      callerWavPath: session.callerWavPath,
+      assistantWavPath: session.assistantWavPath,
+      error: null,
+    });
+
+    return session;
+  } catch (err) {
+    session.status = "failed";
+    session.error = err.message || String(err);
+
+    await writeMeta(callSid, {
+      status: "failed",
+      error: session.error,
+    });
+
+    throw err;
+  }
+}
+
+/**
+ * 读取录音信息
+ * 这里不依赖 liveCalls / 内存 session
+ * 只要磁盘有文件，就能返回
+ */
+async function getRecordingInfo(callSid) {
+  if (!callSid) return null;
+
+  await ensureRecordingsDir();
+
+  const paths = getRecordingPaths(callSid);
+  const meta = await readMeta(callSid);
+
+  const mp3Exists = await fileExists(paths.mixedMp3Path);
+  const mixedWavExists = await fileExists(paths.mixedWavPath);
+  const callerWavExists = await fileExists(paths.callerWavPath);
+  const assistantWavExists = await fileExists(paths.assistantWavPath);
+
+  if (!meta && !mp3Exists && !mixedWavExists && !callerWavExists && !assistantWavExists) {
+    return null;
   }
 
-  function getRecordingMeta(callSid) {
-    const sessionObj = liveCalls.get(callSid);
-    const rec = sessionObj?.recording;
+  const status = meta?.status || (mp3Exists ? "completed" : "recording");
+  const finalizedAt = meta?.finalizedAt || null;
+  const startedAt = meta?.startedAt || null;
+  const deletedAt = meta?.deletedAt || null;
+  const durationSec = meta?.durationSec || 0;
 
-    return {
-      callSid,
-      recording: rec
-        ? {
-            available: !!rec.available && !rec.deletedAt,
-            status: rec.status || "unknown",
-            durationSec: rec.durationSec || 0,
-            createdAt: rec.createdAt || "",
-            completedAt: rec.completedAt || "",
-            expiresAt: rec.expiresAt || "",
-            deletedAt: rec.deletedAt || "",
-            fileName: rec.fileName || "",
-            streamUrl:
-              rec.available && !rec.deletedAt
-                ? `/api/live-call/${encodeURIComponent(callSid)}/recording/media`
-                : "",
-          }
-        : {
-            available: false,
-            status: "not-started",
-            durationSec: 0,
-            createdAt: "",
-            completedAt: "",
-            expiresAt: "",
-            deletedAt: "",
-            fileName: "",
-            streamUrl: "",
-          },
-    };
+  let expiresAt = null;
+  if (finalizedAt) {
+    expiresAt = new Date(
+      new Date(finalizedAt).getTime() + RECORDING_TTL_MS
+    ).toISOString();
   }
 
- async function streamRecordingMedia(callSid, req, res) {
-  const sessionObj = liveCalls.get(callSid);
+  return {
+    callSid,
+    status,
+    available: mp3Exists && !deletedAt,
+    startedAt,
+    finalizedAt,
+    deletedAt,
+    durationSec,
+    expiresAt,
+    callerWavExists,
+    assistantWavExists,
+    mixedWavExists,
+    mixedMp3Exists: mp3Exists,
+    streamUrl: `/api/live-call/${encodeURIComponent(callSid)}/recording/media`,
+    downloadUrl: `/api/live-call/${encodeURIComponent(callSid)}/recording/media?download=1`,
+    error: meta?.error || null,
+  };
+}
 
-  if (!sessionObj) {
-    return res.status(404).json({ ok: false, error: "Call not found" });
+/**
+ * 播放 mp3，支持 Range
+ */
+async function streamRecordingMedia(callSid, req, res) {
+  if (!callSid) {
+    return res.status(400).json({ ok: false, error: "Missing callSid" });
   }
 
-  const rec = sessionObj.recording;
-  if (!rec?.mixedMp3Path || rec.deletedAt) {
-    return res.status(404).json({ ok: false, error: "Recording not available" });
+  const paths = getRecordingPaths(callSid);
+
+  try {
+    await fsp.access(paths.mixedMp3Path, fs.constants.R_OK);
+  } catch {
+    return res.status(404).json({ ok: false, error: "Recording not found" });
   }
 
-  await fsp.access(rec.mixedMp3Path, fs.constants.R_OK);
-  const stat = await fsp.stat(rec.mixedMp3Path);
+  const stat = await fsp.stat(paths.mixedMp3Path);
   const fileSize = stat.size;
   const range = req.headers.range;
+  const isDownload = req.query.download === "1";
 
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("Cache-Control", "private, max-age=60");
-
-  if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-    if (Number.isNaN(start) || Number.isNaN(end) || start > end || end >= fileSize) {
-      res.status(416).setHeader("Content-Range", `bytes */${fileSize}`);
-      return res.end();
-    }
-
-    const chunkSize = end - start + 1;
-    res.status(206);
-    res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-    res.setHeader("Content-Length", chunkSize);
-
-    return fs.createReadStream(rec.mixedMp3Path, { start, end }).pipe(res);
+  if (isDownload) {
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${callSid}.mixed.mp3"`
+    );
   }
 
-  res.setHeader("Content-Length", fileSize);
-  return fs.createReadStream(rec.mixedMp3Path).pipe(res);
+  if (!range) {
+    res.setHeader("Content-Length", fileSize);
+    const stream = fs.createReadStream(paths.mixedMp3Path);
+    stream.on("error", (err) => {
+      if (!res.headersSent) {
+        res.status(500).end(err.message || "Stream error");
+      } else {
+        res.destroy(err);
+      }
+    });
+    return stream.pipe(res);
+  }
+
+  const match = /bytes=(\d*)-(\d*)/.exec(range);
+  if (!match) {
+    return res.status(416).end();
+  }
+
+  let start = match[1] ? parseInt(match[1], 10) : 0;
+  let end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+
+  if (Number.isNaN(start)) start = 0;
+  if (Number.isNaN(end)) end = fileSize - 1;
+
+  if (start >= fileSize || end >= fileSize || start > end) {
+    res.setHeader("Content-Range", `bytes */${fileSize}`);
+    return res.status(416).end();
+  }
+
+  const chunkSize = end - start + 1;
+  res.status(206);
+  res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+  res.setHeader("Content-Length", chunkSize);
+
+  const stream = fs.createReadStream(paths.mixedMp3Path, { start, end });
+  stream.on("error", (err) => {
+    if (!res.headersSent) {
+      res.status(500).end(err.message || "Stream error");
+    } else {
+      res.destroy(err);
+    }
+  });
+
+  return stream.pipe(res);
 }
 
-  async function deleteRecordingFiles(rec) {
-    const paths = [
-      rec?.callerMulawPath,
-      rec?.assistantMulawPath,
-      rec?.callerWavPath,
-      rec?.assistantWavPath,
-      rec?.mixedWavPath,
-      rec?.mixedMp3Path,
-    ].filter(Boolean);
+/**
+ * 删除过期录音
+ */
+async function cleanupExpiredRecordings() {
+  await ensureRecordingsDir();
 
-    for (const p of paths) {
-      try {
-        await fsp.unlink(p);
-      } catch (err) {
-        if (err.code !== "ENOENT") {
-          console.error("delete recording file error:", p, err?.message || err);
-        }
+  const files = await fsp.readdir(RECORDINGS_DIR);
+  const now = Date.now();
+
+  for (const file of files) {
+    if (!file.endsWith(".meta.json")) continue;
+
+    const metaPath = path.join(RECORDINGS_DIR, file);
+
+    try {
+      const raw = await fsp.readFile(metaPath, "utf8");
+      const meta = JSON.parse(raw);
+
+      if (!meta.finalizedAt) continue;
+
+      const finalizedAtMs = new Date(meta.finalizedAt).getTime();
+      if (!Number.isFinite(finalizedAtMs)) continue;
+
+      if (now - finalizedAtMs < RECORDING_TTL_MS) continue;
+
+      const callSid = meta.callSid;
+      if (!callSid) continue;
+
+      const paths = getRecordingPaths(callSid);
+
+      const allFiles = [
+        paths.callerUlawPath,
+        paths.assistantUlawPath,
+        paths.callerWavPath,
+        paths.assistantWavPath,
+        paths.mixedWavPath,
+        paths.mixedMp3Path,
+        paths.metaPath,
+      ];
+
+      for (const p of allFiles) {
+        try {
+          await fsp.unlink(p);
+        } catch (_) {}
       }
-    }
-  }
 
-  async function deleteRecordingIfExpired(sessionObj) {
-    const rec = sessionObj?.recording;
-    if (!rec || rec.deletedAt) return false;
-
-    const expiresAt = rec.expiresAt ? new Date(rec.expiresAt).getTime() : 0;
-    if (!expiresAt || Date.now() < expiresAt) return false;
-
-    await deleteRecordingFiles(rec);
-
-    rec.deletedAt = new Date().toISOString();
-    rec.available = false;
-    rec.status = "deleted";
-    sessionObj.updatedAt = new Date().toISOString();
-    return true;
-  }
-
-  async function cleanupExpiredRecordings() {
-    const calls = Array.from(liveCalls.values());
-    for (const sessionObj of calls) {
-      try {
-        await deleteRecordingIfExpired(sessionObj);
-      } catch (err) {
-        console.error(
-          `cleanup recording failed for ${sessionObj.callSid}:`,
-          err?.message || err
-        );
+      const session = recordingSessions.get(callSid);
+      if (session) {
+        session.status = "deleted";
+        session.deletedAt = new Date().toISOString();
       }
-    }
+    } catch (_) {}
   }
-
-  return {
-    ensureRecordingSession,
-    appendCallerAudio,
-    appendAssistantAudio,
-    finalizeRecording,
-    getRecordingMeta,
-    streamRecordingMedia,
-    cleanupExpiredRecordings,
-  };
 }
 
-module.exports = { createRecordingService };
+module.exports = {
+  RECORDINGS_DIR,
+  ensureRecordingsDir,
+  ensureRecordingSession,
+  getRecordingSession,
+  appendCallerAudio,
+  appendAssistantAudio,
+  finalizeRecording,
+  getRecordingInfo,
+  streamRecordingMedia,
+  cleanupExpiredRecordings,
+};
