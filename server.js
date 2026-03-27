@@ -67,6 +67,18 @@ const REALTIME_VOICE       = process.env.OPENAI_REALTIME_VOICE      || "alloy";
 const TRANSCRIPTION_MODEL  = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
 const EXTRACTION_MODEL     = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-mini";
 
+// ─── Twilio REST Client（用于主动挂断电话）────
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
+const twilioAuthToken  = process.env.TWILIO_AUTH_TOKEN;
+let twilioClient = null;
+if (twilioAccountSid && twilioAuthToken) {
+  const twilio = require("twilio");
+  twilioClient = twilio(twilioAccountSid, twilioAuthToken);
+  console.log("[Twilio] REST client initialized for programmatic hangup");
+} else {
+  console.warn("[Twilio] TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set — end_call tool will not be able to hang up");
+}
+
 // =========================
 // 初始化 Services
 // =========================
@@ -605,6 +617,31 @@ wss.on("connection", async (twilioWs, request) => {
             }
           }
 
+          // ── end_call ────────────────────────
+          if (fnName === "end_call") {
+            const reason = fnArgs.reason || "conversation_complete";
+            console.log(`[EndCall] AI requested hangup for ${activeCallSid}, reason: ${reason}`);
+            toolResult = "Call will be ended now. Goodbye.";
+
+            // 延迟几秒后挂断，让 AI 的告别语音播完
+            setTimeout(async () => {
+              try {
+                if (twilioClient) {
+                  await twilioClient.calls(activeCallSid)
+                    .update({ status: "completed" });
+                  console.log(`[EndCall] Successfully hung up ${activeCallSid}`);
+                } else {
+                  // 没有 Twilio REST client，通过关闭 WebSocket 来结束
+                  console.log(`[EndCall] No Twilio client, closing WebSocket for ${activeCallSid}`);
+                  if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+                  if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+                }
+              } catch (hangupErr) {
+                console.error(`[EndCall] Failed to hang up ${activeCallSid}:`, hangupErr?.message);
+              }
+            }, 3000);  // 3 秒后挂断，给告别语留出播放时间
+          }
+
           // 把工具结果送回 OpenAI Realtime，让 AI 继续对话
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({
@@ -615,8 +652,10 @@ wss.on("connection", async (twilioWs, request) => {
                 output:  toolResult,
               },
             }));
-            // 触发 AI 基于工具结果继续说话
-            openaiWs.send(JSON.stringify({ type: "response.create" }));
+            // 触发 AI 基于工具结果继续说话（end_call 时 AI 不需要再说话，但保持一致）
+            if (fnName !== "end_call") {
+              openaiWs.send(JSON.stringify({ type: "response.create" }));
+            }
           }
         }
       }
