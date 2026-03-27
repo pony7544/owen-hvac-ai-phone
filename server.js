@@ -429,8 +429,15 @@ app.get("/live", requireLiveAuth, (req, res) => {
 // Live APIs
 // =========================
 app.get("/api/live-call/:callSid/recording/media", requireApiAuth, async (req, res) => {
-  const callSid = req.params.callSid;
-  return res.redirect(`/api/recording/${callSid}.mixed.mp3`);
+  try {
+    await streamRecordingMedia(req.params.callSid, req, res);
+  } catch (err) {
+    console.error("recording media error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to stream recording",
+    });
+  }
 });
 
 
