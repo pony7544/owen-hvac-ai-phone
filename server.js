@@ -3,7 +3,6 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const path = require("path");
-
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const session = require("express-session");
@@ -45,9 +44,7 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-
 app.use(bodyParser.json());
-
 app.use(bodyParser.urlencoded({ extended: true }));
 
 app.use(
@@ -428,18 +425,12 @@ app.get("/live", requireLiveAuth, (req, res) => {
 // =========================
 // Live APIs
 // =========================
-app.get("/api/live-call/:callSid/recording/media", requireApiAuth, async (req, res) => {
-  try {
-    await streamRecordingMedia(req.params.callSid, req, res);
-  } catch (err) {
-    console.error("recording media error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Failed to stream recording",
-    });
-  }
+app.get("/api/live-calls", requireApiAuth, (req, res) => {
+  return res.json({
+    ok: true,
+    calls: getLatestCalls(50),
+  });
 });
-
 
 app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
   const callSid = req.params.callSid;
@@ -501,7 +492,7 @@ app.get("/api/live-call/:callSid/recording", requireApiAuth, (req, res) => {
 
 app.get("/api/live-call/:callSid/recording/media", requireApiAuth, async (req, res) => {
   try {
-    await streamRecordingMedia(req.params.callSid, req, res);
+    await streamRecordingMedia(req.params.callSid, res);
   } catch (err) {
     console.error("recording media error:", err);
     return res.status(500).json({
@@ -1012,8 +1003,6 @@ setTimeout(() => {
     cleanupExpiredRecordings().catch(console.error);
   }, 24 * 60 * 60 * 1000);
 }, 60 * 1000);
-
-
 // =========================
 // Start
 // =========================
@@ -1031,5 +1020,4 @@ server.listen(PORT, () => {
   if (PUBLIC_WSS_URL) {
     console.log("Media stream base:", PUBLIC_WSS_URL + MEDIA_STREAM_PATH);
   }
-  
 });
