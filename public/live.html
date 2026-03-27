@@ -500,7 +500,7 @@
     }
 
     async function loadCalls() {
-      const data = await fetchJson("/api/live-calls");
+      const data = await fetchJson("/api/live/calls");
       callsCache = data.calls || [];
       renderCalls(callsCache);
 
