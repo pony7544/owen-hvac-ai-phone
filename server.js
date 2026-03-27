@@ -44,7 +44,7 @@ const {
 
 const app = express();
 const server = http.createServer(app);
-app.use("/api/recording", express.static(path.join(__dirname, "recordings")));
+
 
 app.use(bodyParser.json());
 
