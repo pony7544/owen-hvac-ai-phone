@@ -245,16 +245,49 @@
       border-top: 1px solid #eef2f7;
     }
 
-    audio {
-      width: 100%;
-      margin-top: 12px;
+    .recording-player-wrap {
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-top: 10px;
     }
 
-    .small-note {
-      font-size: 12px;
-      color: #6b7280;
-      margin-top: 6px;
-      line-height: 1.4;
+    .channel-tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .ch-tab {
+      flex: 1;
+      padding: 7px 0;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      background: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.15s ease;
+      color: #374151;
+      text-align: center;
+    }
+
+    .ch-tab:hover { background: #f1f5f9; }
+
+    .ch-tab.active-caller    { background: #fef3c7; border-color: #f59e0b; color: #92400e; }
+    .ch-tab.active-assistant { background: #dbeafe; border-color: #3b82f6; color: #1e40af; }
+    .ch-tab.active-both      { background: #ede9fe; border-color: #7c3aed; color: #4c1d95; }
+
+    audio {
+      width: 100%;
+      margin-top: 4px;
+    }
+
+    .rec-not-ready {
+      color: #9ca3af;
+      font-size: 13px;
+      margin-top: 8px;
     }
 
     @media (max-width: 1280px) {
@@ -329,13 +362,24 @@
         </div>
 
         <div class="recording-box">
-          <div style="font-weight:700; margin-bottom:12px;">Call Recording</div>
-          <div class="field"><label>Recording Status</label><div class="field-value" id="rStatus"></div></div>
-          <div class="field"><label>Duration (sec)</label><div class="field-value" id="rDuration"></div></div>
-          <div class="field"><label>Expires At</label><div class="field-value" id="rExpiresAt"></div></div>
-          <div class="field"><label>Deleted At</label><div class="field-value" id="rDeletedAt"></div></div>
-          <audio id="recordingPlayer" controls style="display:none;"></audio>
-          <div class="small-note">Select a call, then click Play Recording.</div>
+          <div style="font-weight:700; margin-bottom:12px; display:flex; align-items:center; justify-content:space-between;">
+            Call Recording
+            <span id="recStatusBadge" style="font-size:12px; font-weight:600; padding:3px 10px; border-radius:999px; background:#f3f4f6; color:#6b7280;">Not ready</span>
+          </div>
+          <div class="field"><label>Duration</label><div class="field-value" id="rDuration"></div></div>
+          <div class="field"><label>Recorded At</label><div class="field-value" id="rCreatedAt"></div></div>
+
+          <div id="playerWrap" style="display:none;">
+            <div class="recording-player-wrap">
+              <div class="channel-tabs">
+                <button class="ch-tab active-both" id="tabBoth"      onclick="switchChannel('both')">&#9671; Both</button>
+                <button class="ch-tab"             id="tabCaller"    onclick="switchChannel('left')">&#9670; Caller</button>
+                <button class="ch-tab"             id="tabAssistant" onclick="switchChannel('right')">&#9671; AI</button>
+              </div>
+              <audio id="recordingPlayer" controls></audio>
+            </div>
+          </div>
+          <div class="rec-not-ready" id="recNotReadyNote">Select a call and click Play Recording to load.</div>
         </div>
 
         <div class="calendar-box">
@@ -472,31 +516,98 @@
       setText("fApptEventId", f.appointmentEventId || "");
     }
 
+    // ── 当前加载的声道 ──────────────────────────
+    let currentChannel = "both";
+
     function renderRecording(call) {
       const rec = call?.recording || null;
-      const player = document.getElementById("recordingPlayer");
 
-      if (!rec) {
-        setText("rStatus", "");
-        setText("rDuration", "");
-        setText("rExpiresAt", "");
-        setText("rDeletedAt", "");
+      setText("rDuration",  rec?.durationSec ? `${rec.durationSec}s` : "");
+      setText("rCreatedAt", rec?.createdAt   ? new Date(rec.createdAt).toLocaleString() : "");
+
+      const badge = document.getElementById("recStatusBadge");
+      const wrap  = document.getElementById("playerWrap");
+      const note  = document.getElementById("recNotReadyNote");
+
+      if (rec?.available) {
+        badge.textContent       = "Ready";
+        badge.style.background  = "#ecfdf5";
+        badge.style.color       = "#047857";
+        note.style.display      = "none";
+      } else {
+        badge.textContent       = "Not ready";
+        badge.style.background  = "#f3f4f6";
+        badge.style.color       = "#6b7280";
+        wrap.style.display      = "none";
+        note.style.display      = "block";
+
+        // Reset player
+        const player = document.getElementById("recordingPlayer");
         player.pause();
         player.removeAttribute("src");
         player.load();
-        player.style.display = "none";
-        return;
       }
+    }
 
-      setText("rStatus", rec.status || "");
-      setText("rDuration", String(rec.durationSec || ""));
-      setText("rExpiresAt", rec.expiresAt || "");
-      setText("rDeletedAt", rec.deletedAt || "");
+    function switchChannel(channel) {
+      if (!selectedCallSid) return;
+      currentChannel = channel;
 
-      player.pause();
-      player.removeAttribute("src");
+      // Update tab styles
+      document.getElementById("tabBoth").className      = "ch-tab" + (channel === "both"  ? " active-both"      : "");
+      document.getElementById("tabCaller").className    = "ch-tab" + (channel === "left"  ? " active-caller"    : "");
+      document.getElementById("tabAssistant").className = "ch-tab" + (channel === "right" ? " active-assistant" : "");
+
+      const player = document.getElementById("recordingPlayer");
+      const wasPlaying = !player.paused;
+      const currentTime = player.currentTime;
+
+      player.src = `/api/live-call/${encodeURIComponent(selectedCallSid)}/recording/stream?channel=${channel}&t=${Date.now()}`;
       player.load();
-      player.style.display = "none";
+      player.currentTime = currentTime;
+      if (wasPlaying) player.play().catch(() => {});
+    }
+
+    async function playCurrentRecording() {
+      if (!selectedCallSid) return;
+
+      try {
+        const data = await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/recording/info`);
+
+        if (!data.available) {
+          alert("Recording is not ready yet. The call may still be in progress.");
+          return;
+        }
+
+        setText("rDuration",  data.durationSec ? `${data.durationSec}s` : "");
+        setText("rCreatedAt", data.createdAt   ? new Date(data.createdAt).toLocaleString() : "");
+
+        const badge = document.getElementById("recStatusBadge");
+        badge.textContent      = "Ready";
+        badge.style.background = "#ecfdf5";
+        badge.style.color      = "#047857";
+
+        // Show player, load both-channel stream
+        currentChannel = "both";
+        document.getElementById("tabBoth").className      = "ch-tab active-both";
+        document.getElementById("tabCaller").className    = "ch-tab";
+        document.getElementById("tabAssistant").className = "ch-tab";
+
+        const wrap   = document.getElementById("playerWrap");
+        const note   = document.getElementById("recNotReadyNote");
+        const player = document.getElementById("recordingPlayer");
+
+        wrap.style.display  = "block";
+        note.style.display  = "none";
+
+        player.src = `/api/live-call/${encodeURIComponent(selectedCallSid)}/recording/stream?channel=both&t=${Date.now()}`;
+        player.load();
+        await player.play().catch(() => {});
+
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Failed to load recording");
+      }
     }
 
     async function loadCalls() {
@@ -575,33 +686,6 @@
       await loadCallDetail(selectedCallSid);
       await loadCalls();
       await loadCalendarStatus();
-    }
-
-    async function playCurrentRecording() {
-      if (!selectedCallSid) return;
-
-      try {
-        const data = await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/recording`);
-        const rec = data.recording || {};
-
-        setText("rStatus", rec.status || "");
-        setText("rDuration", String(rec.durationSec || ""));
-        setText("rExpiresAt", rec.expiresAt || "");
-        setText("rDeletedAt", rec.deletedAt || "");
-
-        if (!rec.available || !rec.streamUrl) {
-          alert("Recording is not ready yet.");
-          return;
-        }
-
-        const player = document.getElementById("recordingPlayer");
-        player.src = rec.streamUrl;
-        player.style.display = "block";
-        await player.play();
-      } catch (err) {
-        console.error(err);
-        alert(err.message || "Failed to play recording");
-      }
     }
 
     document.getElementById("refreshBtn").addEventListener("click", async () => {
