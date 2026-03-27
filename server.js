@@ -14,7 +14,10 @@ const server = http.createServer(app);
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-
+if (!process.env.SESSION_SECRET) {
+  console.error("FATAL: SESSION_SECRET environment variable is not set. Server cannot start.");
+  process.exit(1);
+}
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "replace_this_session_secret",
@@ -52,7 +55,11 @@ const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 
 const LIVE_ADMIN_USER = process.env.LIVE_ADMIN_USER || "admin";
-const LIVE_ADMIN_PASS = process.env.LIVE_ADMIN_PASS || "ChangeThisPassword123!";
+const LIVE_ADMIN_PASS = process.env.LIVE_ADMIN_PASS ";
+  if (!LIVE_ADMIN_PASS) {
+  console.error("FATAL: LIVE_ADMIN_PASS environment variable is not set. Server cannot start.");
+  process.exit(1);
+}
 
 if (!OPENAI_API_KEY) {
   console.warn("Missing OPENAI_API_KEY");
@@ -467,7 +474,7 @@ async function extractCallInfoWithOpenAI({ transcript, nowIso, timezone }) {
   const transcriptText = transcript.map((x) => `${x.role}: ${x.text}`).join("\n");
 
   const response = await openai.responses.create({
-    model: "gpt-5-mini",
+    model: "gpt-4o-mini",
     input: [
       {
         role: "system",
