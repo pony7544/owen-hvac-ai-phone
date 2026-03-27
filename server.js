@@ -5,6 +5,8 @@
 // =============================================================
 
 require("dotenv").config();
+const os   = require("os");
+const fs   = require("fs");
 
 const express    = require("express");
 const http       = require("http");
@@ -364,8 +366,6 @@ app.get("/api/live-call/:callSid/recording/info", requireApiAuth, (req, res) => 
 // GET /api/live-call/:callSid/recording/stream?channel=both|left|right
 // channel: both=双声道, left=caller only, right=assistant only
 // 修改后
-const os   = require("os");
-const fs   = require("fs");
 
 app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, (req, res) => {
   const call = liveCalls.get(req.params.callSid);
