@@ -213,12 +213,46 @@ function createRecordingService({
       const callerMulaw = Buffer.concat(rec.callerChunks || []);
       const assistantMulaw = Buffer.concat(rec.assistantChunks || []);
 
+      await writeWavFile(rec.callerWavPath, callerPcm);
+await writeWavFile(rec.assistantWavPath, assistantPcm);
+await writeWavFile(rec.mixedWavPath, mixedPcm);
+
       await fsp.writeFile(rec.callerMulawPath, callerMulaw);
       await fsp.writeFile(rec.assistantMulawPath, assistantMulaw);
 
       const callerPcm = decodeMulawBufferToPcm16Buffer(callerMulaw);
       const assistantPcm = decodeMulawBufferToPcm16Buffer(assistantMulaw);
       const mixedPcm = mixPcm16MonoBuffers(callerPcm, assistantPcm);
+      console.log("PCM ENERGY DEBUG", {
+  callSid,
+  caller: pcmStats(callerPcm),
+  assistant: pcmStats(assistantPcm),
+});
+
+      function pcmStats(pcmBuf) {
+  const samples = Math.floor(pcmBuf.length / 2);
+  if (!samples) return { samples: 0, peak: 0, rms: 0, nonZero: 0 };
+
+  let peak = 0;
+  let sumSq = 0;
+  let nonZero = 0;
+
+  for (let i = 0; i < samples; i++) {
+    const v = pcmBuf.readInt16LE(i * 2);
+    const a = Math.abs(v);
+    if (a > peak) peak = a;
+    if (a > 500) nonZero++;
+    sumSq += v * v;
+  }
+
+  return {
+    samples,
+    peak,
+    rms: Math.round(Math.sqrt(sumSq / samples)),
+    nonZero,
+    nonZeroPct: Math.round((nonZero / samples) * 10000) / 100,
+  };
+}
 
       await writeWavFile(rec.mixedWavPath, mixedPcm);
       await convertWavToMp3(rec.mixedWavPath, rec.mixedMp3Path);
