@@ -1,6 +1,37 @@
+// =============================================================
+// services/call-session.service.js
+// 通话会话管理：内存 Map 主存储 + Redis 可选持久化
+// 若未配置 REDIS_URL，纯内存运行（行为与原版相同）
+// =============================================================
+
+const redis = (() => {
+  const url = process.env.REDIS_URL;
+  if (!url) return null;
+  try {
+    const { createClient } = require("redis");
+    const client = createClient({ url });
+    client.connect().catch((err) =>
+      console.error("[Redis] connect error:", err.message)
+    );
+    client.on("error", (err) =>
+      console.error("[Redis] client error:", err.message)
+    );
+    console.log("[Redis] connected to", url);
+    return client;
+  } catch (err) {
+    console.warn("[Redis] redis package not found, running without persistence:", err.message);
+    return null;
+  }
+})();
+
+const REDIS_KEY_PREFIX = "hvac:call:";
+const REDIS_TTL_SECONDS = 60 * 60 * 48; // 48 hours
+
+// ─── 内存主存储 ───────────────────────────────
 const liveCalls = new Map();
 const streamToCallSid = new Map();
 
+// ─── 工具函数 ─────────────────────────────────
 function cleanText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
@@ -26,6 +57,42 @@ function createEmptyExtracted() {
   };
 }
 
+// ─── Redis 持久化（非阻塞，失败不影响主流程）────
+async function persistToRedis(callSid, sessionData) {
+  if (!redis) return;
+  try {
+    const key = REDIS_KEY_PREFIX + callSid;
+    // transcript 可能很大，只持久化元数据和 extracted
+    const payload = {
+      callSid: sessionData.callSid,
+      from: sessionData.from,
+      to: sessionData.to,
+      status: sessionData.status,
+      createdAt: sessionData.createdAt,
+      updatedAt: sessionData.updatedAt,
+      transcript: sessionData.transcript,
+      extracted: sessionData.extracted,
+    };
+    await redis.set(key, JSON.stringify(payload), { EX: REDIS_TTL_SECONDS });
+  } catch (err) {
+    console.error("[Redis] persist error:", err.message);
+  }
+}
+
+async function loadFromRedis(callSid) {
+  if (!redis) return null;
+  try {
+    const key = REDIS_KEY_PREFIX + callSid;
+    const raw = await redis.get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error("[Redis] load error:", err.message);
+    return null;
+  }
+}
+
+// ─── 核心 API ─────────────────────────────────
 function getOrCreateCallSession(callSid) {
   if (!liveCalls.has(callSid)) {
     liveCalls.set(callSid, {
@@ -47,72 +114,32 @@ function getOrCreateCallSession(callSid) {
   return liveCalls.get(callSid);
 }
 
-function mergeRecordings(target, source) {
-  if (!source?.recording) return;
+// 从 Redis 恢复历史通话（服务器重启后调用）
+async function restoreCallSession(callSid) {
+  if (liveCalls.has(callSid)) return liveCalls.get(callSid);
+  const saved = await loadFromRedis(callSid);
+  if (!saved) return getOrCreateCallSession(callSid);
 
-  if (!target.recording) {
-    target.recording = source.recording;
-    return;
-  }
-
-  target.recording.callerChunks = [
-    ...(target.recording.callerChunks || []),
-    ...(source.recording.callerChunks || []),
-  ];
-
-  target.recording.assistantChunks = [
-    ...(target.recording.assistantChunks || []),
-    ...(source.recording.assistantChunks || []),
-  ];
-
-  target.recording.createdAt =
-    target.recording.createdAt || source.recording.createdAt || "";
-
-  target.recording.completedAt =
-    target.recording.completedAt || source.recording.completedAt || "";
-
-  target.recording.expiresAt =
-    target.recording.expiresAt || source.recording.expiresAt || "";
-
-  target.recording.deletedAt =
-    target.recording.deletedAt || source.recording.deletedAt || "";
-
-  target.recording.durationSec = Math.max(
-    Number(target.recording.durationSec || 0),
-    Number(source.recording.durationSec || 0)
-  );
-
-  target.recording.available =
-    Boolean(target.recording.available) || Boolean(source.recording.available);
-
-  target.recording.status =
-    target.recording.status ||
-    source.recording.status ||
-    "recording";
-
-  target.recording.fileName =
-    target.recording.fileName || source.recording.fileName || "";
-
-  target.recording.mimeType =
-    target.recording.mimeType || source.recording.mimeType || "";
-
-  target.recording.sampleRate =
-    target.recording.sampleRate || source.recording.sampleRate || 8000;
-
-  target.recording.channels =
-    target.recording.channels || source.recording.channels || 1;
+  const session = getOrCreateCallSession(callSid);
+  session.from = saved.from || "";
+  session.to = saved.to || "";
+  session.status = saved.status || "new";
+  session.createdAt = saved.createdAt || session.createdAt;
+  session.updatedAt = saved.updatedAt || session.updatedAt;
+  session.transcript = Array.isArray(saved.transcript) ? saved.transcript : [];
+  session.extracted = { ...createEmptyExtracted(), ...(saved.extracted || {}) };
+  console.log(`[Redis] restored session for ${callSid}`);
+  return session;
 }
 
 function mergeCallSessions(targetSid, sourceSid) {
   if (!targetSid && !sourceSid) return null;
-
   if (!targetSid || !sourceSid || targetSid === sourceSid) {
     return getOrCreateCallSession(targetSid || sourceSid);
   }
 
   const target = getOrCreateCallSession(targetSid);
   const source = liveCalls.get(sourceSid);
-
   if (!source) return target;
 
   target.streamSid = target.streamSid || source.streamSid || "";
@@ -127,62 +154,33 @@ function mergeCallSessions(targetSid, sourceSid) {
     );
   }
 
-  target.lastAssistantText =
-    target.lastAssistantText || source.lastAssistantText || "";
+  target.lastAssistantText = target.lastAssistantText || source.lastAssistantText || "";
+  target.extractionInFlight = target.extractionInFlight || source.extractionInFlight || false;
+  target.lastExtractionAt = Math.max(target.lastExtractionAt || 0, source.lastExtractionAt || 0);
+  target.mediaPacketCount = (target.mediaPacketCount || 0) + (source.mediaPacketCount || 0);
 
-  target.extractionInFlight =
-    target.extractionInFlight || source.extractionInFlight || false;
-
-  target.lastExtractionAt = Math.max(
-    target.lastExtractionAt || 0,
-    source.lastExtractionAt || 0
-  );
-
-  target.mediaPacketCount =
-    (target.mediaPacketCount || 0) + (source.mediaPacketCount || 0);
-
-  const targetExtracted = target.extracted || createEmptyExtracted();
-  const sourceExtracted = source.extracted || createEmptyExtracted();
-
+  const te = target.extracted || createEmptyExtracted();
+  const se = source.extracted || createEmptyExtracted();
   target.extracted = {
-    ...sourceExtracted,
-    ...targetExtracted,
-    intent: targetExtracted.intent || sourceExtracted.intent || "",
-    callerName: targetExtracted.callerName || sourceExtracted.callerName || "",
-    callbackNumber:
-      targetExtracted.callbackNumber || sourceExtracted.callbackNumber || "",
-    serviceAddress:
-      targetExtracted.serviceAddress || sourceExtracted.serviceAddress || "",
-    issueSummary:
-      targetExtracted.issueSummary || sourceExtracted.issueSummary || "",
-    preferredDate:
-      targetExtracted.preferredDate || sourceExtracted.preferredDate || "",
-    preferredTime:
-      targetExtracted.preferredTime || sourceExtracted.preferredTime || "",
-    preferredDateTime:
-      targetExtracted.preferredDateTime ||
-      sourceExtracted.preferredDateTime ||
-      "",
-    bookingConfirmed:
-      Boolean(targetExtracted.bookingConfirmed) ||
-      Boolean(sourceExtracted.bookingConfirmed),
-    appointmentCreated:
-      Boolean(targetExtracted.appointmentCreated) ||
-      Boolean(sourceExtracted.appointmentCreated),
-    appointmentEventId:
-      targetExtracted.appointmentEventId ||
-      sourceExtracted.appointmentEventId ||
-      "",
+    ...se,
+    ...te,
+    intent:              te.intent              || se.intent              || "",
+    callerName:          te.callerName          || se.callerName          || "",
+    callbackNumber:      te.callbackNumber      || se.callbackNumber      || "",
+    serviceAddress:      te.serviceAddress      || se.serviceAddress      || "",
+    issueSummary:        te.issueSummary        || se.issueSummary        || "",
+    preferredDate:       te.preferredDate       || se.preferredDate       || "",
+    preferredTime:       te.preferredTime       || se.preferredTime       || "",
+    preferredDateTime:   te.preferredDateTime   || se.preferredDateTime   || "",
+    bookingConfirmed:    Boolean(te.bookingConfirmed)   || Boolean(se.bookingConfirmed),
+    appointmentCreated:  Boolean(te.appointmentCreated) || Boolean(se.appointmentCreated),
+    appointmentEventId:  te.appointmentEventId  || se.appointmentEventId  || "",
   };
 
-  // 关键修复：把旧 session 上已经录到的 recording 一起迁移
-  mergeRecordings(target, source);
-
-  if (source.streamSid) {
-    streamToCallSid.set(source.streamSid, targetSid);
-  }
-
+  if (source.streamSid) streamToCallSid.set(source.streamSid, targetSid);
   liveCalls.delete(sourceSid);
+
+  persistToRedis(targetSid, target);
   return target;
 }
 
@@ -199,35 +197,30 @@ function pushTranscript(callSid, role, text) {
   const session = getOrCreateCallSession(callSid);
   const cleaned = cleanText(text);
   if (!cleaned) return;
-
-  session.transcript.push({
-    role,
-    text: cleaned,
-    ts: new Date().toISOString(),
-  });
-
+  session.transcript.push({ role, text: cleaned, ts: new Date().toISOString() });
   session.updatedAt = new Date().toISOString();
+  persistToRedis(callSid, session);
 }
 
 function buildCallSummary(call) {
   const f = call.extracted || createEmptyExtracted();
   return {
-    callSid: call.callSid,
-    from: call.from || "",
-    to: call.to || "",
-    status: call.status || "",
-    createdAt: call.createdAt || "",
-    updatedAt: call.updatedAt || "",
-    intent: f.intent || "",
-    callerName: f.callerName || "",
-    callbackNumber: f.callbackNumber || "",
-    serviceAddress: f.serviceAddress || "",
-    issueSummary: f.issueSummary || "",
-    preferredDate: f.preferredDate || "",
-    preferredTime: f.preferredTime || "",
-    bookingConfirmed: !!f.bookingConfirmed,
+    callSid:            call.callSid,
+    from:               call.from               || "",
+    to:                 call.to                 || "",
+    status:             call.status             || "",
+    createdAt:          call.createdAt          || "",
+    updatedAt:          call.updatedAt          || "",
+    intent:             f.intent                || "",
+    callerName:         f.callerName            || "",
+    callbackNumber:     f.callbackNumber        || "",
+    serviceAddress:     f.serviceAddress        || "",
+    issueSummary:       f.issueSummary          || "",
+    preferredDate:      f.preferredDate         || "",
+    preferredTime:      f.preferredTime         || "",
+    bookingConfirmed:   !!f.bookingConfirmed,
     appointmentCreated: !!f.appointmentCreated,
-    appointmentEventId: f.appointmentEventId || "",
+    appointmentEventId: f.appointmentEventId    || "",
   };
 }
 
@@ -238,8 +231,10 @@ module.exports = {
   normalizePhone,
   createEmptyExtracted,
   getOrCreateCallSession,
+  restoreCallSession,
   mergeCallSessions,
   resolveStartCallSid,
   pushTranscript,
   buildCallSummary,
+  persistToRedis,
 };
