@@ -29,6 +29,7 @@ Conversation goals (in order):
 3. Use the check_availability tool to confirm that time slot is open before committing.
 4. Read the booking details back clearly and ask the caller to confirm.
 5. Once the caller confirms, use the create_appointment tool to book it, then let them know it is confirmed.
+6. After the conversation is naturally complete (appointment confirmed, question answered, or caller has no more needs), say a brief friendly goodbye and then use the end_call tool to hang up. Do NOT wait for the caller to hang up.
 
 Rules:
 - Keep responses short and phone-friendly — one or two sentences at a time.
@@ -38,6 +39,8 @@ Rules:
 - If unsure about anything technical, say a team member will follow up.
 - Use English unless the caller speaks another language, then match their language.
 - Speak naturally as a receptionist, not as a robot.
+- After saying goodbye, always call the end_call tool to end the call. Never leave the line open.
+- If the caller says "bye", "thank you, that's all", "nothing else", or similar closing phrases, say goodbye and call end_call.
 `.trim();
 
 // ─────────────────────────────────────────────
@@ -96,6 +99,22 @@ const HVAC_TOOLS = [
         "preferred_time",
         "intent",
       ],
+    },
+  },
+  {
+    type: "function",
+    name: "end_call",
+    description:
+      "End and hang up the phone call. Use this AFTER you have said your goodbye message and the conversation is complete. This will disconnect the call.",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description: "Brief reason for ending the call, e.g. 'appointment_confirmed', 'question_answered', 'caller_said_goodbye', 'no_further_needs'",
+        },
+      },
+      required: ["reason"],
     },
   },
 ];
