@@ -65,6 +65,7 @@ const PORT                       = process.env.PORT                       || 100
 const REALTIME_MODEL       = process.env.OPENAI_REALTIME_MODEL      || "gpt-4o-realtime-preview";
 const TRANSCRIPTION_MODEL  = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
 const EXTRACTION_MODEL     = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-mini";
+const REALTIME_VOICE= process.env.OPENAI_REALTIME_VOICE      || "alloy";
 
 // =========================
 // 初始化 Services
@@ -465,7 +466,7 @@ wss.on("connection", async (twilioWs, request) => {
         instructions: HVAC_SYSTEM_PROMPT,
         tools:        HVAC_TOOLS,
         tool_choice:  "auto",
-        voice:        "alloy",
+        voice:        REALTIME_VOICE,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
         input_audio_transcription: { model: TRANSCRIPTION_MODEL },
