@@ -1,6 +1,6 @@
 {
   "name": "owen-hvac-ai-phone",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Twilio + OpenAI Realtime + Google Calendar HVAC intake system",
   "main": "server.js",
   "scripts": {
@@ -15,6 +15,6 @@
     "dotenv": "^17.3.1",
     "body-parser": "^2.2.2",
     "express-session": "^1.18.0",
-    "redis": ^4.7.0
+    "redis": "^4.7.0"
   }
 }
