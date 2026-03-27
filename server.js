@@ -33,6 +33,7 @@ const {
 
 const { createExtractionService } = require("./services/extraction.service");
 const { createCalendarService }   = require("./services/calendar.service");
+const { buildWav, decodeG711UlawFrame } = require("./services/recording.service");
 
 // =========================
 // ENV 校验
@@ -58,6 +59,11 @@ const LIVE_ADMIN_USER            = process.env.LIVE_ADMIN_USER            || "ad
 const LIVE_ADMIN_PASS            = process.env.LIVE_ADMIN_PASS;
 const PORT                       = process.env.PORT                       || 10000;
 
+// AI 模型（可通过环境变量覆盖，无需重新部署）
+const REALTIME_MODEL       = process.env.OPENAI_REALTIME_MODEL      || "gpt-4o-realtime-preview";
+const TRANSCRIPTION_MODEL  = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
+const EXTRACTION_MODEL     = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-mini";
+
 // =========================
 // 初始化 Services
 // =========================
@@ -74,6 +80,7 @@ const calendarService = createCalendarService({
 
 const extractionService = createExtractionService({
   openaiApiKey:         OPENAI_API_KEY,
+  extractionModel:      EXTRACTION_MODEL,
   businessTimezone:     BUSINESS_TIMEZONE,
   getOrCreateCallSession,
   normalizePhone,
@@ -302,6 +309,88 @@ app.post("/twilio/voice/status", (req, res) => {
 });
 
 // =========================
+// 录音：合成双声道 WAV
+// =========================
+// 防止 stop + close 双重触发
+const finalizedCalls = new Set();
+
+function finalizeRecording(callSid, callerFrames, assistantFrames) {
+  if (finalizedCalls.has(callSid)) return;
+  if (!callerFrames.length && !assistantFrames.length) return;
+  finalizedCalls.add(callSid);
+
+  try {
+    const wavBuffer = buildWav(callerFrames, assistantFrames);
+    const session   = getOrCreateCallSession(callSid);
+    session.recording = {
+      wavBuffer,                          // Buffer in memory
+      _callerFrames:    callerFrames,
+      _assistantFrames: assistantFrames,
+      durationSec: Math.round(
+        (callerFrames.length * 160) / 8000  // 160 samples/frame at 8kHz
+      ),
+      createdAt:  new Date().toISOString(),
+      available:  true,
+    };
+    session.updatedAt = new Date().toISOString();
+    persistToRedis(callSid, session);
+    console.log(`[Recording] WAV ready for ${callSid}, ~${session.recording.durationSec}s`);
+  } catch (err) {
+    console.error("[Recording] build WAV failed:", err?.message);
+  }
+}
+
+// =========================
+// 录音 API
+// =========================
+
+// GET /api/live-call/:callSid/recording/info — 录音元数据
+app.get("/api/live-call/:callSid/recording/info", requireApiAuth, (req, res) => {
+  const call = liveCalls.get(req.params.callSid);
+  if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
+
+  const rec = call.recording;
+  if (!rec?.available) {
+    return res.json({ ok: true, available: false });
+  }
+  res.json({
+    ok:          true,
+    available:   true,
+    durationSec: rec.durationSec,
+    createdAt:   rec.createdAt,
+  });
+});
+
+// GET /api/live-call/:callSid/recording/stream?channel=both|left|right
+// channel: both=双声道, left=caller only, right=assistant only
+app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, (req, res) => {
+  const call = liveCalls.get(req.params.callSid);
+  if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
+
+  const rec = call.recording;
+  if (!rec?.available || !rec.wavBuffer) {
+    return res.status(404).json({ ok: false, error: "Recording not ready" });
+  }
+
+  const channel = req.query.channel || "both";
+  let wavToSend = rec.wavBuffer;
+
+  // 如果要单声道，从双声道 WAV 里提取
+  if (channel === "left" || channel === "right") {
+    wavToSend = buildWav(
+      channel === "left"  ? call.recording._callerFrames  || [] : [],
+      channel === "right" ? call.recording._assistantFrames || [] : [],
+      true  // mono mode
+    );
+  }
+
+  res.setHeader("Content-Type", "audio/wav");
+  res.setHeader("Content-Length", wavToSend.length);
+  res.setHeader("Content-Disposition", `inline; filename="call-${req.params.callSid}.wav"`);
+  res.end(wavToSend);
+});
+
+// =========================
 // WebSocket — Twilio Media Streams
 // =========================
 const wss = new WebSocket.Server({ noServer: true });
@@ -326,11 +415,17 @@ wss.on("connection", async (twilioWs, request) => {
   let streamSid     = "";
   let assistantTranscriptBuffer = "";
 
+  // ─── 双声道录音缓冲区 ──────────────────────
+  // callerFrames: Twilio 发来的 g711_ulaw base64 帧（来电者声音）
+  // assistantFrames: OpenAI 返回的 g711_ulaw base64 帧（AI 声音）
+  const callerFrames    = [];
+  const assistantFrames = [];
+
   console.log(`[WS] Twilio connected: ${activeCallSid}`);
 
   // ─── 连接 OpenAI Realtime ──────────────────
   const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
     {
       headers: {
         Authorization:  `Bearer ${OPENAI_API_KEY}`,
@@ -353,7 +448,7 @@ wss.on("connection", async (twilioWs, request) => {
         voice:        "alloy",
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
+        input_audio_transcription: { model: TRANSCRIPTION_MODEL },
         turn_detection: {
           type:                 "server_vad",
           silence_duration_ms:  700,
@@ -399,8 +494,9 @@ wss.on("connection", async (twilioWs, request) => {
         assistantTranscriptBuffer += data.delta;
       }
 
-      // AI 音频增量 → 转发给 Twilio
+      // AI 音频增量 → 转发给 Twilio + 录入 assistant 缓冲
       if (data.type === "response.audio.delta" && data.delta) {
+        assistantFrames.push(data.delta);
         if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify({
             event:     "media",
@@ -537,6 +633,8 @@ wss.on("connection", async (twilioWs, request) => {
 
         case "media":
           callSession.mediaPacketCount += 1;
+          // 录入 caller 声道缓冲
+          if (data.media?.payload) callerFrames.push(data.media.payload);
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({
               type:  "input_audio_buffer.append",
@@ -551,6 +649,8 @@ wss.on("connection", async (twilioWs, request) => {
           callSession.updatedAt = new Date().toISOString();
           if (streamSid) streamToCallSid.delete(streamSid);
           if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+          // 合成双声道 WAV
+          finalizeRecording(activeCallSid, callerFrames, assistantFrames);
           break;
       }
     } catch (err) {
@@ -564,6 +664,8 @@ wss.on("connection", async (twilioWs, request) => {
     callSession.updatedAt = new Date().toISOString();
     if (streamSid) streamToCallSid.delete(streamSid);
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+    // 合成双声道 WAV（stop 事件没触发时的兜底）
+    finalizeRecording(activeCallSid, callerFrames, assistantFrames);
   });
 
   twilioWs.on("error", (err) => console.error("[Twilio] WS error:", err?.message));
