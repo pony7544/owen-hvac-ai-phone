@@ -35,7 +35,7 @@ const {
 
 const { createExtractionService } = require("./services/extraction.service");
 const { createCalendarService }   = require("./services/calendar.service");
-const { buildWav, decodeG711UlawFrame } = require("./services/recording.service");
+const { buildWav, decodeG711UlawFrame, TimelineRecorder } = require("./services/recording.service");
 
 // =========================
 // ENV 校验
@@ -63,9 +63,9 @@ const PORT                       = process.env.PORT                       || 100
 
 // AI 模型（可通过环境变量覆盖，无需重新部署）
 const REALTIME_MODEL       = process.env.OPENAI_REALTIME_MODEL      || "gpt-4o-realtime-preview";
+const REALTIME_VOICE       = process.env.OPENAI_REALTIME_VOICE      || "alloy";
 const TRANSCRIPTION_MODEL  = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
 const EXTRACTION_MODEL     = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-mini";
-const REALTIME_VOICE= process.env.OPENAI_REALTIME_VOICE      || "alloy";
 
 // =========================
 // 初始化 Services
@@ -323,8 +323,11 @@ app.post("/twilio/voice/status", (req, res) => {
 // 防止 stop + close 双重触发
 const finalizedCalls = new Set();
 
-function finalizeRecording(callSid, callerFrames, assistantFrames) {
+function finalizeRecording(callSid, recorder) {
   if (finalizedCalls.has(callSid)) return;
+
+  // 从录音器取出时间轴对齐的帧
+  const { callerFrames, assistantFrames } = recorder.finalize();
   if (!callerFrames.length && !assistantFrames.length) return;
   finalizedCalls.add(callSid);
 
@@ -333,8 +336,8 @@ function finalizeRecording(callSid, callerFrames, assistantFrames) {
     const session   = getOrCreateCallSession(callSid);
     session.recording = {
       wavBuffer,                          // Buffer in memory
-      _callerFrames:    callerFrames,
-      _assistantFrames: assistantFrames,
+      _callerFrames:    callerFrames,     // 时间轴对齐，含 null（静音）
+      _assistantFrames: assistantFrames,  // 时间轴对齐，含 null（静音）
       durationSec: Math.round(
         (callerFrames.length * 160) / 8000  // 160 samples/frame at 8kHz
       ),
@@ -436,11 +439,10 @@ wss.on("connection", async (twilioWs, request) => {
   let streamSid     = "";
   let assistantTranscriptBuffer = "";
 
-  // ─── 双声道录音缓冲区 ──────────────────────
-  // callerFrames: Twilio 发来的 g711_ulaw base64 帧（来电者声音）
-  // assistantFrames: OpenAI 返回的 g711_ulaw base64 帧（AI 声音）
-  const callerFrames    = [];
-  const assistantFrames = [];
+  // ─── 时间轴对齐录音器 ──────────────────────
+  // 用 Twilio 的 caller 媒体流作为时钟基准（每 20ms 一包），
+  // assistant 帧按实际到达时间对齐到同一时间轴
+  const recorder = new TimelineRecorder();
 
   console.log(`[WS] Twilio connected: ${activeCallSid}`);
 
@@ -517,7 +519,7 @@ wss.on("connection", async (twilioWs, request) => {
 
       // AI 音频增量 → 转发给 Twilio + 录入 assistant 缓冲
       if (data.type === "response.audio.delta" && data.delta) {
-        assistantFrames.push(data.delta);
+        recorder.pushAssistant(data.delta);
         if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify({
             event:     "media",
@@ -654,8 +656,8 @@ wss.on("connection", async (twilioWs, request) => {
 
         case "media":
           callSession.mediaPacketCount += 1;
-          // 录入 caller 声道缓冲
-          if (data.media?.payload) callerFrames.push(data.media.payload);
+          // 录入 caller 声道缓冲（时间轴基准）
+          if (data.media?.payload) recorder.pushCaller(data.media.payload);
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({
               type:  "input_audio_buffer.append",
@@ -670,8 +672,8 @@ wss.on("connection", async (twilioWs, request) => {
           callSession.updatedAt = new Date().toISOString();
           if (streamSid) streamToCallSid.delete(streamSid);
           if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-          // 合成双声道 WAV
-          finalizeRecording(activeCallSid, callerFrames, assistantFrames);
+          // 合成双声道 WAV（时间轴对齐）
+          finalizeRecording(activeCallSid, recorder);
           break;
       }
     } catch (err) {
@@ -686,7 +688,7 @@ wss.on("connection", async (twilioWs, request) => {
     if (streamSid) streamToCallSid.delete(streamSid);
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
     // 合成双声道 WAV（stop 事件没触发时的兜底）
-    finalizeRecording(activeCallSid, callerFrames, assistantFrames);
+    finalizeRecording(activeCallSid, recorder);
   });
 
   twilioWs.on("error", (err) => console.error("[Twilio] WS error:", err?.message));
