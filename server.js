@@ -1,5 +1,5 @@
 require("dotenv").config();
-
+app.use("/recordings", express.static(path.join(__dirname, "recordings")));
 const express = require("express");
 const http = require("http");
 const path = require("path");
