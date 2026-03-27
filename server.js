@@ -9,6 +9,16 @@ const session = require("express-session");
 const twilio = require("twilio");
 
 const {
+  ensureRecordingsDir,
+  ensureRecordingSession,
+  appendCallerAudio,
+  appendAssistantAudio,
+  finalizeRecording,
+  getRecordingInfo,
+  streamRecordingMedia,
+  cleanupExpiredRecordings,
+} = require("./services/recording.service");
+const {
   liveCalls,
   streamToCallSid,
   cleanText,
@@ -567,6 +577,7 @@ app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
 // =========================
 function twilioVoiceHandler(req, res) {
   const callSid = cleanText(req.body.CallSid || `call_${Date.now()}`);
+  ensureRecordingSession(callSid);
   const from = cleanText(req.body.From || "");
   const to = cleanText(req.body.To || "");
 
@@ -599,7 +610,58 @@ function twilioVoiceHandler(req, res) {
 
 app.post(TWILIO_VOICE_PATH, twilioVoiceHandler);
 app.post(TWILIO_VOICE_INCOMING_PATH, twilioVoiceHandler);
+// =========================
+// Recording APIs
+// =========================
 
+// 获取某通电话的录音信息
+app.get("/api/live-call/:callSid/recording", requireApiAuth, async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const info = await getRecordingInfo(callSid);
+
+    if (!info) {
+      return res.status(404).json({
+        ok: false,
+        error: "Recording not found",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      recording: info,
+    });
+  } catch (err) {
+    console.error("recording info error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to load recording info",
+    });
+  }
+});
+
+// 播放 / 下载录音媒体
+app.get("/api/live-call/:callSid/recording/media", requireApiAuth, async (req, res) => {
+  try {
+    await streamRecordingMedia(req.params.callSid, req, res);
+  } catch (err) {
+    console.error("recording media error:", err);
+    if (!res.headersSent) {
+      return res.status(500).json({
+        ok: false,
+        error: err.message || "Failed to stream recording",
+      });
+    }
+  }
+});
+
+// 可选：静态直链调试入口
+// 生产可保留，也可删掉
+app.use(
+  "/recordings",
+  requireApiAuth,
+  express.static(path.join(__dirname, "recordings"))
+);
 app.post(TWILIO_STATUS_PATH, (req, res) => {
   const callSid = req.body.CallSid || "";
   if (callSid) {
@@ -879,6 +941,7 @@ if (data.type === "response.audio.delta" && data.delta) {
   if (data.media?.payload) {
     try {
       await appendCallerAudio(activeCallSid, data.media.payload);
+      await appendCallerAudio(callSid, media.payload);
 
       const rec = getOrCreateCallSession(activeCallSid)?.recording;
       const call = getOrCreateCallSession(activeCallSid);
@@ -1006,6 +1069,9 @@ setTimeout(() => {
 // =========================
 // Start
 // =========================
+ensureRecordingsDir().catch((err) => {
+  console.error("Failed to ensure recordings dir:", err);
+});
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
  
