@@ -32,24 +32,8 @@ const {
 
 const { createCalendarService } = require("./services/calendar.service");
 const { createExtractionService } = require("./services/extraction.service");
-const { createRecordingService } = require("./services/recording.service");
 
-const recordingService = createRecordingService({
-  recordingsDir: path.join(__dirname, "recordings"),
-  retentionDays: parseInt(process.env.RECORDING_RETENTION_DAYS || "90", 10),
-  getOrCreateCallSession,
-  liveCalls,
-});
 
-const {
-  ensureRecordingSession,
-  appendCallerAudio,
-  appendAssistantAudio,
-  finalizeRecording,
-  getRecordingMeta,
-  streamRecordingMedia,
-  cleanupExpiredRecordings,
-} = recordingService;
 
 const app = express();
 const server = http.createServer(app);
@@ -797,6 +781,7 @@ if (data.type === "response.audio.delta" && data.delta) {
 
   try {
     await appendAssistantAudio(activeCallSid, data.delta);
+//    await appendAssistantAudio(callSid, audioDeltaBase64);
 
     const rec = getOrCreateCallSession(activeCallSid)?.recording;
     console.log("REC DEBUG assistant append", {
@@ -941,7 +926,7 @@ if (data.type === "response.audio.delta" && data.delta) {
   if (data.media?.payload) {
     try {
       await appendCallerAudio(activeCallSid, data.media.payload);
-      await appendCallerAudio(callSid, media.payload);
+//      await appendCallerAudio(callSid, media.payload);
 
       const rec = getOrCreateCallSession(activeCallSid)?.recording;
       const call = getOrCreateCallSession(activeCallSid);
