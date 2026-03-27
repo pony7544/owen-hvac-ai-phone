@@ -44,7 +44,7 @@ function createExtractionService(config = {}) {
       .join("\n");
 
     const response = await openai.responses.create({
-      model: "gpt-5-mini",
+      model: "gpt-4O-mini",
       input: [
         {
           role: "system",
