@@ -477,7 +477,7 @@ app.post(
 );
 
 app.get("/api/live-call/:callSid/recording", requireApiAuth, (req, res) => {
-  const result = getRecordingMeta(req.params.callSid);
+  const result = getRecordingInfo(req.params.callSid);
   if (!result.ok) {
     return res.status(404).json(result);
   }
