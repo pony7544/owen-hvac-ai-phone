@@ -44,6 +44,7 @@ const {
 
 const app = express();
 const server = http.createServer(app);
+app.use("/api/recording", express.static(path.join(__dirname, "recordings")));
 app.use("/recordings", express.static(path.join(__dirname, "recordings")));
 app.use(bodyParser.json());
 
@@ -427,11 +428,10 @@ app.get("/live", requireLiveAuth, (req, res) => {
 // =========================
 // Live APIs
 // =========================
-app.get("/api/live-calls", requireApiAuth, (req, res) => {
-  return res.json({
-    ok: true,
-    calls: getLatestCalls(50),
-  });
+app.get("/api/live-call/:callSid/recording/media", requireApiAuth, async (req, res) => {
+  const callSid = req.params.callSid;
+  return res.redirect(`/api/recording/${callSid}.mixed.mp3`);
+});
 });
 
 app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
