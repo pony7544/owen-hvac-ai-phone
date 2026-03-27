@@ -1,5 +1,5 @@
 require("dotenv").config();
-app.use("/recordings", express.static(path.join(__dirname, "recordings")));
+
 const express = require("express");
 const http = require("http");
 const path = require("path");
@@ -1020,4 +1020,5 @@ server.listen(PORT, () => {
   if (PUBLIC_WSS_URL) {
     console.log("Media stream base:", PUBLIC_WSS_URL + MEDIA_STREAM_PATH);
   }
+  app.use("/recordings", express.static(path.join(__dirname, "recordings")));
 });
