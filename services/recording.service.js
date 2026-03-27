@@ -96,33 +96,6 @@ function createRecordingService({
     await fsp.writeFile(filePath, Buffer.concat([header, pcm16Buffer]));
   }
 
-  function pcmStats(pcmBuf) {
-    const samples = Math.floor(pcmBuf.length / 2);
-    if (!samples) {
-      return { samples: 0, peak: 0, rms: 0, nonZero: 0, nonZeroPct: 0 };
-    }
-
-    let peak = 0;
-    let sumSq = 0;
-    let nonZero = 0;
-
-    for (let i = 0; i < samples; i++) {
-      const v = pcmBuf.readInt16LE(i * 2);
-      const a = Math.abs(v);
-      if (a > peak) peak = a;
-      if (a > 500) nonZero++;
-      sumSq += v * v;
-    }
-
-    return {
-      samples,
-      peak,
-      rms: Math.round(Math.sqrt(sumSq / samples)),
-      nonZero,
-      nonZeroPct: Math.round((nonZero / samples) * 10000) / 100,
-    };
-  }
-
   function runFfmpeg(args) {
     return new Promise((resolve, reject) => {
       const child = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -194,9 +167,6 @@ function createRecordingService({
 
         callerMulawPath: path.join(recordingsDir, `${safeBaseName}.caller.ulaw`),
         assistantMulawPath: path.join(recordingsDir, `${safeBaseName}.assistant.ulaw`),
-
-        callerWavPath: path.join(recordingsDir, `${safeBaseName}.caller.wav`),
-        assistantWavPath: path.join(recordingsDir, `${safeBaseName}.assistant.wav`),
         mixedWavPath: path.join(recordingsDir, `${safeBaseName}.mixed.wav`),
         mixedMp3Path: path.join(recordingsDir, `${safeBaseName}.mixed.mp3`),
       };
@@ -243,15 +213,6 @@ function createRecordingService({
       const callerMulaw = Buffer.concat(rec.callerChunks || []);
       const assistantMulaw = Buffer.concat(rec.assistantChunks || []);
 
-      console.log("REC SIZE DEBUG raw", {
-        callSid,
-        callerMulawBytes: callerMulaw.length,
-        assistantMulawBytes: assistantMulaw.length,
-        callerSecApprox: Math.round((callerMulaw.length / sampleRate) * 100) / 100,
-        assistantSecApprox:
-          Math.round((assistantMulaw.length / sampleRate) * 100) / 100,
-      });
-
       await fsp.writeFile(rec.callerMulawPath, callerMulaw);
       await fsp.writeFile(rec.assistantMulawPath, assistantMulaw);
 
@@ -259,35 +220,8 @@ function createRecordingService({
       const assistantPcm = decodeMulawBufferToPcm16Buffer(assistantMulaw);
       const mixedPcm = mixPcm16MonoBuffers(callerPcm, assistantPcm);
 
-      console.log("PCM ENERGY DEBUG", {
-        callSid,
-        caller: pcmStats(callerPcm),
-        assistant: pcmStats(assistantPcm),
-      });
-
-      console.log("REC SIZE DEBUG pcm", {
-        callSid,
-        callerPcmBytes: callerPcm.length,
-        assistantPcmBytes: assistantPcm.length,
-        mixedPcmBytes: mixedPcm.length,
-        mixedSecApprox:
-          Math.round(((mixedPcm.length / 2 / sampleRate) * 100)) / 100,
-      });
-
-      await writeWavFile(rec.callerWavPath, callerPcm);
-      await writeWavFile(rec.assistantWavPath, assistantPcm);
       await writeWavFile(rec.mixedWavPath, mixedPcm);
-
       await convertWavToMp3(rec.mixedWavPath, rec.mixedMp3Path);
-
-      const mixedWavStat = await fsp.stat(rec.mixedWavPath);
-      const mixedMp3Stat = await fsp.stat(rec.mixedMp3Path);
-
-      console.log("REC FILE DEBUG", {
-        callSid,
-        mixedWavBytes: mixedWavStat.size,
-        mixedMp3Bytes: mixedMp3Stat.size,
-      });
 
       rec.durationSec =
         Math.round(((mixedPcm.length / 2 / sampleRate) * 100)) / 100;
@@ -298,12 +232,9 @@ function createRecordingService({
       rec.callerChunks = [];
       rec.assistantChunks = [];
 
-      // 先保留诊断文件，确认问题后再改回删除
-      // await safeUnlink(rec.callerMulawPath);
-      // await safeUnlink(rec.assistantMulawPath);
-      // await safeUnlink(rec.callerWavPath);
-      // await safeUnlink(rec.assistantWavPath);
-      // await safeUnlink(rec.mixedWavPath);
+      await safeUnlink(rec.callerMulawPath);
+      await safeUnlink(rec.assistantMulawPath);
+      await safeUnlink(rec.mixedWavPath);
 
       sessionObj.updatedAt = new Date().toISOString();
       return rec;
@@ -319,14 +250,18 @@ function createRecordingService({
 
   function getRecordingMeta(callSid) {
     const sessionObj = liveCalls.get(callSid);
-    const rec = sessionObj?.recording;
+    if (!sessionObj) {
+      return { ok: false, error: "Call not found" };
+    }
+
+    const rec = sessionObj.recording || null;
 
     return {
-      callSid,
+      ok: true,
       recording: rec
         ? {
             available: !!rec.available && !rec.deletedAt,
-            status: rec.status || "unknown",
+            status: rec.status || "",
             durationSec: rec.durationSec || 0,
             createdAt: rec.createdAt || "",
             completedAt: rec.completedAt || "",
@@ -352,55 +287,37 @@ function createRecordingService({
     };
   }
 
- async function streamRecordingMedia(callSid, req, res) {
-  const sessionObj = liveCalls.get(callSid);
+  async function streamRecordingMedia(callSid, res) {
+    const sessionObj = liveCalls.get(callSid);
 
-  if (!sessionObj) {
-    return res.status(404).json({ ok: false, error: "Call not found" });
-  }
-
-  const rec = sessionObj.recording;
-  if (!rec?.mixedMp3Path || rec.deletedAt) {
-    return res.status(404).json({ ok: false, error: "Recording not available" });
-  }
-
-  await fsp.access(rec.mixedMp3Path, fs.constants.R_OK);
-  const stat = await fsp.stat(rec.mixedMp3Path);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Cache-Control", "private, max-age=60");
-
-  if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-    if (Number.isNaN(start) || Number.isNaN(end) || start > end || end >= fileSize) {
-      res.status(416).setHeader("Content-Range", `bytes */${fileSize}`);
-      return res.end();
+    if (!sessionObj) {
+      return res.status(404).json({ ok: false, error: "Call not found" });
     }
 
-    const chunkSize = end - start + 1;
-    res.status(206);
-    res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-    res.setHeader("Content-Length", chunkSize);
+    const rec = sessionObj.recording;
+    if (!rec?.mixedMp3Path || rec.deletedAt) {
+      return res.status(404).json({ ok: false, error: "Recording not available" });
+    }
 
-    return fs.createReadStream(rec.mixedMp3Path, { start, end }).pipe(res);
+    await fsp.access(rec.mixedMp3Path, fs.constants.R_OK);
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "private, max-age=60");
+
+    const stream = fs.createReadStream(rec.mixedMp3Path);
+    stream.on("error", (err) => {
+      console.error("recording stream error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: "Failed to read recording file" });
+      }
+    });
+    stream.pipe(res);
   }
-
-  res.setHeader("Content-Length", fileSize);
-  return fs.createReadStream(rec.mixedMp3Path).pipe(res);
-}
 
   async function deleteRecordingFiles(rec) {
     const paths = [
       rec?.callerMulawPath,
       rec?.assistantMulawPath,
-      rec?.callerWavPath,
-      rec?.assistantWavPath,
       rec?.mixedWavPath,
       rec?.mixedMp3Path,
     ].filter(Boolean);
