@@ -1,4 +1,10 @@
+// =============================================================
+// services/extraction.service.js
+// 用 gpt-4o-mini + JSON Schema 从对话记录中提取结构化预约信息
+// =============================================================
+
 const OpenAI = require("openai");
+const { buildExtractionSystemPrompt } = require("../prompts");
 
 function createExtractionService(config = {}) {
   const {
@@ -6,12 +12,12 @@ function createExtractionService(config = {}) {
     businessTimezone = "America/Halifax",
     getOrCreateCallSession,
     normalizePhone,
+    persistToRedis,
   } = config;
 
-  const openai = new OpenAI({
-    apiKey: openaiApiKey,
-  });
+  const openai = new OpenAI({ apiKey: openaiApiKey });
 
+  // ─── 标准化模型输出 ────────────────────────
   function normalizeExtractedFromModel(data = {}) {
     const preferredDate =
       typeof data.preferred_date === "string" ? data.preferred_date.trim() : "";
@@ -19,68 +25,36 @@ function createExtractionService(config = {}) {
       typeof data.preferred_time === "string" ? data.preferred_time.trim() : "";
 
     return {
-      intent: typeof data.intent === "string" ? data.intent.trim() : "",
-      callerName: typeof data.name === "string" ? data.name.trim() : "",
-      callbackNumber:
-        typeof data.phone === "string" && typeof normalizePhone === "function"
-          ? normalizePhone(data.phone)
-          : typeof data.phone === "string"
-          ? data.phone.trim()
-          : "",
-      serviceAddress:
-        typeof data.address === "string" ? data.address.trim() : "",
-      issueSummary: typeof data.issue === "string" ? data.issue.trim() : "",
+      intent:          typeof data.intent   === "string" ? data.intent.trim()   : "",
+      callerName:      typeof data.name     === "string" ? data.name.trim()     : "",
+      callbackNumber:  typeof data.phone    === "string" && typeof normalizePhone === "function"
+                         ? normalizePhone(data.phone)
+                         : typeof data.phone === "string" ? data.phone.trim() : "",
+      serviceAddress:  typeof data.address  === "string" ? data.address.trim()  : "",
+      issueSummary:    typeof data.issue    === "string" ? data.issue.trim()    : "",
       preferredDate,
       preferredTime,
-      preferredDateTime:
-        preferredDate && preferredTime ? `${preferredDate} ${preferredTime}` : "",
+      preferredDateTime: preferredDate && preferredTime ? `${preferredDate} ${preferredTime}` : "",
       bookingConfirmed: Boolean(data.booking_confirmed),
     };
   }
 
-  async function extractCallInfoWithOpenAI({ transcript, nowIso, timezone }) {
+  // ─── OpenAI 结构化抽取 ─────────────────────
+  async function extractCallInfoWithOpenAI({ transcript, nowIso }) {
     const transcriptText = transcript
       .map((x) => `${x.role}: ${x.text}`)
       .join("\n");
 
     const response = await openai.responses.create({
-      model: "gpt-4O-mini",
+      model: "gpt-4o-mini",
       input: [
         {
           role: "system",
-          content: [
-            {
-              type: "input_text",
-              text: `
-You extract structured booking information from an HVAC phone call transcript.
-
-Return only information clearly supported by the transcript.
-
-Current datetime: ${nowIso}
-Business timezone: ${timezone}
-
-Rules:
-- Return data matching the schema exactly.
-- Use empty string for unknown text fields.
-- Normalize preferred_date to YYYY-MM-DD when possible.
-- Normalize preferred_time to HH:MM in 24-hour format when possible.
-- booking_confirmed is true only if the caller clearly confirmed the booking summary or accepted the booking details.
-- If the assistant only asks for confirmation, that does not mean confirmed.
-- If the caller says "correct", "yes", "that's right", "正确", or equivalent after the summary, set booking_confirmed=true.
-- intent must be one of:
-  service_or_repair, quote_request, maintenance, new_installation, general_inquiry, other, or empty string.
-              `.trim(),
-            },
-          ],
+          content: [{ type: "input_text", text: buildExtractionSystemPrompt(nowIso) }],
         },
         {
           role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: transcriptText,
-            },
-          ],
+          content: [{ type: "input_text", text: transcriptText }],
         },
       ],
       text: {
@@ -92,24 +66,18 @@ Rules:
             type: "object",
             additionalProperties: false,
             properties: {
-              intent: { type: "string" },
-              name: { type: "string" },
-              phone: { type: "string" },
-              address: { type: "string" },
-              issue: { type: "string" },
-              preferred_date: { type: "string" },
-              preferred_time: { type: "string" },
-              booking_confirmed: { type: "boolean" },
+              intent:           { type: "string" },
+              name:             { type: "string" },
+              phone:            { type: "string" },
+              address:          { type: "string" },
+              issue:            { type: "string" },
+              preferred_date:   { type: "string" },
+              preferred_time:   { type: "string" },
+              booking_confirmed:{ type: "boolean" },
             },
             required: [
-              "intent",
-              "name",
-              "phone",
-              "address",
-              "issue",
-              "preferred_date",
-              "preferred_time",
-              "booking_confirmed",
+              "intent", "name", "phone", "address", "issue",
+              "preferred_date", "preferred_time", "booking_confirmed",
             ],
           },
         },
@@ -120,13 +88,12 @@ Rules:
     return JSON.parse(raw);
   }
 
+  // ─── 写回 session ──────────────────────────
   async function refreshStructuredCallInfo(callSid) {
     if (typeof getOrCreateCallSession !== "function") {
       throw new Error("getOrCreateCallSession is required");
     }
-
     const session = getOrCreateCallSession(callSid);
-
     if (!session.transcript || session.transcript.length === 0) {
       return session.extracted;
     }
@@ -134,44 +101,43 @@ Rules:
     const modelData = await extractCallInfoWithOpenAI({
       transcript: session.transcript,
       nowIso: new Date().toISOString(),
-      timezone: businessTimezone,
     });
 
     const normalized = normalizeExtractedFromModel(modelData);
 
-    session.extracted.intent = normalized.intent;
-    session.extracted.callerName = normalized.callerName;
-    session.extracted.callbackNumber = normalized.callbackNumber;
-    session.extracted.serviceAddress = normalized.serviceAddress;
-    session.extracted.issueSummary = normalized.issueSummary;
-    session.extracted.preferredDate = normalized.preferredDate;
-    session.extracted.preferredTime = normalized.preferredTime;
-    session.extracted.preferredDateTime = normalized.preferredDateTime;
-    session.extracted.bookingConfirmed = normalized.bookingConfirmed;
+    Object.assign(session.extracted, {
+      intent:           normalized.intent,
+      callerName:       normalized.callerName,
+      callbackNumber:   normalized.callbackNumber,
+      serviceAddress:   normalized.serviceAddress,
+      issueSummary:     normalized.issueSummary,
+      preferredDate:    normalized.preferredDate,
+      preferredTime:    normalized.preferredTime,
+      preferredDateTime:normalized.preferredDateTime,
+      bookingConfirmed: normalized.bookingConfirmed,
+    });
     session.updatedAt = new Date().toISOString();
+
+    if (typeof persistToRedis === "function") {
+      persistToRedis(callSid, session);
+    }
 
     return session.extracted;
   }
 
+  // ─── 防抖包装（同一通话最快 1200ms 触发一次）──
   async function refreshStructuredCallInfoDebounced(callSid, minIntervalMs = 1200) {
     if (typeof getOrCreateCallSession !== "function") {
       throw new Error("getOrCreateCallSession is required");
     }
-
     const session = getOrCreateCallSession(callSid);
     const now = Date.now();
 
-    if (session.extractionInFlight) {
-      return session.extracted;
-    }
-
-    if (now - session.lastExtractionAt < minIntervalMs) {
-      return session.extracted;
-    }
+    if (session.extractionInFlight) return session.extracted;
+    if (now - session.lastExtractionAt < minIntervalMs) return session.extracted;
 
     session.extractionInFlight = true;
     session.lastExtractionAt = now;
-
     try {
       return await refreshStructuredCallInfo(callSid);
     } finally {
@@ -187,6 +153,4 @@ Rules:
   };
 }
 
-module.exports = {
-  createExtractionService,
-};
+module.exports = { createExtractionService };
