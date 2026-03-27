@@ -528,6 +528,7 @@
       const badge = document.getElementById("recStatusBadge");
       const wrap  = document.getElementById("playerWrap");
       const note  = document.getElementById("recNotReadyNote");
+      const player = document.getElementById("recordingPlayer");
 
       if (rec?.available) {
         badge.textContent       = "Ready";
@@ -538,14 +539,21 @@
         badge.textContent       = "Not ready";
         badge.style.background  = "#f3f4f6";
         badge.style.color       = "#6b7280";
-        wrap.style.display      = "none";
-        note.style.display      = "block";
 
-        // Reset player
-        const player = document.getElementById("recordingPlayer");
-        player.pause();
-        player.removeAttribute("src");
-        player.load();
+        // Only reset player if it's NOT currently playing or loaded
+        // This prevents the 3-second polling from killing an active playback
+        if (player.paused && !player.src) {
+          wrap.style.display      = "none";
+          note.style.display      = "block";
+        }
+        // If player has a src (user clicked Play), keep the player visible
+        if (!player.getAttribute("src")) {
+          wrap.style.display      = "none";
+          note.style.display      = "block";
+          player.pause();
+          player.removeAttribute("src");
+          player.load();
+        }
       }
     }
 
