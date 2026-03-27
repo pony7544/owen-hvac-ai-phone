@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const path = require("path");
+app.use("/recordings", express.static(path.join(__dirname, "recordings")));
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const session = require("express-session");
