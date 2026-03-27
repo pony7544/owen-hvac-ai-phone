@@ -352,35 +352,48 @@ function createRecordingService({
     };
   }
 
-  async function streamRecordingMedia(callSid, res) {
-    const sessionObj = liveCalls.get(callSid);
+ async function streamRecordingMedia(callSid, req, res) {
+  const sessionObj = liveCalls.get(callSid);
 
-    if (!sessionObj) {
-      return res.status(404).json({ ok: false, error: "Call not found" });
-    }
-
-    const rec = sessionObj.recording;
-    if (!rec?.mixedMp3Path || rec.deletedAt) {
-      return res.status(404).json({ ok: false, error: "Recording not available" });
-    }
-
-    await fsp.access(rec.mixedMp3Path, fs.constants.R_OK);
-    const stat = await fsp.stat(rec.mixedMp3Path);
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Length", stat.size);
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "private, max-age=60");
-
-    const stream = fs.createReadStream(rec.mixedMp3Path);
-    stream.on("error", (err) => {
-      console.error("recording stream error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ ok: false, error: "Failed to read recording file" });
-      }
-    });
-    stream.pipe(res);
+  if (!sessionObj) {
+    return res.status(404).json({ ok: false, error: "Call not found" });
   }
+
+  const rec = sessionObj.recording;
+  if (!rec?.mixedMp3Path || rec.deletedAt) {
+    return res.status(404).json({ ok: false, error: "Recording not available" });
+  }
+
+  await fsp.access(rec.mixedMp3Path, fs.constants.R_OK);
+  const stat = await fsp.stat(rec.mixedMp3Path);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Cache-Control", "private, max-age=60");
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+    if (Number.isNaN(start) || Number.isNaN(end) || start > end || end >= fileSize) {
+      res.status(416).setHeader("Content-Range", `bytes */${fileSize}`);
+      return res.end();
+    }
+
+    const chunkSize = end - start + 1;
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+    res.setHeader("Content-Length", chunkSize);
+
+    return fs.createReadStream(rec.mixedMp3Path, { start, end }).pipe(res);
+  }
+
+  res.setHeader("Content-Length", fileSize);
+  return fs.createReadStream(rec.mixedMp3Path).pipe(res);
+}
 
   async function deleteRecordingFiles(rec) {
     const paths = [
