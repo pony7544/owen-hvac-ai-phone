@@ -5,7 +5,8 @@
 // =============================================================
 
 require("dotenv").config();
-
+const os = require("os");
+const fs = require("fs");
 const express    = require("express");
 const http       = require("http");
 const path       = require("path");
@@ -363,6 +364,10 @@ app.get("/api/live-call/:callSid/recording/info", requireApiAuth, (req, res) => 
 
 // GET /api/live-call/:callSid/recording/stream?channel=both|left|right
 // channel: both=双声道, left=caller only, right=assistant only
+// 修改后
+const os   = require("os");
+const fs   = require("fs");
+
 app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, (req, res) => {
   const call = liveCalls.get(req.params.callSid);
   if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
@@ -375,21 +380,31 @@ app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, (req, res) =
   const channel = req.query.channel || "both";
   let wavToSend = rec.wavBuffer;
 
-  // 如果要单声道，从双声道 WAV 里提取
   if (channel === "left" || channel === "right") {
     wavToSend = buildWav(
       channel === "left"  ? call.recording._callerFrames  || [] : [],
       channel === "right" ? call.recording._assistantFrames || [] : [],
-      true  // mono mode
+      true
     );
   }
 
-  res.setHeader("Content-Type", "audio/wav");
-  res.setHeader("Content-Length", wavToSend.length);
-  res.setHeader("Content-Disposition", `inline; filename="call-${req.params.callSid}.wav"`);
-  res.end(wavToSend);
+  // 写临时文件，让 sendFile 处理 Range 请求（支持 seek 和 Safari）
+  const tmpPath = path.join(os.tmpdir(), `hvac-rec-${req.params.callSid}-${channel}.wav`);
+  fs.writeFile(tmpPath, wavToSend, (writeErr) => {
+    if (writeErr) {
+      return res.status(500).json({ ok: false, error: "Failed to prepare recording" });
+    }
+    res.sendFile(tmpPath, {
+      headers: {
+        "Content-Type":        "audio/wav",
+        "Content-Disposition": `inline; filename="call-${req.params.callSid}.wav"`,
+      },
+    }, (sendErr) => {
+      // 响应发完后删除临时文件（静默失败无所谓）
+      fs.unlink(tmpPath, () => {});
+    });
+  });
 });
-
 // =========================
 // WebSocket — Twilio Media Streams
 // =========================
