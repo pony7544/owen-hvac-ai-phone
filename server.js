@@ -726,14 +726,22 @@ wss.on("connection", async (twilioWs, request) => {
         assistantTranscriptBuffer += data.delta;
       }
 
-      if (data.type === "response.audio.delta" && data.delta) {
+if (data.type === "response.audio.delta" && data.delta) {
   console.log("🔊 audio delta", {
     len: data.delta.length,
     streamSid,
+    activeCallSid,
   });
 
   try {
     await appendAssistantAudio(activeCallSid, data.delta);
+
+    const rec = getOrCreateCallSession(activeCallSid)?.recording;
+    console.log("REC DEBUG assistant append", {
+      activeCallSid,
+      callerChunks: rec?.callerChunks?.length || 0,
+      assistantChunks: rec?.assistantChunks?.length || 0,
+    });
   } catch (err) {
     console.error("append assistant audio error:", err?.message || err);
   }
@@ -814,45 +822,56 @@ wss.on("connection", async (twilioWs, request) => {
       const data = JSON.parse(msg.toString());
 
       switch (data.event) {
-        case "start": {
-          console.log(
-            "Twilio stream start:",
-            JSON.stringify(data.start, null, 2)
-          );
+       case "start": {
+  console.log(
+    "Twilio stream start:",
+    JSON.stringify(data.start, null, 2)
+  );
 
-          streamSid = data.start?.streamSid || "";
+  streamSid = data.start?.streamSid || "";
+  const startCallSid = resolveStartCallSid(data.start, urlCallSid);
 
-          const startCallSid = resolveStartCallSid(data.start, urlCallSid);
-          if (startCallSid && startCallSid !== activeCallSid) {
-            console.log(
-              `Merging call session from ${activeCallSid} -> ${startCallSid}`
-            );
-            sessionObj = mergeCallSessions(startCallSid, activeCallSid);
-            activeCallSid = startCallSid;
-          } else {
-            sessionObj = getOrCreateCallSession(activeCallSid);
-          }
+  if (startCallSid && startCallSid !== activeCallSid) {
+    console.log(
+      `Merging call session from ${activeCallSid} -> ${startCallSid}`
+    );
+    sessionObj = mergeCallSessions(startCallSid, activeCallSid);
+    activeCallSid = startCallSid;
+  } else {
+    sessionObj = getOrCreateCallSession(activeCallSid);
+  }
 
-          sessionObj.streamSid = streamSid || sessionObj.streamSid;
-          sessionObj.status = "in-progress";
-          sessionObj.from =
-            cleanText(data.start?.customParameters?.from || "") ||
-            sessionObj.from;
-          sessionObj.to =
-            cleanText(data.start?.customParameters?.to || "") || sessionObj.to;
-          sessionObj.updatedAt = new Date().toISOString();
+  // 关键修复：在最终 callSid 上立即绑定 recording
+  ensureRecordingSession(activeCallSid);
 
-          if (streamSid) {
-            streamToCallSid.set(streamSid, activeCallSid);
-          }
+  sessionObj = getOrCreateCallSession(activeCallSid);
+  sessionObj.streamSid = streamSid || sessionObj.streamSid;
+  sessionObj.status = "in-progress";
+  sessionObj.from =
+    cleanText(data.start?.customParameters?.from || "") ||
+    sessionObj.from;
+  sessionObj.to =
+    cleanText(data.start?.customParameters?.to || "") || sessionObj.to;
+  sessionObj.updatedAt = new Date().toISOString();
 
-          
-          break;
-        }
+  if (streamSid) {
+    streamToCallSid.set(streamSid, activeCallSid);
+  }
 
-        case "media": {
-  if (activeCallSid) {
-    const call = getOrCreateCallSession(activeCallSid);
+  console.log("REC DEBUG start", {
+    activeCallSid,
+    streamSid,
+    hasRecording: !!sessionObj.recording,
+    callerChunks: sessionObj.recording?.callerChunks?.length || 0,
+    assistantChunks: sessionObj.recording?.assistantChunks?.length || 0,
+  });
+
+  break;
+}
+
+       case "media": {
+  if (activeCallSid && liveCalls.has(activeCallSid)) {
+    const call = liveCalls.get(activeCallSid);
     call.mediaPacketCount = (call.mediaPacketCount || 0) + 1;
     call.updatedAt = new Date().toISOString();
   }
@@ -860,18 +879,26 @@ wss.on("connection", async (twilioWs, request) => {
   if (data.media?.payload) {
     try {
       await appendCallerAudio(activeCallSid, data.media.payload);
+
+      const rec = getOrCreateCallSession(activeCallSid)?.recording;
+      const call = getOrCreateCallSession(activeCallSid);
+
+      console.log("REC DEBUG caller append", {
+        activeCallSid,
+        mediaPacketCount: call?.mediaPacketCount || 0,
+        callerChunks: rec?.callerChunks?.length || 0,
+        assistantChunks: rec?.assistantChunks?.length || 0,
+      });
     } catch (err) {
       console.error("append caller audio error:", err?.message || err);
     }
   }
 
-  if (data.media?.payload && openaiWs.readyState === WebSocket.OPEN) {
-    openaiWs.send(
-      JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: data.media.payload,
-      })
-    );
+  if (openaiWs.readyState === WebSocket.OPEN && data.media?.payload) {
+    sendOpenAIEvent(openaiWs, {
+      type: "input_audio_buffer.append",
+      audio: data.media.payload,
+    });
   }
 
   break;
@@ -880,8 +907,9 @@ wss.on("connection", async (twilioWs, request) => {
         case "mark":
           break;
 
-        case "stop": {
+       case "stop": {
   console.log("Twilio stream stop");
+
   if (activeCallSid && liveCalls.has(activeCallSid)) {
     const call = liveCalls.get(activeCallSid);
     call.status = "completed";
@@ -889,6 +917,16 @@ wss.on("connection", async (twilioWs, request) => {
   }
 
   try {
+    const rec = getOrCreateCallSession(activeCallSid)?.recording;
+    const call = getOrCreateCallSession(activeCallSid);
+
+    console.log("REC DEBUG before finalize(stop)", {
+      activeCallSid,
+      mediaPacketCount: call?.mediaPacketCount || 0,
+      callerChunks: rec?.callerChunks?.length || 0,
+      assistantChunks: rec?.assistantChunks?.length || 0,
+    });
+
     await finalizeRecording(activeCallSid);
   } catch (err) {
     console.error("finalize recording error:", err?.message || err);
@@ -911,8 +949,9 @@ wss.on("connection", async (twilioWs, request) => {
     }
   });
 
-  twilioWs.on("close", async () => {
+ twilioWs.on("close", async () => {
   console.log("Twilio WS closed");
+
   if (activeCallSid && liveCalls.has(activeCallSid)) {
     const call = liveCalls.get(activeCallSid);
     if (call.status === "in-progress") {
@@ -922,6 +961,16 @@ wss.on("connection", async (twilioWs, request) => {
   }
 
   try {
+    const rec = getOrCreateCallSession(activeCallSid)?.recording;
+    const call = getOrCreateCallSession(activeCallSid);
+
+    console.log("REC DEBUG before finalize(close)", {
+      activeCallSid,
+      mediaPacketCount: call?.mediaPacketCount || 0,
+      callerChunks: rec?.callerChunks?.length || 0,
+      assistantChunks: rec?.assistantChunks?.length || 0,
+    });
+
     await finalizeRecording(activeCallSid);
   } catch (err) {
     console.error("finalize on close error:", err?.message || err);
