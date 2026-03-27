@@ -6,7 +6,6 @@
 
 require("dotenv").config();
 
-const fs = require("fs");
 const express    = require("express");
 const http       = require("http");
 const path       = require("path");
