@@ -6,22 +6,8 @@ const path = require("path");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
 const session = require("express-session");
-const twilio = require("twilio");
-
-const {
-  liveCalls,
-  streamToCallSid,
-  cleanText,
-  normalizePhone,
-  getOrCreateCallSession,
-  mergeCallSessions,
-  resolveStartCallSid,
-  pushTranscript,
-  buildCallSummary,
-} = require("./services/call-session.service");
-
-const { createCalendarService } = require("./services/calendar.service");
-const { createExtractionService } = require("./services/extraction.service");
+const { google } = require("googleapis");
+const OpenAI = require("openai");
 
 const app = express();
 const server = http.createServer(app);
@@ -38,7 +24,7 @@ app.use(
       httpOnly: true,
       sameSite: "lax",
       secure: false,
-      maxAge: 1000 * 60 * 60 * 12,
+      maxAge: 1000 * 60 * 60 * 12, // 12 hours
     },
   })
 );
@@ -51,8 +37,7 @@ const PORT = process.env.PORT || 10000;
 // =========================
 // ENV
 // =========================
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "Owen HVAC Corp";
 const BUSINESS_PHONE = process.env.BUSINESS_PHONE || "";
 const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || "America/Halifax";
@@ -61,94 +46,264 @@ const DEFAULT_APPOINTMENT_MINUTES = parseInt(
   10
 );
 
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
-const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
 
 const LIVE_ADMIN_USER = process.env.LIVE_ADMIN_USER || "admin";
 const LIVE_ADMIN_PASS = process.env.LIVE_ADMIN_PASS || "ChangeThisPassword123!";
 
-const REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
-const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "alloy";
-
-const PUBLIC_BASE_URL =
-  process.env.PUBLIC_BASE_URL ||
-  process.env.RENDER_EXTERNAL_URL ||
-  process.env.BASE_URL ||
-  "";
-
-const PUBLIC_WSS_URL =
-  process.env.PUBLIC_WSS_URL ||
-  (PUBLIC_BASE_URL.startsWith("https://")
-    ? PUBLIC_BASE_URL.replace(/^https:\/\//i, "wss://")
-    : PUBLIC_BASE_URL.startsWith("http://")
-    ? PUBLIC_BASE_URL.replace(/^http:\/\//i, "ws://")
-    : "");
-
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const RECORDING_RETENTION_DAYS = parseInt(
-  process.env.RECORDING_RETENTION_DAYS || "90",
-  10
-);
-
-const TWILIO_VOICE_PATH = "/twilio/voice";
-const TWILIO_VOICE_INCOMING_PATH = "/twilio/voice/incoming";
-const TWILIO_STATUS_PATH = "/twilio/voice/status";
-const RECORDING_STATUS_PATH = "/twilio/voice/recording-status";
-const MEDIA_STREAM_PATH = "/media-stream";
-
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    : null;
-
 if (!OPENAI_API_KEY) {
   console.warn("Missing OPENAI_API_KEY");
 }
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-  console.warn("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN");
+
+// =========================
+// OpenAI SDK
+// =========================
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+});
+
+// =========================
+// Google Calendar
+// =========================
+const oauth2Client = new google.auth.OAuth2(
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET
+);
+
+oauth2Client.setCredentials({
+  refresh_token: GOOGLE_REFRESH_TOKEN,
+});
+
+const calendar = google.calendar({
+  version: "v3",
+  auth: oauth2Client,
+});
+
+// =========================
+// In-memory call store
+// =========================
+const liveCalls = new Map();
+const streamToCallSid = new Map();
+/*
+liveCalls[callSid] = {
+  callSid,
+  streamSid,
+  from,
+  to,
+  status,
+  createdAt,
+  updatedAt,
+  transcript: [],
+  lastAssistantText: "",
+  extractionInFlight: false,
+  lastExtractionAt: 0,
+  mediaPacketCount: 0,
+  extracted: {
+    intent: "",
+    callerName: "",
+    callbackNumber: "",
+    serviceAddress: "",
+    issueSummary: "",
+    preferredDate: "",
+    preferredTime: "",
+    preferredDateTime: "",
+    bookingConfirmed: false,
+    appointmentCreated: false,
+    appointmentEventId: "",
+  }
 }
-
-// =========================
-// Services
-// =========================
-const calendarService = createCalendarService({
-  googleClientId: GOOGLE_CLIENT_ID,
-  googleClientSecret: GOOGLE_CLIENT_SECRET,
-  googleRefreshToken: GOOGLE_REFRESH_TOKEN,
-  googleCalendarId: GOOGLE_CALENDAR_ID,
-  businessTimezone: BUSINESS_TIMEZONE,
-  defaultAppointmentMinutes: DEFAULT_APPOINTMENT_MINUTES,
-  businessName: BUSINESS_NAME,
-  getOrCreateCallSession,
-});
-
-const extractionService = createExtractionService({
-  openaiApiKey: OPENAI_API_KEY,
-  businessTimezone: BUSINESS_TIMEZONE,
-  getOrCreateCallSession,
-  normalizePhone,
-});
-
-const {
-  testCalendarConnection,
-  listEventsForDay,
-  generateSlotsForDay,
-  createAppointmentEvent,
-  maybeAutoCreateAppointment,
-} = calendarService;
-
-const {
-  refreshStructuredCallInfo,
-  refreshStructuredCallInfoDebounced,
-} = extractionService;
+*/
 
 // =========================
 // Helpers
 // =========================
+function cleanText(s) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizePhone(phone) {
+  if (!phone) return "";
+  return phone.replace(/[^\d+]/g, "").trim();
+}
+
+function getOrCreateCallSession(callSid) {
+  if (!liveCalls.has(callSid)) {
+    liveCalls.set(callSid, {
+      callSid,
+      streamSid: "",
+      from: "",
+      to: "",
+      status: "new",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      transcript: [],
+      lastAssistantText: "",
+      extractionInFlight: false,
+      lastExtractionAt: 0,
+      mediaPacketCount: 0,
+      extracted: {
+        intent: "",
+        callerName: "",
+        callbackNumber: "",
+        serviceAddress: "",
+        issueSummary: "",
+        preferredDate: "",
+        preferredTime: "",
+        preferredDateTime: "",
+        bookingConfirmed: false,
+        appointmentCreated: false,
+        appointmentEventId: "",
+      },
+    });
+  }
+  return liveCalls.get(callSid);
+}
+
+function mergeCallSessions(targetSid, sourceSid) {
+  if (!targetSid && !sourceSid) return null;
+  if (!targetSid || !sourceSid || targetSid === sourceSid) {
+    return getOrCreateCallSession(targetSid || sourceSid);
+  }
+
+  const target = getOrCreateCallSession(targetSid);
+  const source = liveCalls.get(sourceSid);
+
+  if (!source) return target;
+
+  target.streamSid = target.streamSid || source.streamSid || "";
+  target.from = target.from || source.from || "";
+  target.to = target.to || source.to || "";
+  target.status = source.status || target.status;
+  target.updatedAt = new Date().toISOString();
+
+  if (Array.isArray(source.transcript) && source.transcript.length) {
+    target.transcript = [...target.transcript, ...source.transcript].sort(
+      (a, b) => new Date(a.ts) - new Date(b.ts)
+    );
+  }
+
+  target.lastAssistantText =
+    target.lastAssistantText || source.lastAssistantText || "";
+  target.extractionInFlight =
+    target.extractionInFlight || source.extractionInFlight || false;
+  target.lastExtractionAt = Math.max(
+    target.lastExtractionAt || 0,
+    source.lastExtractionAt || 0
+  );
+  target.mediaPacketCount =
+    (target.mediaPacketCount || 0) + (source.mediaPacketCount || 0);
+
+  target.extracted = {
+    ...source.extracted,
+    ...target.extracted,
+    intent: target.extracted.intent || source.extracted.intent || "",
+    callerName: target.extracted.callerName || source.extracted.callerName || "",
+    callbackNumber:
+      target.extracted.callbackNumber || source.extracted.callbackNumber || "",
+    serviceAddress:
+      target.extracted.serviceAddress || source.extracted.serviceAddress || "",
+    issueSummary:
+      target.extracted.issueSummary || source.extracted.issueSummary || "",
+    preferredDate:
+      target.extracted.preferredDate || source.extracted.preferredDate || "",
+    preferredTime:
+      target.extracted.preferredTime || source.extracted.preferredTime || "",
+    preferredDateTime:
+      target.extracted.preferredDateTime ||
+      source.extracted.preferredDateTime ||
+      "",
+    bookingConfirmed:
+      Boolean(target.extracted.bookingConfirmed) ||
+      Boolean(source.extracted.bookingConfirmed),
+    appointmentCreated:
+      Boolean(target.extracted.appointmentCreated) ||
+      Boolean(source.extracted.appointmentCreated),
+    appointmentEventId:
+      target.extracted.appointmentEventId ||
+      source.extracted.appointmentEventId ||
+      "",
+  };
+
+  if (source.streamSid) {
+    streamToCallSid.set(source.streamSid, targetSid);
+  }
+
+  liveCalls.delete(sourceSid);
+  return target;
+}
+
+function resolveStartCallSid(startData, fallbackCallSid = "") {
+  return (
+    startData?.callSid ||
+    startData?.customParameters?.callSid ||
+    fallbackCallSid ||
+    ""
+  );
+}
+
+function pushTranscript(callSid, role, text) {
+  const session = getOrCreateCallSession(callSid);
+  const cleaned = cleanText(text);
+  if (!cleaned) return;
+
+  session.transcript.push({
+    role,
+    text: cleaned,
+    ts: new Date().toISOString(),
+  });
+  session.updatedAt = new Date().toISOString();
+}
+
+function buildCallSummary(call) {
+  const f = call.extracted || {};
+  return {
+    callSid: call.callSid,
+    from: call.from || "",
+    to: call.to || "",
+    status: call.status || "",
+    createdAt: call.createdAt || "",
+    updatedAt: call.updatedAt || "",
+    intent: f.intent || "",
+    callerName: f.callerName || "",
+    callbackNumber: f.callbackNumber || "",
+    serviceAddress: f.serviceAddress || "",
+    issueSummary: f.issueSummary || "",
+    preferredDate: f.preferredDate || "",
+    preferredTime: f.preferredTime || "",
+    bookingConfirmed: !!f.bookingConfirmed,
+    appointmentCreated: !!f.appointmentCreated,
+    appointmentEventId: f.appointmentEventId || "",
+  };
+}
+
+function isValidIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function isValidHHMM(s) {
+  return /^\d{2}:\d{2}$/.test(s);
+}
+
+function parsePreferredDateTime(dateRaw, timeRaw, timezone = BUSINESS_TIMEZONE) {
+  if (!dateRaw || !timeRaw) return null;
+  if (!isValidIsoDate(dateRaw)) return null;
+  if (!isValidHHMM(timeRaw)) return null;
+
+  const start = new Date(`${dateRaw}T${timeRaw}:00`);
+  if (Number.isNaN(start.getTime())) return null;
+
+  const end = new Date(start.getTime() + DEFAULT_APPOINTMENT_MINUTES * 60000);
+
+  return {
+    start,
+    end,
+    timezone,
+  };
+}
+
 function requireLiveAuth(req, res, next) {
   if (req.session && req.session.liveAuthed) {
     return next();
@@ -163,114 +318,586 @@ function requireApiAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "Unauthorized" });
 }
 
-function escapeXml(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+// =========================
+// Calendar helpers
+// =========================
+async function testCalendarConnection() {
+  const res = await calendar.calendars.get({
+    calendarId: GOOGLE_CALENDAR_ID,
+  });
+  return res.data;
 }
 
-function buildHttpUrl(baseUrl, pathName) {
-  if (!baseUrl) return pathName;
-  return `${baseUrl}${pathName}`;
+async function listEventsForDay(dateStr) {
+  const dayStart = new Date(`${dateStr}T00:00:00`);
+  const dayEnd = new Date(`${dateStr}T23:59:59`);
+
+  const res = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    timeMin: dayStart.toISOString(),
+    timeMax: dayEnd.toISOString(),
+    singleEvents: true,
+    orderBy: "startTime",
+  });
+
+  return res.data.items || [];
 }
 
-function formatDisplayTime(iso, timeZone = BUSINESS_TIMEZONE) {
-  try {
-    return new Intl.DateTimeFormat("en-CA", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
-    }).format(new Date(iso));
-  } catch {
-    return iso;
+function generateSlotsForDay(dateStr, events, slotMinutes = 120) {
+  const slots = [];
+  const workStart = new Date(`${dateStr}T08:00:00`);
+  const workEnd = new Date(`${dateStr}T18:00:00`);
+
+  let cursor = new Date(workStart);
+
+  while (cursor < workEnd) {
+    const slotStart = new Date(cursor);
+    const slotEnd = new Date(cursor.getTime() + slotMinutes * 60000);
+
+    const overlaps = events.some((evt) => {
+      if (!evt.start?.dateTime || !evt.end?.dateTime) return false;
+      const evtStart = new Date(evt.start.dateTime);
+      const evtEnd = new Date(evt.end.dateTime);
+      return slotStart < evtEnd && slotEnd > evtStart;
+    });
+
+    if (!overlaps && slotEnd <= workEnd) {
+      slots.push({
+        start: slotStart.toISOString(),
+        end: slotEnd.toISOString(),
+      });
+    }
+
+    cursor = new Date(cursor.getTime() + slotMinutes * 60000);
   }
+
+  return slots;
 }
 
-function safeJsonParse(raw, fallback = null) {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return fallback;
+async function createAppointmentEvent(callSid) {
+  const session = getOrCreateCallSession(callSid);
+  const f = session.extracted;
+
+  const parsed = parsePreferredDateTime(f.preferredDate, f.preferredTime);
+  if (!parsed) {
+    throw new Error("Unable to parse normalized preferred date/time.");
   }
+
+  const event = {
+    summary: `Service Call - ${f.callerName || "Customer"}`,
+    location: f.serviceAddress || "",
+    description: [
+      `Customer Name: ${f.callerName || ""}`,
+      `Phone: ${f.callbackNumber || ""}`,
+      `Address: ${f.serviceAddress || ""}`,
+      `Issue: ${f.issueSummary || ""}`,
+      `Call SID: ${callSid}`,
+      `Booked by AI phone assistant for ${BUSINESS_NAME}.`,
+    ].join("\n"),
+    start: {
+      dateTime: parsed.start.toISOString(),
+      timeZone: parsed.timezone,
+    },
+    end: {
+      dateTime: parsed.end.toISOString(),
+      timeZone: parsed.timezone,
+    },
+  };
+
+  const res = await calendar.events.insert({
+    calendarId: GOOGLE_CALENDAR_ID,
+    requestBody: event,
+  });
+
+  session.extracted.appointmentCreated = true;
+  session.extracted.appointmentEventId = res.data.id || "";
+  session.updatedAt = new Date().toISOString();
+
+  return res.data;
 }
 
-function getTodayDateInBusinessTimezone() {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: BUSINESS_TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
+async function maybeAutoCreateAppointment(callSid) {
+  const session = getOrCreateCallSession(callSid);
+  const f = session.extracted;
 
-  const year = parts.find((p) => p.type === "year")?.value || "2000";
-  const month = parts.find((p) => p.type === "month")?.value || "01";
-  const day = parts.find((p) => p.type === "day")?.value || "01";
-  return `${year}-${month}-${day}`;
+  if (f.appointmentCreated) return null;
+  if (!f.bookingConfirmed) return null;
+
+  if (
+    !f.callerName ||
+    !f.callbackNumber ||
+    !f.serviceAddress ||
+    !f.issueSummary ||
+    !f.preferredDate ||
+    !f.preferredTime
+  ) {
+    return null;
+  }
+
+  return await createAppointmentEvent(callSid);
 }
 
-function addDaysIso(dateLike, days) {
-  const d = new Date(dateLike || Date.now());
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString();
-}
+// =========================
+// Structured extraction
+// =========================
+function normalizeExtractedFromModel(data = {}) {
+  const preferredDate =
+    typeof data.preferred_date === "string" ? data.preferred_date.trim() : "";
+  const preferredTime =
+    typeof data.preferred_time === "string" ? data.preferred_time.trim() : "";
 
-function getCallPublicData(sessionObj) {
   return {
-    callSid: sessionObj.callSid,
-    streamSid: sessionObj.streamSid || "",
-    from: sessionObj.from || "",
-    to: sessionObj.to || "",
-    status: sessionObj.status || "",
-    createdAt: sessionObj.createdAt || "",
-    updatedAt: sessionObj.updatedAt || "",
-    mediaPacketCount: sessionObj.mediaPacketCount || 0,
-    lastAssistantText: sessionObj.lastAssistantText || "",
-    extracted: sessionObj.extracted || {},
-    transcript: Array.isArray(sessionObj.transcript) ? sessionObj.transcript : [],
-    summary: buildCallSummary(sessionObj),
-
-    recording: sessionObj.recording
-      ? {
-          enabled: true,
-          status: sessionObj.recording.status || "",
-          recordingSid: sessionObj.recording.recordingSid || "",
-          durationSec: sessionObj.recording.durationSec || 0,
-          createdAt: sessionObj.recording.createdAt || "",
-          completedAt: sessionObj.recording.completedAt || "",
-          expiresAt: sessionObj.recording.expiresAt || "",
-          deletedAt: sessionObj.recording.deletedAt || "",
-          available: !!sessionObj.recording.available,
-        }
-      : {
-          enabled: false,
-          status: "not-started",
-          recordingSid: "",
-          durationSec: 0,
-          createdAt: "",
-          completedAt: "",
-          expiresAt: "",
-          deletedAt: "",
-          available: false,
-        },
+    intent: typeof data.intent === "string" ? data.intent.trim() : "",
+    callerName: typeof data.name === "string" ? data.name.trim() : "",
+    callbackNumber:
+      typeof data.phone === "string" ? normalizePhone(data.phone) : "",
+    serviceAddress:
+      typeof data.address === "string" ? data.address.trim() : "",
+    issueSummary:
+      typeof data.issue === "string" ? data.issue.trim() : "",
+    preferredDate,
+    preferredTime,
+    preferredDateTime:
+      preferredDate && preferredTime ? `${preferredDate} ${preferredTime}` : "",
+    bookingConfirmed: Boolean(data.booking_confirmed),
   };
 }
 
-function getLatestCalls(limit = 20) {
-  return Array.from(liveCalls.values())
-    .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))
-    .slice(0, limit)
-    .map(getCallPublicData);
+async function extractCallInfoWithOpenAI({ transcript, nowIso, timezone }) {
+  const transcriptText = transcript.map((x) => `${x.role}: ${x.text}`).join("\n");
+
+  const response = await openai.responses.create({
+    model: "gpt-5-mini",
+    input: [
+      {
+        role: "system",
+        content: [
+          {
+            type: "input_text",
+            text: `
+You extract structured booking information from an HVAC phone call transcript.
+
+Return only information clearly supported by the transcript.
+
+Current datetime: ${nowIso}
+Business timezone: ${timezone}
+
+Rules:
+- Return data matching the schema exactly.
+- Use empty string for unknown text fields.
+- Normalize preferred_date to YYYY-MM-DD when possible.
+- Normalize preferred_time to HH:MM in 24-hour format when possible.
+- booking_confirmed is true only if the caller clearly confirmed the booking summary or accepted the booking details.
+- If the assistant only asks for confirmation, that does not mean confirmed.
+- If the caller says "correct", "yes", "that's right", "正确", or equivalent after the summary, set booking_confirmed=true.
+- intent must be one of:
+  service_or_repair, quote_request, maintenance, new_installation, general_inquiry, other, or empty string.
+            `.trim(),
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: transcriptText,
+          },
+        ],
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "call_info_extraction",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            intent: { type: "string" },
+            name: { type: "string" },
+            phone: { type: "string" },
+            address: { type: "string" },
+            issue: { type: "string" },
+            preferred_date: { type: "string" },
+            preferred_time: { type: "string" },
+            booking_confirmed: { type: "boolean" },
+          },
+          required: [
+            "intent",
+            "name",
+            "phone",
+            "address",
+            "issue",
+            "preferred_date",
+            "preferred_time",
+            "booking_confirmed",
+          ],
+        },
+      },
+    },
+  });
+
+  const raw = response.output_text || "{}";
+  return JSON.parse(raw);
 }
 
-function buildSystemPrompt() {
-  return `
+async function refreshStructuredCallInfo(callSid) {
+  const session = getOrCreateCallSession(callSid);
+
+  if (!session.transcript || session.transcript.length === 0) {
+    return session.extracted;
+  }
+
+  const modelData = await extractCallInfoWithOpenAI({
+    transcript: session.transcript,
+    nowIso: new Date().toISOString(),
+    timezone: BUSINESS_TIMEZONE,
+  });
+
+  const normalized = normalizeExtractedFromModel(modelData);
+
+  session.extracted.intent = normalized.intent;
+  session.extracted.callerName = normalized.callerName;
+  session.extracted.callbackNumber = normalized.callbackNumber;
+  session.extracted.serviceAddress = normalized.serviceAddress;
+  session.extracted.issueSummary = normalized.issueSummary;
+  session.extracted.preferredDate = normalized.preferredDate;
+  session.extracted.preferredTime = normalized.preferredTime;
+  session.extracted.preferredDateTime = normalized.preferredDateTime;
+  session.extracted.bookingConfirmed = normalized.bookingConfirmed;
+  session.updatedAt = new Date().toISOString();
+
+  return session.extracted;
+}
+
+async function refreshStructuredCallInfoDebounced(callSid, minIntervalMs = 1200) {
+  const session = getOrCreateCallSession(callSid);
+  const now = Date.now();
+
+  if (session.extractionInFlight) {
+    return session.extracted;
+  }
+
+  if (now - session.lastExtractionAt < minIntervalMs) {
+    return session.extracted;
+  }
+
+  session.extractionInFlight = true;
+  session.lastExtractionAt = now;
+
+  try {
+    return await refreshStructuredCallInfo(callSid);
+  } finally {
+    session.extractionInFlight = false;
+  }
+}
+
+// =========================
+// Page routes
+// =========================
+app.get("/", (req, res) => {
+  res.send("Owen HVAC AI phone server is running.");
+});
+
+app.get("/login", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "login.html"));
+});
+
+app.post("/login", (req, res) => {
+  const username = cleanText(req.body.username);
+  const password = req.body.password || "";
+
+  if (username === LIVE_ADMIN_USER && password === LIVE_ADMIN_PASS) {
+    req.session.liveAuthed = true;
+    req.session.liveUser = username;
+    return res.redirect("/live");
+  }
+
+  return res.status(401).send(`
+    <html>
+      <body style="font-family: Arial; padding: 24px;">
+        <h3>Login failed</h3>
+        <p>Invalid username or password.</p>
+        <p><a href="/login">Back to login</a></p>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.redirect("/login");
+  });
+});
+
+app.get("/live", requireLiveAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "live.html"));
+});
+
+// =========================
+// Live dashboard APIs
+// =========================
+app.get("/api/live/calls", requireApiAuth, (req, res) => {
+  const calls = Array.from(liveCalls.values())
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .map((c) => buildCallSummary(c));
+
+  res.json({
+    ok: true,
+    calls,
+  });
+});
+
+app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
+  const callSid = req.params.callSid;
+  const call = liveCalls.get(callSid);
+
+  if (!call) {
+    return res.status(404).json({ ok: false, error: "Call not found" });
+  }
+
+  return res.json({
+    ok: true,
+    call: {
+      callSid: call.callSid,
+      from: call.from,
+      to: call.to,
+      status: call.status,
+      streamSid: call.streamSid,
+      createdAt: call.createdAt,
+      updatedAt: call.updatedAt,
+      transcript: call.transcript,
+      extracted: call.extracted,
+    },
+  });
+});
+
+app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
+  try {
+    const cal = await testCalendarConnection();
+
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const dd = String(today.getDate()).padStart(2, "0");
+    const date = `${yyyy}-${mm}-${dd}`;
+
+    const events = await listEventsForDay(date);
+    const slots = generateSlotsForDay(date, events, 120);
+
+    res.json({
+      ok: true,
+      connected: true,
+      calendarId: cal.id || GOOGLE_CALENDAR_ID,
+      summary: cal.summary || "",
+      timeZone: cal.timeZone || BUSINESS_TIMEZONE,
+      todayDate: date,
+      todayEventCount: events.length,
+      todayAvailableSlots: slots.length,
+      slots,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      connected: false,
+      error: err?.message || "Calendar status failed",
+    });
+  }
+});
+
+app.post("/api/live-call/:callSid/reextract", requireApiAuth, async (req, res) => {
+  try {
+    const callSid = req.params.callSid;
+    const extracted = await refreshStructuredCallInfo(callSid);
+
+    let created = null;
+    try {
+      created = await maybeAutoCreateAppointment(callSid);
+    } catch (err) {
+      console.error("Reextract auto-create failed:", err?.message || err);
+    }
+
+    res.json({
+      ok: true,
+      extracted,
+      createdEventId: created?.id || null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Re-extract failed",
+    });
+  }
+});
+
+app.post("/api/live-call/:callSid/create-appointment", requireApiAuth, async (req, res) => {
+  try {
+    const event = await createAppointmentEvent(req.params.callSid);
+    res.json({
+      ok: true,
+      eventId: event.id,
+      htmlLink: event.htmlLink,
+      event,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Create appointment failed",
+    });
+  }
+});
+
+// =========================
+// Calendar public/test APIs
+// =========================
+app.get("/test/calendar", async (req, res) => {
+  try {
+    const data = await testCalendarConnection();
+    res.json({ ok: true, calendar: data });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Calendar connection failed",
+    });
+  }
+});
+
+app.get("/appointments/availability", async (req, res) => {
+  try {
+    const date = req.query.date;
+    if (!date) {
+      return res.status(400).json({ ok: false, error: "Missing date" });
+    }
+
+    const events = await listEventsForDay(date);
+    const slots = generateSlotsForDay(date, events, 120);
+
+    res.json({
+      ok: true,
+      date,
+      timezone: BUSINESS_TIMEZONE,
+      slots,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || "Failed to get availability",
+    });
+  }
+});
+
+// =========================
+// Twilio voice webhook routes
+// =========================
+function twilioVoiceHandler(req, res) {
+  console.log("VOICE WEBHOOK content-type:", req.headers["content-type"]);
+  console.log("VOICE WEBHOOK body:", req.body);
+
+  const callSid = req.body.CallSid || `call_${Date.now()}`;
+  const from = req.body.From || "";
+  const to = req.body.To || "";
+
+  const session = getOrCreateCallSession(callSid);
+  session.from = from;
+  session.to = to;
+  session.status = "initiated";
+  session.updatedAt = new Date().toISOString();
+
+  const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!wsUrl) {
+    return res
+      .status(500)
+      .send("Missing PUBLIC_WSS_URL or RENDER_EXTERNAL_URL in environment.");
+  }
+
+  const streamUrl = wsUrl.startsWith("https://")
+    ? wsUrl.replace("https://", "wss://")
+    : wsUrl.startsWith("http://")
+    ? wsUrl.replace("http://", "ws://")
+    : wsUrl;
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Hello, thank you for calling ${BUSINESS_NAME}. Please hold while I connect you.</Say>
+  <Connect>
+    <Stream url="${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}" />
+  </Connect>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+}
+
+app.post("/twilio/voice", twilioVoiceHandler);
+app.post("/twilio/voice/incoming", twilioVoiceHandler);
+
+app.post("/twilio/voice/status", (req, res) => {
+  const callSid = req.body.CallSid || "";
+
+  if (callSid) {
+    const session = getOrCreateCallSession(callSid);
+    session.status = req.body.CallStatus || session.status;
+    session.from = req.body.From || session.from;
+    session.to = req.body.To || session.to;
+    session.updatedAt = new Date().toISOString();
+  }
+
+  console.log("Twilio Status Callback:", req.body);
+  res.sendStatus(200);
+});
+
+// =========================
+// WebSocket server for Twilio Media Streams
+// =========================
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const { url } = request;
+
+  if (url.startsWith("/media-stream")) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on("connection", async (twilioWs, request) => {
+  const urlObj = new URL(request.url, `http://${request.headers.host}`);
+
+  const urlCallSid =
+    urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
+
+  let activeCallSid = urlCallSid;
+  let session = getOrCreateCallSession(activeCallSid);
+
+  console.log(`Twilio media stream connected: initial=${activeCallSid}`);
+
+  let streamSid = "";
+  let assistantTranscriptBuffer = "";
+
+  const openaiWs = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
+
+  openaiWs.on("open", () => {
+    console.log("Connected to OpenAI Realtime");
+
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        modalities: ["audio","text"],
+        instructions: `
 You are the phone receptionist for ${BUSINESS_NAME}, an HVAC company.
+
 Your job is to speak naturally and help callers with:
 - service
 - repair
@@ -296,543 +923,8 @@ Rules:
 - Do not invent customer details.
 - Use English unless the caller speaks another language.
 - Speak naturally as a receptionist.
-`.trim();
-}
-
-function sendOpenAIEvent(ws, event) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(event));
-  }
-}
-
-async function startCallRecording(callSid) {
-  if (!twilioClient || !callSid) return null;
-
-  const sessionObj = getOrCreateCallSession(callSid);
-
-  if (sessionObj.recording?.recordingSid || sessionObj.recording?.starting) {
-    return sessionObj.recording || null;
-  }
-
-  sessionObj.recording = {
-    ...(sessionObj.recording || {}),
-    starting: true,
-    status: "starting",
-    available: false,
-    createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
-    expiresAt:
-      sessionObj.recording?.expiresAt ||
-      addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
-  };
-  sessionObj.updatedAt = new Date().toISOString();
-
-  const statusCallback = buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH);
-
-  try {
-    const recording = await twilioClient.calls(callSid).recordings.create({
-      recordingStatusCallback: statusCallback,
-      recordingStatusCallbackEvent: ["in-progress", "completed", "absent"],
-      recordingChannels: "dual",
-      recordingTrack: "both",
-      trim: "do-not-trim",
-    });
-
-    sessionObj.recording = {
-      ...(sessionObj.recording || {}),
-      starting: false,
-      status: recording.status || "in-progress",
-      recordingSid: recording.sid,
-      available: false,
-      createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
-      expiresAt:
-        sessionObj.recording?.expiresAt ||
-        addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
-    };
-    sessionObj.updatedAt = new Date().toISOString();
-
-    return sessionObj.recording;
-  } catch (err) {
-    sessionObj.recording = {
-      ...(sessionObj.recording || {}),
-      starting: false,
-      status: "failed",
-      available: false,
-      error: err.message || "Failed to start recording",
-    };
-    sessionObj.updatedAt = new Date().toISOString();
-    throw err;
-  }
-}
-
-async function deleteRecordingIfExpired(sessionObj) {
-  if (!twilioClient || !sessionObj?.recording?.recordingSid) return false;
-  if (sessionObj.recording.deletedAt) return false;
-
-  const expiresAt = sessionObj.recording.expiresAt
-    ? new Date(sessionObj.recording.expiresAt).getTime()
-    : 0;
-
-  if (!expiresAt || Date.now() < expiresAt) return false;
-
-  await twilioClient.recordings(sessionObj.recording.recordingSid).remove();
-
-  sessionObj.recording.deletedAt = new Date().toISOString();
-  sessionObj.recording.available = false;
-  sessionObj.recording.status = "deleted";
-  sessionObj.updatedAt = new Date().toISOString();
-
-  return true;
-}
-
-async function cleanupExpiredRecordings() {
-  const calls = Array.from(liveCalls.values());
-  for (const sessionObj of calls) {
-    try {
-      await deleteRecordingIfExpired(sessionObj);
-    } catch (err) {
-      console.error(
-        `cleanup recording failed for ${sessionObj.callSid}:`,
-        err?.message || err
-      );
-    }
-  }
-}
-
-// =========================
-// Page Routes
-// =========================
-app.get("/", (req, res) => {
-  res.send("Owen HVAC AI phone server is running.");
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "owen-hvac-ai-phone",
-    time: new Date().toISOString(),
-    publicBaseUrl: PUBLIC_BASE_URL,
-    publicWssUrl: PUBLIC_WSS_URL,
-    voiceWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH),
-    statusWebhook: buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH),
-    recordingWebhook: buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH),
-    mediaStreamPath: MEDIA_STREAM_PATH,
-  });
-});
-
-app.get("/login", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "login.html"));
-});
-
-app.post("/login", (req, res) => {
-  const username = cleanText(req.body.username);
-  const password = req.body.password || "";
-
-  if (username === LIVE_ADMIN_USER && password === LIVE_ADMIN_PASS) {
-    req.session.liveAuthed = true;
-    req.session.liveUser = username;
-    return res.redirect("/live");
-  }
-
-  return res.status(401).send(`
-    <h3>Login failed</h3>
-    <p>Invalid username or password.</p>
-    <p><a href="/login">Back to login</a></p>
-  `);
-});
-
-app.get("/logout", (req, res) => {
-  req.session.destroy(() => {
-    res.redirect("/login");
-  });
-});
-
-app.post("/logout", (req, res) => {
-  req.session.destroy(() => {
-    res.redirect("/login");
-  });
-});
-
-app.get("/live", requireLiveAuth, (req, res) => {
-  const liveHtmlPath = path.join(__dirname, "public", "live.html");
-  res.sendFile(liveHtmlPath, (err) => {
-    if (!err) return;
-
-    res.send(`
-      <!doctype html>
-      <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Live Calls</title>
-        <style>
-          body { font-family: Arial, sans-serif; margin: 20px; }
-          pre { background: #f4f4f4; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
-          .row { margin-bottom: 16px; }
-          button { padding: 8px 12px; }
-        </style>
-      </head>
-      <body>
-        <h2>Owen HVAC Live Calls</h2>
-        <div class="row"><a href="/logout">Logout</a></div>
-        <div class="row"><button onclick="loadCalls()">Refresh</button></div>
-        <pre id="out">Loading...</pre>
-        <script>
-          async function loadCalls() {
-            const res = await fetch('/api/live-calls');
-            const data = await res.json();
-            document.getElementById('out').textContent =
-              JSON.stringify(data, null, 2);
-          }
-          loadCalls();
-          setInterval(loadCalls, 2000);
-        </script>
-      </body>
-      </html>
-    `);
-  });
-});
-
-// =========================
-// Live APIs
-// =========================
-app.get("/api/live-calls", requireApiAuth, (req, res) => {
-  return res.json({
-    ok: true,
-    calls: getLatestCalls(50),
-  });
-});
-
-app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
-  const callSid = req.params.callSid;
-  const sessionObj = liveCalls.get(callSid);
-
-  if (!sessionObj) {
-    return res.status(404).json({ ok: false, error: "Call not found" });
-  }
-
-  return res.json({
-    ok: true,
-    call: getCallPublicData(sessionObj),
-  });
-});
-
-app.post(
-  "/api/live-call/:callSid/refresh-extraction",
-  requireApiAuth,
-  async (req, res) => {
-    try {
-      const callSid = req.params.callSid;
-      const extracted = await refreshStructuredCallInfo(callSid);
-      return res.json({ ok: true, extracted });
-    } catch (err) {
-      console.error("refresh extraction error:", err);
-      return res.status(500).json({
-        ok: false,
-        error: err.message || "Failed to refresh extraction",
-      });
-    }
-  }
-);
-
-app.post(
-  "/api/live-call/:callSid/create-appointment",
-  requireApiAuth,
-  async (req, res) => {
-    try {
-      const callSid = req.params.callSid;
-      const event = await createAppointmentEvent(callSid);
-      return res.json({ ok: true, event });
-    } catch (err) {
-      console.error("create appointment error:", err);
-      return res.status(500).json({
-        ok: false,
-        error: err.message || "Failed to create appointment",
-      });
-    }
-  }
-);
-
-app.get("/api/live-call/:callSid/recording", requireApiAuth, (req, res) => {
-  const callSid = req.params.callSid;
-  const sessionObj = liveCalls.get(callSid);
-
-  if (!sessionObj) {
-    return res.status(404).json({ ok: false, error: "Call not found" });
-  }
-
-  const rec = sessionObj.recording || null;
-
-  return res.json({
-    ok: true,
-    recording: rec
-      ? {
-          available: !!rec.available && !rec.deletedAt,
-          status: rec.status || "",
-          recordingSid: rec.recordingSid || "",
-          durationSec: rec.durationSec || 0,
-          expiresAt: rec.expiresAt || "",
-          deletedAt: rec.deletedAt || "",
-          streamUrl:
-            rec.available && !rec.deletedAt
-              ? `/api/live-call/${encodeURIComponent(callSid)}/recording/media`
-              : "",
-        }
-      : {
-          available: false,
-          status: "not-started",
-          recordingSid: "",
-          durationSec: 0,
-          expiresAt: "",
-          deletedAt: "",
-          streamUrl: "",
-        },
-  });
-});
-
-app.get(
-  "/api/live-call/:callSid/recording/media",
-  requireApiAuth,
-  async (req, res) => {
-    try {
-      const callSid = req.params.callSid;
-      const sessionObj = liveCalls.get(callSid);
-
-      if (!sessionObj) {
-        return res.status(404).json({ ok: false, error: "Call not found" });
-      }
-
-      const rec = sessionObj.recording;
-      if (!rec?.recordingSid || rec.deletedAt) {
-        return res
-          .status(404)
-          .json({ ok: false, error: "Recording not available" });
-      }
-
-      const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
-        TWILIO_ACCOUNT_SID
-      )}/Recordings/${encodeURIComponent(rec.recordingSid)}.mp3`;
-
-      const auth = Buffer.from(
-        `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-      ).toString("base64");
-
-      const response = await fetch(mediaUrl, {
-        headers: {
-          Authorization: `Basic ${auth}`,
-        },
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        return res.status(response.status).send(text);
-      }
-
-      res.setHeader("Content-Type", "audio/mpeg");
-      res.setHeader("Cache-Control", "private, max-age=60");
-
-      const arrayBuffer = await response.arrayBuffer();
-      return res.send(Buffer.from(arrayBuffer));
-    } catch (err) {
-      console.error("recording media proxy error:", err);
-      return res.status(500).json({
-        ok: false,
-        error: err.message || "Failed to load recording media",
-      });
-    }
-  }
-);
-
-// =========================
-// Calendar APIs
-// =========================
-app.get("/test/calendar", async (req, res) => {
-  try {
-    const data = await testCalendarConnection();
-    res.json({ ok: true, calendar: data });
-  } catch (err) {
-    res.json({ ok: false, error: err.message });
-  }
-});
-
-app.get("/appointments/availability", async (req, res) => {
-  try {
-    const date = cleanText(req.query.date || getTodayDateInBusinessTimezone());
-    const slotMinutes = parseInt(req.query.slotMinutes || "120", 10);
-
-    const events = await listEventsForDay(date);
-    const slots = generateSlotsForDay(date, events, slotMinutes);
-
-    res.json({
-      ok: true,
-      date,
-      slotMinutes,
-      slots: slots.map((s) => ({
-        ...s,
-        displayStart: formatDisplayTime(s.start),
-        displayEnd: formatDisplayTime(s.end),
-      })),
-    });
-  } catch (err) {
-    res.json({ ok: false, error: err.message });
-  }
-});
-
-app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
-  try {
-    const todayDate = getTodayDateInBusinessTimezone();
-    const calendar = await testCalendarConnection();
-    const events = await listEventsForDay(todayDate);
-    const slots = generateSlotsForDay(todayDate, events, 120);
-
-    res.json({
-      connected: true,
-      calendarId: calendar?.id || GOOGLE_CALENDAR_ID,
-      summary: calendar?.summary || "",
-      timeZone: calendar?.timeZone || BUSINESS_TIMEZONE,
-      todayDate,
-      todayEventCount: Array.isArray(events) ? events.length : 0,
-      todayAvailableSlots: Array.isArray(slots) ? slots.length : 0,
-    });
-  } catch (err) {
-    res.status(500).json({
-      connected: false,
-      error: err.message || "Calendar status failed",
-    });
-  }
-});
-
-// =========================
-// Twilio Voice Webhook
-// =========================
-function twilioVoiceHandler(req, res) {
-  const callSid = cleanText(req.body.CallSid || `call_${Date.now()}`);
-  const from = cleanText(req.body.From || "");
-  const to = cleanText(req.body.To || "");
-
-  const sessionObj = getOrCreateCallSession(callSid);
-  sessionObj.from = from || sessionObj.from;
-  sessionObj.to = to || sessionObj.to;
-  sessionObj.status = "initiated";
-  sessionObj.updatedAt = new Date().toISOString();
-
-  const streamBase =
-    PUBLIC_WSS_URL || (req.headers.host ? `wss://${req.headers.host}` : "");
-
-  const streamUrl = `${streamBase}${MEDIA_STREAM_PATH}?callSid=${encodeURIComponent(
-    callSid
-  )}`;
-
-  const twiml = `
-<Response>
-  <Say voice="alice">Hello, you have reached ${escapeXml(
-    BUSINESS_NAME
-  )}. This call may be recorded for quality and training purposes. Please hold while I connect you.</Say>
-  <Connect>
-    <Stream url="${escapeXml(streamUrl)}" />
-  </Connect>
-</Response>
-`.trim();
-
-  res.type("text/xml").send(twiml);
-}
-
-app.post(TWILIO_VOICE_PATH, twilioVoiceHandler);
-app.post(TWILIO_VOICE_INCOMING_PATH, twilioVoiceHandler);
-
-app.post(TWILIO_STATUS_PATH, (req, res) => {
-  const callSid = req.body.CallSid || "";
-  if (callSid) {
-    const sessionObj = getOrCreateCallSession(callSid);
-    sessionObj.status = req.body.CallStatus || sessionObj.status;
-    sessionObj.from = req.body.From || sessionObj.from;
-    sessionObj.to = req.body.To || sessionObj.to;
-    sessionObj.updatedAt = new Date().toISOString();
-  }
-  console.log("Twilio Status Callback:", req.body);
-  res.sendStatus(200);
-});
-
-app.post(RECORDING_STATUS_PATH, (req, res) => {
-  const callSid = cleanText(req.body.CallSid || "");
-  const recordingSid = cleanText(req.body.RecordingSid || "");
-  const recordingUrl = cleanText(req.body.RecordingUrl || "");
-  const recordingStatus = cleanText(req.body.RecordingStatus || "");
-  const recordingDuration = parseInt(req.body.RecordingDuration || "0", 10) || 0;
-
-  if (callSid) {
-    const sessionObj = getOrCreateCallSession(callSid);
-    sessionObj.recording = {
-      ...(sessionObj.recording || {}),
-      recordingSid: recordingSid || sessionObj.recording?.recordingSid || "",
-      status: recordingStatus || sessionObj.recording?.status || "",
-      durationSec: recordingDuration,
-      createdAt: sessionObj.recording?.createdAt || new Date().toISOString(),
-      completedAt:
-        recordingStatus === "completed"
-          ? new Date().toISOString()
-          : sessionObj.recording?.completedAt || "",
-      expiresAt:
-        sessionObj.recording?.expiresAt ||
-        addDaysIso(new Date(), RECORDING_RETENTION_DAYS),
-      available: recordingStatus === "completed",
-      sourceUrl: recordingUrl || sessionObj.recording?.sourceUrl || "",
-    };
-    sessionObj.updatedAt = new Date().toISOString();
-  }
-
-  console.log("Twilio Recording Callback:", req.body);
-  res.sendStatus(200);
-});
-
-// =========================
-// WebSocket server for Twilio Media Streams
-// =========================
-const wss = new WebSocket.Server({ noServer: true });
-
-server.on("upgrade", (request, socket, head) => {
-  const { url } = request || {};
-  if (url && url.startsWith(MEDIA_STREAM_PATH)) {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
-    });
-  } else {
-    socket.destroy();
-  }
-});
-
-wss.on("connection", async (twilioWs, request) => {
-  const urlObj = new URL(request.url, `http://${request.headers.host}`);
-  const urlCallSid =
-    urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
-
-  let activeCallSid = urlCallSid;
-  let sessionObj = getOrCreateCallSession(activeCallSid);
-
-  console.log(`Twilio media stream connected: initial=${activeCallSid}`);
-
-  let streamSid = "";
-  let assistantTranscriptBuffer = "";
-
-  const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
-      REALTIME_MODEL
-    )}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
-
-  openaiWs.on("open", () => {
-    console.log("Connected to OpenAI Realtime");
-
-    const sessionUpdate = {
-      type: "session.update",
-      session: {
-        modalities: ["audio", "text"],
-        instructions: buildSystemPrompt(),
-        voice: REALTIME_VOICE,
+        `.trim(),
+        voice: "alloy",
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         input_audio_transcription: {
@@ -846,130 +938,112 @@ wss.on("connection", async (twilioWs, request) => {
       },
     };
 
-    sendOpenAIEvent(openaiWs, sessionUpdate);
+    openaiWs.send(JSON.stringify(sessionUpdate));
 
-    sendOpenAIEvent(openaiWs, {
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions: "Greet the caller and ask how you can help today.",
-      },
-    });
+    openaiWs.send(
+      JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio","text"],
+          instructions: "Greet the caller and ask how you can help today.",
+        },
+      })
+    );
   });
 
   openaiWs.on("message", async (message) => {
-    try {
-      const data = JSON.parse(message.toString());
-      console.log("OpenAI event type:", data.type);
+  try {
+    const data = JSON.parse(message.toString());
 
-      if (
-        data.type === "conversation.item.input_audio_transcription.completed" &&
-        data.transcript
-      ) {
-        const callerText = cleanText(data.transcript);
-        if (callerText) {
-          console.log("Caller:", callerText);
-          pushTranscript(activeCallSid, "caller", callerText);
+    console.log("OpenAI event type:", data.type);
 
-          try {
-            await refreshStructuredCallInfoDebounced(activeCallSid);
-          } catch (err) {
-            console.error(
-              "Structured extraction after caller failed:",
-              err?.message || err
-            );
-          }
+    // ===== 来电者转写完成 =====
+    if (
+      data.type === "conversation.item.input_audio_transcription.completed" &&
+      data.transcript
+    ) {
+      const callerText = cleanText(data.transcript);
+      if (callerText) {
+        console.log("Caller:", callerText);
+        pushTranscript(activeCallSid, "caller", callerText);
 
-          try {
-            await maybeAutoCreateAppointment(activeCallSid);
-          } catch (err) {
-            console.error(
-              "Auto-create appointment after caller failed:",
-              err?.message || err
-            );
-          }
+        try {
+          await refreshStructuredCallInfoDebounced(activeCallSid);
+        } catch (err) {
+          console.error("Structured extraction after caller failed:", err?.message || err);
+        }
+
+        try {
+          await maybeAutoCreateAppointment(activeCallSid);
+        } catch (err) {
+          console.error("Auto-create appointment after caller failed:", err?.message || err);
         }
       }
-
-      if (data.type === "response.audio_transcript.delta" && data.delta) {
-        assistantTranscriptBuffer += data.delta;
-      }
-
-      if (data.type === "response.audio.delta" && data.delta) {
-        console.log("🔊 audio delta", {
-          len: data.delta.length,
-          streamSid,
-        });
-
-        if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: {
-                payload: data.delta,
-              },
-            })
-          );
-          console.log("✅ sent audio to Twilio");
-        } else {
-          console.log("❌ Twilio not ready or streamSid missing");
-        }
-      }
-
-      if (data.type === "response.audio.done") {
-        console.log("🔊 audio done");
-      }
-
-      if (data.type === "response.done") {
-        const assistantText = cleanText(assistantTranscriptBuffer);
-        console.log("🤖 response done", assistantText);
-
-        if (assistantText) {
-          pushTranscript(activeCallSid, "assistant", assistantText);
-          assistantTranscriptBuffer = "";
-
-          try {
-            await refreshStructuredCallInfoDebounced(activeCallSid);
-          } catch (err) {
-            console.error(
-              "Structured extraction after assistant failed:",
-              err?.message || err
-            );
-          }
-
-          try {
-            await maybeAutoCreateAppointment(activeCallSid);
-          } catch (err) {
-            console.error("Auto-create appointment failed:", err?.message || err);
-          }
-        } else {
-          assistantTranscriptBuffer = "";
-        }
-      }
-
-      if (data.type === "error") {
-        console.error(
-          "OpenAI realtime error event:",
-          JSON.stringify(data, null, 2)
-        );
-      }
-    } catch (err) {
-      console.error("OpenAI message parse error:", err?.message || err);
     }
-  });
+
+    // ===== AI 语音转写文本增量 =====
+    if (data.type === "response.audio_transcript.delta" && data.delta) {
+      assistantTranscriptBuffer += data.delta;
+    }
+
+    // ===== AI 音频输出给 Twilio =====
+    if (data.type === "response.audio.delta" && data.delta) {
+      console.log("🔊 audio delta", {
+        len: data.delta.length,
+        streamSid,
+      });
+
+      if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: {
+              payload: data.delta,
+            },
+          })
+        );
+        console.log("✅ sent audio to Twilio");
+      } else {
+        console.log("❌ Twilio not ready or streamSid missing");
+      }
+    }
+
+    if (data.type === "response.audio.done") {
+      console.log("🔊 audio done");
+    }
+
+    // ===== AI 一轮响应结束，保存助手文本 =====
+    if (data.type === "response.done") {
+      const assistantText = cleanText(assistantTranscriptBuffer);
+      console.log("🤖 response done", assistantText);
+
+      if (assistantText) {
+        pushTranscript(activeCallSid, "assistant", assistantText);
+        assistantTranscriptBuffer = "";
+
+        try {
+          await refreshStructuredCallInfoDebounced(activeCallSid);
+        } catch (err) {
+          console.error("Structured extraction after assistant failed:", err?.message || err);
+        }
+
+        try {
+          await maybeAutoCreateAppointment(activeCallSid);
+        } catch (err) {
+          console.error("Auto-create appointment failed:", err?.message || err);
+        }
+      } else {
+        assistantTranscriptBuffer = "";
+      }
+    }
+  } catch (err) {
+    console.error("OpenAI message parse error:", err?.message || err);
+  }
+});
 
   openaiWs.on("error", (err) => {
     console.error("OpenAI WS error:", err?.message || err);
-  });
-
-  openaiWs.on("close", (code, reason) => {
-    console.log("OpenAI WS closed:", code, reason ? reason.toString() : "");
-    try {
-      if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.close();
-      }
-    } catch {}
   });
 
   twilioWs.on("message", async (msg) => {
@@ -978,108 +1052,95 @@ wss.on("connection", async (twilioWs, request) => {
 
       switch (data.event) {
         case "start": {
-          console.log(
-            "Twilio stream start:",
-            JSON.stringify(data.start, null, 2)
-          );
+          console.log("Twilio stream start:", JSON.stringify(data.start, null, 2));
 
           streamSid = data.start?.streamSid || "";
-
           const startCallSid = resolveStartCallSid(data.start, urlCallSid);
+
           if (startCallSid && startCallSid !== activeCallSid) {
             console.log(
-              `Merging call session from ${activeCallSid} -> ${startCallSid}`
+              `Rebinding media stream session from ${activeCallSid} -> ${startCallSid}`
             );
-            sessionObj = mergeCallSessions(startCallSid, activeCallSid);
-            activeCallSid = startCallSid;
-          } else {
-            sessionObj = getOrCreateCallSession(activeCallSid);
-          }
 
-          sessionObj.streamSid = streamSid || sessionObj.streamSid;
-          sessionObj.status = "in-progress";
-          sessionObj.from =
-            cleanText(data.start?.customParameters?.from || "") ||
-            sessionObj.from;
-          sessionObj.to =
-            cleanText(data.start?.customParameters?.to || "") || sessionObj.to;
-          sessionObj.updatedAt = new Date().toISOString();
+            mergeCallSessions(startCallSid, activeCallSid);
+            activeCallSid = startCallSid;
+            session = getOrCreateCallSession(activeCallSid);
+          }
 
           if (streamSid) {
             streamToCallSid.set(streamSid, activeCallSid);
           }
 
-          try {
-            await startCallRecording(activeCallSid);
-          } catch (err) {
-            console.error("start recording error:", err?.message || err);
-          }
+          session.streamSid = streamSid;
+          session.status = "in_progress";
+          session.updatedAt = new Date().toISOString();
 
+          console.log({
+            urlCallSid,
+            startCallSid,
+            activeCallSid,
+            streamSid,
+          });
           break;
         }
 
-        case "media": {
-          if (activeCallSid) {
-            const call = getOrCreateCallSession(activeCallSid);
-            call.mediaPacketCount = (call.mediaPacketCount || 0) + 1;
-            call.updatedAt = new Date().toISOString();
+        case "media":
+          session.mediaPacketCount += 1;
+
+          if (session.mediaPacketCount % 50 === 0) {
+            console.log(
+              `Incoming media packets for ${activeCallSid}: ${session.mediaPacketCount}`
+            );
           }
 
-          if (data.media?.payload && openaiWs.readyState === WebSocket.OPEN) {
+          if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(
               JSON.stringify({
                 type: "input_audio_buffer.append",
                 audio: data.media.payload,
               })
             );
+          } else {
+            console.log(
+              `OpenAI WS not open for ${activeCallSid}, state=${openaiWs.readyState}`
+            );
+          }
+          break;
+
+        case "stop":
+          console.log(`Twilio stream stop for ${activeCallSid}`);
+          session.status = "stream_closed";
+          session.updatedAt = new Date().toISOString();
+
+          if (streamSid) {
+            streamToCallSid.delete(streamSid);
           }
 
-          break;
-        }
-
-        case "mark":
-          break;
-
-        case "stop": {
-          console.log("Twilio stream stop");
-          if (activeCallSid && liveCalls.has(activeCallSid)) {
-            const call = liveCalls.get(activeCallSid);
-            call.status = "completed";
-            call.updatedAt = new Date().toISOString();
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.close();
           }
-
-          try {
-            if (openaiWs.readyState === WebSocket.OPEN) {
-              openaiWs.close();
-            }
-          } catch {}
-
           break;
-        }
 
         default:
           break;
       }
     } catch (err) {
-      console.error("Twilio WS message error:", err?.message || err);
+      console.error("Twilio message error:", err?.message || err);
     }
   });
 
   twilioWs.on("close", () => {
-    console.log("Twilio WS closed");
-    if (activeCallSid && liveCalls.has(activeCallSid)) {
-      const call = liveCalls.get(activeCallSid);
-      if (call.status === "in-progress") {
-        call.status = "completed";
-      }
-      call.updatedAt = new Date().toISOString();
+    console.log(`Twilio WS closed: ${activeCallSid}`);
+    session.status = "stream_closed";
+    session.updatedAt = new Date().toISOString();
+
+    if (streamSid) {
+      streamToCallSid.delete(streamSid);
     }
 
-    try {
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.close();
-      }
-    } catch {}
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
   });
 
   twilioWs.on("error", (err) => {
@@ -1088,29 +1149,8 @@ wss.on("connection", async (twilioWs, request) => {
 });
 
 // =========================
-// Background cleanup
-// =========================
-setTimeout(() => {
-  cleanupExpiredRecordings().catch(console.error);
-  setInterval(() => {
-    cleanupExpiredRecordings().catch(console.error);
-  }, 24 * 60 * 60 * 1000);
-}, 60 * 1000);
-
-// =========================
-// Start
+// Start server
 // =========================
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-  if (PUBLIC_BASE_URL) {
-    console.log("Voice webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_VOICE_PATH));
-    console.log("Status webhook:", buildHttpUrl(PUBLIC_BASE_URL, TWILIO_STATUS_PATH));
-    console.log(
-      "Recording webhook:",
-      buildHttpUrl(PUBLIC_BASE_URL, RECORDING_STATUS_PATH)
-    );
-  }
-  if (PUBLIC_WSS_URL) {
-    console.log("Media stream base:", PUBLIC_WSS_URL + MEDIA_STREAM_PATH);
-  }
 });
