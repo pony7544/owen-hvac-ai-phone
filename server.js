@@ -1003,6 +1003,44 @@ setTimeout(() => {
     cleanupExpiredRecordings().catch(console.error);
   }, 24 * 60 * 60 * 1000);
 }, 60 * 1000);
+
+app.get("/api/recording/:callSid/:type", async (req, res) => {
+  try {
+    const { callSid, type } = req.params;
+
+    const session = liveCalls.get(callSid);
+    const rec = session?.recording;
+
+    if (!rec) {
+      return res.status(404).json({ error: "Recording not found" });
+    }
+
+    let filePath = null;
+
+    if (type === "caller") filePath = rec.callerWavPath;
+    if (type === "assistant") filePath = rec.assistantWavPath;
+    if (type === "mixed") filePath = rec.mixedWavPath;
+    if (type === "mp3") filePath = rec.mixedMp3Path;
+
+    if (!filePath) {
+      return res.status(400).json({ error: "Invalid type" });
+    }
+
+    await fsp.access(filePath);
+
+    const stat = await fsp.stat(filePath);
+
+    res.setHeader("Content-Length", stat.size);
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Content-Disposition", `attachment; filename=${path.basename(filePath)}`);
+
+    fs.createReadStream(filePath).pipe(res);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Download failed" });
+  }
+});
 // =========================
 // Start
 // =========================
@@ -1020,5 +1058,5 @@ server.listen(PORT, () => {
   if (PUBLIC_WSS_URL) {
     console.log("Media stream base:", PUBLIC_WSS_URL + MEDIA_STREAM_PATH);
   }
-  app.use("/recordings", express.static(path.join(__dirname, "recordings")));
+  
 });
