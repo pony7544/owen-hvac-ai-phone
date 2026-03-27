@@ -494,7 +494,7 @@ app.get("/api/live-call/:callSid/recording", requireApiAuth, (req, res) => {
 
 app.get("/api/live-call/:callSid/recording/media", requireApiAuth, async (req, res) => {
   try {
-    await streamRecordingMedia(req.params.callSid, res);
+    await streamRecordingMedia(req.params.callSid, req, res);
   } catch (err) {
     console.error("recording media error:", err);
     return res.status(500).json({
