@@ -486,8 +486,9 @@ wss.on("connection", async (twilioWs, request) => {
         input_audio_transcription: { model: TRANSCRIPTION_MODEL },
         turn_detection: {
           type:                 "server_vad",
-          silence_duration_ms:  700,
-          prefix_padding_ms:    300,
+          threshold:            0.5,           // 语音检测灵敏度（0-1），越低越容易检测到 caller 说话
+          silence_duration_ms:  500,           // 500ms 静音即认为 caller 说完（原 700ms）
+          prefix_padding_ms:    300,           // 保留 caller 开始说话前 300ms 的音频
         },
       },
     }));
