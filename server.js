@@ -176,6 +176,7 @@ app.get("/api/live/calls", requireApiAuth, (_req, res) => {
 app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
   const call = liveCalls.get(req.params.callSid);
   if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
+  const rec = call.recording;
   return res.json({
     ok: true,
     call: {
@@ -188,6 +189,11 @@ app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
       updatedAt:  call.updatedAt,
       transcript: call.transcript,
       extracted:  call.extracted,
+      recording:  rec ? {
+        available:   !!rec.available,
+        durationSec: rec.durationSec,
+        createdAt:   rec.createdAt,
+      } : null,
     },
   });
 });
