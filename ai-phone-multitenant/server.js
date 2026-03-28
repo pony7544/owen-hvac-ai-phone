@@ -602,6 +602,12 @@ wss.on("connection", async (twilioWs, request) => {
   twilioWs.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
+
+      // 调试：记录所有非 media 事件
+      if (data.event !== "media") {
+        console.log(`[Twilio] event=${data.event}`, JSON.stringify(data).substring(0, 300));
+      }
+
       switch (data.event) {
         case "start": {
           streamSid = data.start?.streamSid || "";
