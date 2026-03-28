@@ -487,6 +487,11 @@ wss.on("connection", async (twilioWs, request) => {
     try {
       const data = JSON.parse(message.toString());
 
+      // 记录 OpenAI 发来的错误
+      if (data.type === "error") {
+        console.error(`[OpenAI] Error event:`, JSON.stringify(data.error || data));
+      }
+
       if (data.type === "conversation.item.input_audio_transcription.completed" && data.transcript) {
         const t = cleanText(data.transcript);
         if (t) { console.log("[Caller]", t); pushTranscript(activeCallSid, "caller", t);
@@ -576,7 +581,7 @@ wss.on("connection", async (twilioWs, request) => {
   });
 
   openaiWs.on("error", (err) => console.error("[OpenAI] WS error:", err?.message));
-  openaiWs.on("close", () => console.log("[OpenAI] disconnected"));
+  openaiWs.on("close", (code, reason) => console.log(`[OpenAI] disconnected code=${code} reason=${reason?.toString() || ''}`));
 
   // ─── Twilio → OpenAI ─────────────────────
   twilioWs.on("message", async (msg) => {
