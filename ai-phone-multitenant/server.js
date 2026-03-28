@@ -58,6 +58,8 @@ const extractionService = createExtractionService({
 
 // callSid → tenantId 映射
 const callTenantMap = new Map();
+// 待匹配的 callSid 队列（webhook 创建，WS 连接时消费）
+const pendingCallSids = [];
 
 // =========================
 // Express App
@@ -359,6 +361,8 @@ app.post("/twilio/voice/:tenantId", (req, res) => {
 
   // 绑定 callSid → tenantId
   callTenantMap.set(callSid, tenantId);
+  // 放入待匹配队列，WS 连接时消费
+  pendingCallSids.push({ callSid, ts: Date.now() });
 
   const callSession = getOrCreateCallSession(callSid);
   callSession.tenantId = tenantId;
@@ -435,7 +439,23 @@ server.on("upgrade", (request, socket, head) => {
 
 wss.on("connection", async (twilioWs, request) => {
   const urlObj = new URL(request.url, `http://${request.headers.host}`);
-  const urlCallSid = urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
+  let urlCallSid = urlObj.searchParams.get("callSid") || "";
+
+  console.log(`[WS] Raw URL callSid: "${urlCallSid}", pending queue size: ${pendingCallSids.length}`);
+
+  // 如果 URL 参数没有真正的 Twilio CallSid（CA开头），从 pending 队列取
+  if (!urlCallSid || !urlCallSid.startsWith("CA")) {
+    const now = Date.now();
+    while (pendingCallSids.length && now - pendingCallSids[0].ts > 30000) pendingCallSids.shift();
+    const pending = pendingCallSids.shift();
+    if (pending) {
+      urlCallSid = pending.callSid;
+      console.log(`[WS] Matched pending callSid: ${urlCallSid}`);
+    } else {
+      urlCallSid = urlCallSid || `call_${Date.now()}`;
+      console.log(`[WS] No pending match, using fallback: ${urlCallSid}`);
+    }
+  }
 
   await restoreCallSession(urlCallSid);
 
@@ -445,9 +465,29 @@ wss.on("connection", async (twilioWs, request) => {
   let assistantTranscriptBuffer = "";
   let sessionConfigured = false;
   let recordingStarted = false;
-  let tenantExtractionPrompt = "";   // 租户自定义的 extraction prompt
+  let tenantExtractionPrompt = "";
+  let endCallTriggered = false;        // end_call 是否已触发
+  let goodbyeTimer = null;             // 告别后的自动挂断计时器
 
   const recorder = new TimelineRecorder();
+
+  // 强制挂断函数
+  function forceHangup(reason) {
+    if (endCallTriggered) return;
+    endCallTriggered = true;
+    console.log(`[ForceHangup] ${activeCallSid}, reason: ${reason}`);
+    setTimeout(async () => {
+      try {
+        if (twilioClient && activeCallSid.startsWith("CA")) {
+          await twilioClient.calls(activeCallSid).update({ status: "completed" });
+          console.log(`[ForceHangup] Successfully hung up ${activeCallSid}`);
+        } else {
+          if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+          if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+        }
+      } catch (e) { console.error("[ForceHangup] failed:", e?.message); }
+    }, 2000);
+  }
 
   console.log(`[WS] Connected: ${activeCallSid}`);
 
@@ -544,6 +584,22 @@ wss.on("connection", async (twilioWs, request) => {
         assistantTranscriptBuffer = "";
         if (t) { console.log("[Assistant]", t); pushTranscript(activeCallSid, "assistant", t);
           try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {} }
+
+        // 检测 AI 是否在说再见 — 如果是，启动自动挂断计时器
+        if (t && !endCallTriggered) {
+          const lower = t.toLowerCase();
+          const goodbyePatterns = ["goodbye", "bye", "再见", "see you", "have a great day", "take care", "au revoir", "bonne journée"];
+          const isGoodbye = goodbyePatterns.some(p => lower.includes(p));
+          if (isGoodbye) {
+            if (goodbyeTimer) clearTimeout(goodbyeTimer);
+            goodbyeTimer = setTimeout(() => {
+              if (!endCallTriggered) {
+                console.log(`[AutoHangup] AI said goodbye but didn't call end_call, forcing hangup`);
+                forceHangup("ai_said_goodbye_no_end_call");
+              }
+            }, 8000);  // 8 秒后如果 end_call 还没触发就强制挂断
+          }
+        }
       }
 
       // Function Calling
@@ -596,12 +652,8 @@ wss.on("connection", async (twilioWs, request) => {
             const reason = fnArgs.reason || "complete";
             console.log(`[EndCall] ${activeCallSid}, reason: ${reason}`);
             toolResult = "Call ending now.";
-            setTimeout(async () => {
-              try {
-                if (twilioClient) await twilioClient.calls(activeCallSid).update({ status: "completed" });
-                else { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); }
-              } catch (e) { console.error("[EndCall] failed:", e?.message); }
-            }, 3000);
+            if (goodbyeTimer) { clearTimeout(goodbyeTimer); goodbyeTimer = null; }
+            forceHangup(reason);
           }
 
           if (openaiWs.readyState === WebSocket.OPEN) {
