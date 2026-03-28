@@ -310,9 +310,7 @@ function twilioVoiceHandler(req, res) {
     ? wsUrl.replace("http://", "ws://")
     : wsUrl;
 
-  const streamParam = isAgent
-    ? `${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}&amp;mode=agent`
-    : `${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}`;
+  const streamParam = `${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}`;
 
   // Agent 外呼不播放欢迎语，直接连接；来电播放欢迎语
   const twiml = isAgent
@@ -462,7 +460,6 @@ server.on("upgrade", (request, socket, head) => {
 wss.on("connection", async (twilioWs, request) => {
   const urlObj     = new URL(request.url, `http://${request.headers.host}`);
   const urlCallSid = urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
-  const mode       = urlObj.searchParams.get("mode") || "inbound";  // "inbound" | "agent"
 
   // 尝试从 Redis 恢复（服务器重启场景）
   await restoreCallSession(urlCallSid);
@@ -476,7 +473,7 @@ wss.on("connection", async (twilioWs, request) => {
   // ─── 时间轴对齐录音器 ──────────────────────
   const recorder = new TimelineRecorder();
 
-  console.log(`[WS] Connected: ${activeCallSid}, mode=${mode}`);
+  console.log(`[WS] Connected: ${activeCallSid}`);
 
   // ─── 连接 OpenAI Realtime ──────────────────
   const openaiWs = new WebSocket(
@@ -490,14 +487,14 @@ wss.on("connection", async (twilioWs, request) => {
   );
 
   /**
-   * 根据当前 activeCallSid 和 mode 配置 OpenAI 会话。
-   * 在 start 事件 rebind 后调用，确保用正确的 callSid 查 agentCalls。
+   * 根据当前 activeCallSid 配置 OpenAI 会话。
+   * 在 start 事件 rebind 后调用，用真实 callSid 查 agentCalls 判断模式。
    */
   function configureAndGreet() {
     if (sessionConfigured) return;
     sessionConfigured = true;
 
-    const isAgent   = mode === "agent";
+    const isAgent   = agentCalls.has(activeCallSid);
     const agentData = isAgent ? agentCalls.get(activeCallSid) : null;
 
     let sessionInstructions, sessionTools, greetingInstruction;
@@ -541,9 +538,7 @@ Rules:
 
       greetingInstruction = `Introduce yourself and state the purpose of this call based on your task. Be brief and natural.`;
     } else {
-      if (isAgent) {
-        console.warn(`[Agent] mode=agent but no agentData found for ${activeCallSid}, falling back to HVAC prompt`);
-      }
+      console.log(`[WS] Inbound call, using HVAC prompt for ${activeCallSid}`);
       sessionInstructions = HVAC_SYSTEM_PROMPT;
       sessionTools        = HVAC_TOOLS;
       greetingInstruction = "Greet the caller and ask how you can help today.";
