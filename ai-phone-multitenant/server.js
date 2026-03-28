@@ -599,13 +599,20 @@ wss.on("connection", async (twilioWs, request) => {
   openaiWs.on("close", (code, reason) => console.log(`[OpenAI] disconnected code=${code} reason=${reason?.toString() || ''}`));
 
   // ─── Twilio → OpenAI ─────────────────────
+  let mediaCount = 0;
   twilioWs.on("message", async (msg) => {
     try {
-      const data = JSON.parse(msg.toString());
+      const raw = msg.toString();
+      const data = JSON.parse(raw);
 
-      // 调试：记录所有非 media 事件
-      if (data.event !== "media") {
-        console.log(`[Twilio] event=${data.event}`, JSON.stringify(data).substring(0, 300));
+      // 调试：记录所有事件类型
+      if (data.event === "media") {
+        mediaCount++;
+        if (mediaCount <= 3 || mediaCount % 100 === 0) {
+          console.log(`[Twilio] media packet #${mediaCount}`);
+        }
+      } else {
+        console.log(`[Twilio] event=${data.event}`, raw.substring(0, 400));
       }
 
       switch (data.event) {
