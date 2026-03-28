@@ -482,6 +482,7 @@ wss.on("connection", async (twilioWs, request) => {
   let sessionInstructions, sessionTools, greetingInstruction;
 
   if (isAgent && agentData) {
+    console.log(`[Agent] Using custom task prompt for ${activeCallSid}: "${agentData.task.substring(0, 80)}..."`);
     sessionInstructions = `
 You are an AI phone agent making an outbound call on behalf of a user. Your task is:
 
@@ -521,6 +522,9 @@ Rules:
 
     console.log(`[WS] Agent outbound connected: ${activeCallSid}`);
   } else {
+    if (isAgent) {
+      console.warn(`[Agent] mode=agent but no agentData found for ${activeCallSid}, falling back to HVAC prompt`);
+    }
     sessionInstructions = HVAC_SYSTEM_PROMPT;
     sessionTools        = HVAC_TOOLS;
     greetingInstruction = "Greet the caller and ask how you can help today.";
@@ -751,6 +755,11 @@ Rules:
           if (startCallSid && startCallSid !== activeCallSid) {
             console.log(`[WS] Rebinding ${activeCallSid} -> ${startCallSid}`);
             mergeCallSessions(startCallSid, activeCallSid);
+            // 迁移 agent 任务数据到新的 callSid
+            if (agentCalls.has(activeCallSid)) {
+              agentCalls.set(startCallSid, agentCalls.get(activeCallSid));
+              agentCalls.delete(activeCallSid);
+            }
             activeCallSid = startCallSid;
             callSession   = getOrCreateCallSession(activeCallSid);
           }
