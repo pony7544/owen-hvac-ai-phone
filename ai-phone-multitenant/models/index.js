@@ -27,6 +27,10 @@ const tenantSchema = new mongoose.Schema({
   adminPass:    { type: String, default: "" },
   prompt:       { type: String, default: "" },
   greeting:     { type: String, default: "" },
+  // 语音控制参数
+  speechSpeed:        { type: String, default: "moderate", enum: ["slow", "moderate", "fast"] },
+  vadThreshold:       { type: Number, default: 0.5 },    // 0.1-0.9, 越低越敏感
+  silenceDurationMs:  { type: Number, default: 500 },     // 300-2000ms, 等用户说完的时间
   google: {
     clientId:     { type: String, default: "" },
     clientSecret: { type: String, default: "" },
