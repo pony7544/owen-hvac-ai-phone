@@ -471,19 +471,40 @@ wss.on("connection", async (twilioWs, request) => {
   let callSession   = getOrCreateCallSession(activeCallSid);
   let streamSid     = "";
   let assistantTranscriptBuffer = "";
+  let sessionConfigured = false;  // 标记是否已发送最终 session.update
 
   // ─── 时间轴对齐录音器 ──────────────────────
   const recorder = new TimelineRecorder();
 
-  // ─── Agent 模式：构建自定义指令 ──────────────
-  const isAgent   = mode === "agent";
-  const agentData = isAgent ? agentCalls.get(activeCallSid) : null;
+  console.log(`[WS] Connected: ${activeCallSid}, mode=${mode}`);
 
-  let sessionInstructions, sessionTools, greetingInstruction;
+  // ─── 连接 OpenAI Realtime ──────────────────
+  const openaiWs = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
+    {
+      headers: {
+        Authorization:  `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta":  "realtime=v1",
+      },
+    }
+  );
 
-  if (isAgent && agentData) {
-    console.log(`[Agent] Using custom task prompt for ${activeCallSid}: "${agentData.task.substring(0, 80)}..."`);
-    sessionInstructions = `
+  /**
+   * 根据当前 activeCallSid 和 mode 配置 OpenAI 会话。
+   * 在 start 事件 rebind 后调用，确保用正确的 callSid 查 agentCalls。
+   */
+  function configureAndGreet() {
+    if (sessionConfigured) return;
+    sessionConfigured = true;
+
+    const isAgent   = mode === "agent";
+    const agentData = isAgent ? agentCalls.get(activeCallSid) : null;
+
+    let sessionInstructions, sessionTools, greetingInstruction;
+
+    if (isAgent && agentData) {
+      console.log(`[Agent] Using custom task prompt for ${activeCallSid}: "${agentData.task.substring(0, 80)}..."`);
+      sessionInstructions = `
 You are an AI phone agent making an outbound call on behalf of a user. Your task is:
 
 ${agentData.task}
@@ -500,80 +521,76 @@ Rules:
 - If the callee cannot help or the request cannot be fulfilled, politely end the call with end_call.
 `.trim();
 
-    sessionTools = [
-      {
-        type: "function",
-        name: "end_call",
-        description: "End and hang up the phone call after completing the task or when no further progress can be made.",
-        parameters: {
-          type: "object",
-          properties: {
-            reason: {
-              type: "string",
-              description: "Brief reason: 'task_completed', 'task_failed', 'callee_unavailable', etc.",
+      sessionTools = [
+        {
+          type: "function",
+          name: "end_call",
+          description: "End and hang up the phone call after completing the task or when no further progress can be made.",
+          parameters: {
+            type: "object",
+            properties: {
+              reason: {
+                type: "string",
+                description: "Brief reason: 'task_completed', 'task_failed', 'callee_unavailable', etc.",
+              },
             },
+            required: ["reason"],
           },
-          required: ["reason"],
         },
-      },
-    ];
+      ];
 
-    greetingInstruction = `Introduce yourself and state the purpose of this call based on your task. Be brief and natural.`;
-
-    console.log(`[WS] Agent outbound connected: ${activeCallSid}`);
-  } else {
-    if (isAgent) {
-      console.warn(`[Agent] mode=agent but no agentData found for ${activeCallSid}, falling back to HVAC prompt`);
+      greetingInstruction = `Introduce yourself and state the purpose of this call based on your task. Be brief and natural.`;
+    } else {
+      if (isAgent) {
+        console.warn(`[Agent] mode=agent but no agentData found for ${activeCallSid}, falling back to HVAC prompt`);
+      }
+      sessionInstructions = HVAC_SYSTEM_PROMPT;
+      sessionTools        = HVAC_TOOLS;
+      greetingInstruction = "Greet the caller and ask how you can help today.";
     }
-    sessionInstructions = HVAC_SYSTEM_PROMPT;
-    sessionTools        = HVAC_TOOLS;
-    greetingInstruction = "Greet the caller and ask how you can help today.";
 
-    console.log(`[WS] Twilio inbound connected: ${activeCallSid}`);
+    // 发送 session.update 配置
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          modalities:   ["audio", "text"],
+          instructions: sessionInstructions,
+          tools:        sessionTools,
+          tool_choice:  "auto",
+          voice:        REALTIME_VOICE,
+          input_audio_format:  "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          input_audio_transcription: { model: TRANSCRIPTION_MODEL },
+          turn_detection: {
+            type:                 "server_vad",
+            threshold:            0.5,
+            silence_duration_ms:  500,
+            prefix_padding_ms:    300,
+          },
+        },
+      }));
+
+      // AI 主动开场
+      openaiWs.send(JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities:   ["audio", "text"],
+          instructions: greetingInstruction,
+        },
+      }));
+    }
   }
-
-  // ─── 连接 OpenAI Realtime ──────────────────
-  const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
-    {
-      headers: {
-        Authorization:  `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta":  "realtime=v1",
-      },
-    }
-  );
 
   openaiWs.on("open", () => {
     console.log("[OpenAI] Realtime connected");
-
-    openaiWs.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        modalities:   ["audio", "text"],
-        instructions: sessionInstructions,
-        tools:        sessionTools,
-        tool_choice:  "auto",
-        voice:        REALTIME_VOICE,
-        input_audio_format:  "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        input_audio_transcription: { model: TRANSCRIPTION_MODEL },
-        turn_detection: {
-          type:                 "server_vad",
-          threshold:            0.5,
-          silence_duration_ms:  500,
-          prefix_padding_ms:    300,
-        },
-      },
-    }));
-
-    // AI 主动开场
-    openaiWs.send(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities:   ["audio", "text"],
-        instructions: greetingInstruction,
-      },
-    }));
+    // 不在这里配置 session —— 等 Twilio start 事件 rebind callSid 后再配置
+    // 但如果 start 事件很快就到，openaiWs.on("open") 可能在 start 之后才触发
+    // 所以也检查一下是否已经收到 start
+    if (streamSid) {
+      // start 事件已经到了，可以直接配置
+      configureAndGreet();
+    }
   });
 
   // ─── OpenAI → Twilio 消息处理 ─────────────
@@ -769,6 +786,11 @@ Rules:
           callSession.status     = "in_progress";
           callSession.updatedAt  = new Date().toISOString();
           console.log(`[WS] stream started sid=${streamSid} call=${activeCallSid}`);
+
+          // callSid 已确定，现在配置 OpenAI session（agent 或 inbound）
+          if (openaiWs.readyState === WebSocket.OPEN) {
+            configureAndGreet();
+          }
           break;
         }
 
@@ -942,7 +964,7 @@ Be specific and factual. Write in plain language.`,
           content: `Here is the full call transcript:\n\n${transcript}`,
         },
       ],
-      max_tokens: 500,
+      max_completion_tokens: 500,
     });
 
     const summary = completion.choices[0]?.message?.content || "Unable to generate summary.";
