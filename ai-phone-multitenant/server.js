@@ -622,7 +622,6 @@ wss.on("connection", async (twilioWs, request) => {
           if (startCallSid && startCallSid !== activeCallSid) {
             console.log(`[WS] Rebinding ${activeCallSid} -> ${startCallSid}`);
             mergeCallSessions(startCallSid, activeCallSid);
-            // 迁移 tenant 映射
             if (callTenantMap.has(activeCallSid)) {
               callTenantMap.set(startCallSid, callTenantMap.get(activeCallSid));
               callTenantMap.delete(activeCallSid);
@@ -640,17 +639,48 @@ wss.on("connection", async (twilioWs, request) => {
         }
         case "media":
           callSession.mediaPacketCount += 1;
+
+          // 提取 streamSid（有些 Twilio 版本不发 start 事件）
+          if (!streamSid && data.streamSid) {
+            streamSid = data.streamSid;
+            streamToCallSid.set(streamSid, activeCallSid);
+            callSession.streamSid = streamSid;
+            callSession.status = "in_progress";
+            callSession.updatedAt = new Date().toISOString();
+          }
+
+          // 第一个 media 包到达时触发 configureAndGreet（兜底 start 事件缺失）
+          if (!sessionConfigured && openaiWs.readyState === WebSocket.OPEN) {
+            console.log(`[WS] First media received, configuring session for ${activeCallSid}`);
+            configureAndGreet();
+          }
+
           if (data.media?.payload) recorder.pushCaller(data.media.payload);
           if (openaiWs.readyState === WebSocket.OPEN)
             openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
           break;
-        case "stop":
+        case "stop": {
+          // 从 stop 事件提取真正的 callSid 做最后的 rebind
+          const stopCallSid = data.stop?.callSid || "";
+          if (stopCallSid && stopCallSid !== activeCallSid) {
+            console.log(`[WS] Stop-rebinding ${activeCallSid} -> ${stopCallSid}`);
+            mergeCallSessions(stopCallSid, activeCallSid);
+            if (callTenantMap.has(activeCallSid)) {
+              callTenantMap.set(stopCallSid, callTenantMap.get(activeCallSid));
+              callTenantMap.delete(activeCallSid);
+            }
+            activeCallSid = stopCallSid;
+            callSession = getOrCreateCallSession(activeCallSid);
+          }
+          if (!streamSid && data.streamSid) streamSid = data.streamSid;
+
           console.log(`[WS] stream stopped: ${activeCallSid}`);
           callSession.status = "stream_closed"; callSession.updatedAt = new Date().toISOString();
           if (streamSid) streamToCallSid.delete(streamSid);
           if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
           finalizeRecording(activeCallSid, recorder);
           break;
+        }
       }
     } catch (err) { console.error("[Twilio] error:", err?.message); }
   });
