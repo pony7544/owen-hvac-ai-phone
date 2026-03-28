@@ -15,11 +15,13 @@ const WebSocket  = require("ws");
 const session    = require("express-session");
 
 const { FALLBACK_PROMPT, buildExtractionSystemPrompt } = require("./prompts");
+const { connectDB } = require("./models");
 const tenantService = require("./services/tenant.service");
 const {
   liveCalls, streamToCallSid, cleanText, normalizePhone,
-  getOrCreateCallSession, restoreCallSession, mergeCallSessions,
-  resolveStartCallSid, pushTranscript, buildCallSummary, persistToRedis,
+  getOrCreateCallSession, restoreCallSession, loadRecentCalls, mergeCallSessions,
+  resolveStartCallSid, pushTranscript, buildCallSummary,
+  persistToDB, persistRecordingToDB, loadRecordingFromDB,
 } = require("./services/call-session.service");
 const { createExtractionService } = require("./services/extraction.service");
 const { buildWav, TimelineRecorder } = require("./services/recording.service");
@@ -45,17 +47,13 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
   console.log("[Twilio] REST client initialized");
 }
 
-// =========================
-// 加载租户
-// =========================
-tenantService.loadAll({ getOrCreateCallSession });
-
 // Extraction service（平台级共用 OpenAI key）
 const extractionService = createExtractionService({
   openaiApiKey: OPENAI_API_KEY,
   extractionModel: EXTRACTION_MODEL,
   businessTimezone: "America/Halifax",
-  getOrCreateCallSession, normalizePhone, persistToRedis,
+  getOrCreateCallSession, normalizePhone,
+  persistToRedis: persistToDB,  // extraction.service.js 内部用 persistToRedis 这个 key
 });
 
 // callSid → tenantId 映射
@@ -145,7 +143,7 @@ function getSessionTenant(req) {
 app.get("/api/live/calls", requireApiAuth, (req, res) => {
   const tid = req.session.tenantId;
   const calls = Array.from(liveCalls.values())
-    .filter(c => !tid || callTenantMap.get(c.callSid) === tid)
+    .filter(c => !tid || callTenantMap.get(c.callSid) === tid || c.tenantId === tid)
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
     .map(buildCallSummary);
   res.json({ ok: true, calls });
@@ -265,18 +263,31 @@ app.delete("/api/calendar/events/:eventId", requireApiAuth, async (req, res) => 
 // =========================
 // Recording APIs
 // =========================
-app.get("/api/live-call/:callSid/recording/info", requireApiAuth, (req, res) => {
+app.get("/api/live-call/:callSid/recording/info", requireApiAuth, async (req, res) => {
   const call = liveCalls.get(req.params.callSid);
   if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
-  const rec = call.recording;
+  let rec = call.recording;
+  if ((!rec || rec._fromDB) && !rec?.wavBuffer) {
+    const dbRec = await loadRecordingFromDB(req.params.callSid);
+    if (dbRec) { call.recording = dbRec; rec = dbRec; }
+  }
   if (!rec?.available) return res.json({ ok: true, available: false });
   res.json({ ok: true, available: true, durationSec: rec.durationSec, createdAt: rec.createdAt });
 });
 
-app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, (req, res) => {
+app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, async (req, res) => {
   const call = liveCalls.get(req.params.callSid);
   if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
-  const rec = call.recording;
+
+  // 如果内存中没有录音数据，从 DB 加载
+  let rec = call.recording;
+  if ((!rec || rec._fromDB) && !rec?.wavBuffer) {
+    const dbRec = await loadRecordingFromDB(req.params.callSid);
+    if (dbRec) {
+      call.recording = dbRec;
+      rec = dbRec;
+    }
+  }
   if (!rec?.available || !rec.wavBuffer) return res.status(404).json({ ok: false, error: "Not ready" });
 
   const channel = req.query.channel || "both";
@@ -300,7 +311,7 @@ app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, (req, res) =
 // =========================
 // Admin APIs — 租户 CRUD
 // =========================
-app.get("/api/admin/tenants", requireAdmin, (_req, res) => {
+app.get("/api/admin/tenants", requireAdmin, async (_req, res) => {
   const list = tenantService.getAllTenants().map(t => ({
     id: t.id, businessName: t.businessName, phoneNumber: t.phoneNumber,
     voice: t.voice, hasCalendar: !!(t.google?.clientId && t.google?.refreshToken),
@@ -308,29 +319,29 @@ app.get("/api/admin/tenants", requireAdmin, (_req, res) => {
   res.json({ ok: true, tenants: list });
 });
 
-app.get("/api/admin/tenants/:id", requireAdmin, (req, res) => {
-  const raw = tenantService.getTenantRaw(req.params.id);
+app.get("/api/admin/tenants/:id", requireAdmin, async (req, res) => {
+  const raw = await tenantService.getTenantRaw(req.params.id);
   if (!raw) return res.status(404).json({ ok: false, error: "Not found" });
   res.json({ ok: true, tenant: raw });
 });
 
-app.post("/api/admin/tenants", requireAdmin, (req, res) => {
+app.post("/api/admin/tenants", requireAdmin, async (req, res) => {
   try {
-    tenantService.createTenant(req.body, { getOrCreateCallSession });
+    await tenantService.createTenant(req.body, { getOrCreateCallSession });
     res.json({ ok: true });
   } catch (err) { res.status(400).json({ ok: false, error: err?.message }); }
 });
 
-app.put("/api/admin/tenants/:id", requireAdmin, (req, res) => {
+app.put("/api/admin/tenants/:id", requireAdmin, async (req, res) => {
   try {
-    tenantService.updateTenant(req.params.id, req.body, { getOrCreateCallSession });
+    await tenantService.updateTenant(req.params.id, req.body, { getOrCreateCallSession });
     res.json({ ok: true });
   } catch (err) { res.status(400).json({ ok: false, error: err?.message }); }
 });
 
-app.delete("/api/admin/tenants/:id", requireAdmin, (req, res) => {
+app.delete("/api/admin/tenants/:id", requireAdmin, async (req, res) => {
   try {
-    tenantService.deleteTenant(req.params.id);
+    await tenantService.deleteTenant(req.params.id);
     res.json({ ok: true });
   } catch (err) { res.status(400).json({ ok: false, error: err?.message }); }
 });
@@ -350,6 +361,7 @@ app.post("/twilio/voice/:tenantId", (req, res) => {
   callTenantMap.set(callSid, tenantId);
 
   const callSession = getOrCreateCallSession(callSid);
+  callSession.tenantId = tenantId;
   callSession.from = from;
   callSession.to = to;
   callSession.status = "initiated";
@@ -396,14 +408,17 @@ function finalizeRecording(callSid, recorder) {
   try {
     const wavBuffer = buildWav(callerFrames, assistantFrames);
     const s = getOrCreateCallSession(callSid);
+    const durationSec = Math.round((callerFrames.length * 160) / 8000);
     s.recording = {
       wavBuffer, _callerFrames: callerFrames, _assistantFrames: assistantFrames,
-      durationSec: Math.round((callerFrames.length * 160) / 8000),
-      createdAt: new Date().toISOString(), available: true,
+      durationSec, createdAt: new Date().toISOString(), available: true,
     };
     s.updatedAt = new Date().toISOString();
-    persistToRedis(callSid, s);
-    console.log(`[Recording] WAV ready for ${callSid}, ~${s.recording.durationSec}s`);
+    // 持久化到 MongoDB
+    const tenantId = callTenantMap.get(callSid) || s.tenantId || "";
+    persistToDB(callSid, s);
+    persistRecordingToDB(callSid, tenantId, wavBuffer, callerFrames, assistantFrames, durationSec);
+    console.log(`[Recording] WAV ready for ${callSid}, ~${durationSec}s`);
   } catch (err) { console.error("[Recording] build WAV failed:", err?.message); }
 }
 
@@ -554,7 +569,7 @@ wss.on("connection", async (twilioWs, request) => {
                 bookingConfirmed: true,
               });
               const event = await calSvc.createAppointmentEvent(activeCallSid);
-              persistToRedis(activeCallSid, s);
+              persistToDB(activeCallSid, s);
               toolResult = `Appointment created. Event ID: ${event.id}. Confirm to caller.`;
             } catch (err) { toolResult = `Failed: ${err?.message}. Tell caller a team member will follow up.`; }
           }
@@ -637,6 +652,15 @@ wss.on("connection", async (twilioWs, request) => {
 });
 
 // =========================
-// Start
+// Start (async — connect DB first)
 // =========================
-server.listen(PORT, () => console.log(`[Server] listening on port ${PORT}`));
+(async () => {
+  await connectDB();
+  await tenantService.loadAll({ getOrCreateCallSession });
+  await loadRecentCalls(200);
+
+  server.listen(PORT, () => console.log(`[Server] listening on port ${PORT}`));
+})().catch(err => {
+  console.error("FATAL startup error:", err);
+  process.exit(1);
+});
