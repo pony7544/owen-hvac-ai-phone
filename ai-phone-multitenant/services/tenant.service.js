@@ -74,6 +74,7 @@ function buildRuntimeTenant(doc, getOrCreateCallSession) {
     defaultAppointmentMinutes: cfg.defaultAppointmentMinutes || 60,
     adminUser: cfg.adminUser || "", adminPass: cfg.adminPass || "",
     prompt: cfg.prompt || "",
+    extractionPrompt: cfg.extractionPrompt || "",
     greeting: cfg.greeting || `Hello, thank you for calling ${cfg.businessName || cfg.id}. Please hold.`,
     speechSpeed: cfg.speechSpeed || "moderate",
     vadThreshold: cfg.vadThreshold ?? 0.5,
