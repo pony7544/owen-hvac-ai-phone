@@ -444,6 +444,7 @@ wss.on("connection", async (twilioWs, request) => {
   let streamSid = "";
   let assistantTranscriptBuffer = "";
   let sessionConfigured = false;
+  let recordingStarted = false;   // 录音从 AI 第一个音频帧开始
 
   const recorder = new TimelineRecorder();
 
@@ -516,6 +517,10 @@ wss.on("connection", async (twilioWs, request) => {
       if (data.type === "response.audio_transcript.delta" && data.delta) assistantTranscriptBuffer += data.delta;
 
       if (data.type === "response.audio.delta" && data.delta) {
+        if (!recordingStarted) {
+          recordingStarted = true;
+          console.log(`[Recording] Started — AI first audio frame for ${activeCallSid}`);
+        }
         recorder.pushAssistant(data.delta);
         if (streamSid && twilioWs.readyState === WebSocket.OPEN)
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: data.delta } }));
@@ -655,7 +660,9 @@ wss.on("connection", async (twilioWs, request) => {
             configureAndGreet();
           }
 
-          if (data.media?.payload) recorder.pushCaller(data.media.payload);
+          if (data.media?.payload) {
+            if (recordingStarted) recorder.pushCaller(data.media.payload);
+          }
           if (openaiWs.readyState === WebSocket.OPEN)
             openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
           break;
