@@ -4,7 +4,9 @@
 // 通话进行中全部操作走内存（低延迟），通话结束/关键节点写 DB
 // =============================================================
 
-const { Call, Recording } = require("../models");
+// 懒加载 Model，避免循环依赖
+function getCallModel() { return require("../models").Call; }
+function getRecordingModel() { return require("../models").Recording; }
 const zlib = require("zlib");
 
 // ─── 内存主存储（活跃通话）───────────────────
@@ -26,7 +28,7 @@ function createEmptyExtracted() {
 // ─── MongoDB 持久化（非阻塞）─────────────────
 async function persistToDB(callSid, sessionData) {
   try {
-    await Call.findOneAndUpdate(
+    await getCallModel().findOneAndUpdate(
       { callSid },
       {
         callSid:         sessionData.callSid,
@@ -52,7 +54,7 @@ async function persistRecordingToDB(callSid, tenantId, wavBuffer, callerFrames, 
     const callerBuf = zlib.gzipSync(JSON.stringify(callerFrames));
     const assistantBuf = zlib.gzipSync(JSON.stringify(assistantFrames));
 
-    await Recording.findOneAndUpdate(
+    await getRecordingModel().findOneAndUpdate(
       { callSid },
       {
         callSid, tenantId: tenantId || "",
@@ -69,7 +71,7 @@ async function persistRecordingToDB(callSid, tenantId, wavBuffer, callerFrames, 
 
 async function loadCallFromDB(callSid) {
   try {
-    const doc = await Call.findOne({ callSid }).lean();
+    const doc = await getCallModel().findOne({ callSid }).lean();
     return doc || null;
   } catch (err) {
     console.error("[DB] load call error:", err.message);
@@ -79,7 +81,7 @@ async function loadCallFromDB(callSid) {
 
 async function loadRecordingFromDB(callSid) {
   try {
-    const doc = await Recording.findOne({ callSid }).lean();
+    const doc = await getRecordingModel().findOne({ callSid }).lean();
     if (!doc) return null;
     // 解压 frames
     let callerFrames = [], assistantFrames = [];
@@ -147,7 +149,7 @@ async function restoreCallSession(callSid) {
 // 启动时从 DB 加载最近的通话到内存
 async function loadRecentCalls(limit = 100) {
   try {
-    const docs = await Call.find().sort({ updatedAt: -1 }).limit(limit).lean();
+    const docs = await getCallModel().find().sort({ updatedAt: -1 }).limit(limit).lean();
     for (const doc of docs) {
       if (liveCalls.has(doc.callSid)) continue;
       const session = getOrCreateCallSession(doc.callSid);
@@ -161,7 +163,7 @@ async function loadRecentCalls(limit = 100) {
       session.extracted = { ...createEmptyExtracted(), ...(doc.extracted || {}) };
 
       // 录音标记（不加载 wavBuffer 到内存，需要时再从 DB 读）
-      const hasRec = await Recording.exists({ callSid: doc.callSid, available: true });
+      const hasRec = await getRecordingModel().exists({ callSid: doc.callSid, available: true });
       if (hasRec) {
         session.recording = { available: true, durationSec: 0, _fromDB: true, createdAt: "" };
       }
