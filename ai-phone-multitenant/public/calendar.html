@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Calendar Management</title>
+  <style>
+    *{box-sizing:border-box;margin:0}
+    body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+    .topbar{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:#1e293b;border-bottom:1px solid #334155}
+    .topbar h1{font-size:16px;font-weight:600;color:#93c5fd}
+    .topbar-nav{display:flex;gap:12px}
+    .topbar-nav a{color:#94a3b8;text-decoration:none;font-size:13px}
+    .main{max-width:960px;margin:0 auto;padding:32px 20px}
+    .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;margin-bottom:20px}
+    .card h2{font-size:15px;font-weight:600;color:#93c5fd;margin-bottom:16px}
+    .date-nav{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+    .date-nav input{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 12px;color:#e2e8f0;font-size:14px}
+    .btn{border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:.15s}
+    .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
+    .btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
+    .btn-sm{padding:5px 10px;font-size:11px}
+    .btn-gray{background:#334155;color:#cbd5e1}.btn-gray:hover{background:#475569}
+    .slots{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:16px}
+    .slot{padding:10px 12px;border-radius:8px;font-size:13px;text-align:center;cursor:pointer;transition:.15s;border:1px solid #334155}
+    .slot.available{background:#064e3b;border-color:#065f46;color:#6ee7b7}
+    .slot.available:hover{background:#065f46}
+    .slot.blocked{background:#7f1d1d;border-color:#991b1b;color:#fca5a5;cursor:default}
+    .slot.booked{background:#1e3a5f;border-color:#1e40af;color:#93c5fd;cursor:default}
+    .events-list{margin-top:16px}
+    .event-item{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-radius:8px;margin-bottom:8px;font-size:13px}
+    .event-item.booking{background:#172554;border:1px solid #1e3a8a}
+    .event-item.blocked{background:#450a0a;border:1px solid #7f1d1d}
+    .event-time{font-weight:600;min-width:120px}
+    .event-title{flex:1;margin:0 12px}
+    .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;margin-left:8px}
+    .tag-blue{background:#1e3a8a;color:#93c5fd}
+    .tag-red{background:#7f1d1d;color:#fca5a5}
+    .empty{color:#64748b;font-size:14px;padding:20px 0;text-align:center}
+    .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:flex-start;padding-top:100px}
+    .modal-bg.open{display:flex}
+    .modal{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;width:400px}
+    .modal h3{font-size:16px;margin-bottom:16px;color:#f1f5f9}
+    .form-group{margin-bottom:14px}
+    .form-group label{display:block;font-size:12px;color:#94a3b8;margin-bottom:4px;font-weight:600}
+    .input{width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px 12px;font-size:13px;color:#e2e8f0;outline:none}
+    .input:focus{border-color:#3b82f6}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1 id="pageTitle">Calendar Management</h1>
+    <div class="topbar-nav">
+      <a href="/live">Dashboard</a>
+      <a href="/calendar">Calendar</a>
+      <a href="/logout">Logout</a>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- Date navigation -->
+    <div class="card">
+      <div class="date-nav">
+        <button class="btn btn-gray" onclick="shiftDate(-1)">&larr; Prev</button>
+        <input type="date" id="dateInput" onchange="loadDay()"/>
+        <button class="btn btn-gray" onclick="shiftDate(1)">Next &rarr;</button>
+        <button class="btn btn-gray" onclick="goToday()">Today</button>
+        <span style="margin-left:auto">
+          <button class="btn btn-blue" onclick="openBlockModal()">+ Block Time</button>
+        </span>
+      </div>
+    </div>
+
+    <!-- Time slots grid -->
+    <div class="card">
+      <h2>Time Slots</h2>
+      <div class="slots" id="slotsGrid"><div class="empty">Loading...</div></div>
+    </div>
+
+    <!-- Events list -->
+    <div class="card">
+      <h2>Events for <span id="dateLabel"></span></h2>
+      <div class="events-list" id="eventsList"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Block time modal -->
+  <div class="modal-bg" id="blockModal">
+    <div class="modal">
+      <h3>Block time slot</h3>
+      <div class="form-group"><label>Date</label><input class="input" id="blockDate" type="date"/></div>
+      <div class="row2">
+        <div class="form-group"><label>Start time</label><input class="input" id="blockStart" type="time" value="09:00"/></div>
+        <div class="form-group"><label>End time</label><input class="input" id="blockEnd" type="time" value="10:00"/></div>
+      </div>
+      <div class="form-group"><label>Reason (optional)</label><input class="input" id="blockReason" placeholder="e.g. Lunch break, Staff meeting"/></div>
+      <div class="actions">
+        <button class="btn btn-gray" onclick="closeBlockModal()">Cancel</button>
+        <button class="btn btn-blue" onclick="createBlock()">Block</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function today() { return new Date().toLocaleDateString('en-CA'); }
+    function getDate() { return document.getElementById('dateInput').value || today(); }
+
+    function shiftDate(days) {
+      const d = new Date(getDate());
+      d.setDate(d.getDate() + days);
+      document.getElementById('dateInput').value = d.toLocaleDateString('en-CA');
+      loadDay();
+    }
+
+    function goToday() {
+      document.getElementById('dateInput').value = today();
+      loadDay();
+    }
+
+    function fmtTime(iso) {
+      return new Date(iso).toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit', hour12: true });
+    }
+
+    async function api(url, opts) {
+      const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      return r.json();
+    }
+
+    async function loadDay() {
+      const date = getDate();
+      document.getElementById('dateLabel').textContent = date;
+
+      // Load events
+      const evData = await api(`/api/calendar/events?date=${date}`);
+      const el = document.getElementById('eventsList');
+
+      if (!evData.ok || !evData.events?.length) {
+        el.innerHTML = '<div class="empty">No events for this day.</div>';
+      } else {
+        el.innerHTML = evData.events.map(ev => {
+          const isBlocked = (ev.summary || '').toLowerCase().includes('blocked') || (ev.summary || '').toLowerCase().includes('unavailable');
+          const cls = isBlocked ? 'blocked' : 'booking';
+          const tag = isBlocked ? '<span class="tag tag-red">Blocked</span>' : '<span class="tag tag-blue">Booking</span>';
+          const start = ev.start?.dateTime ? fmtTime(ev.start.dateTime) : 'All day';
+          const end = ev.end?.dateTime ? fmtTime(ev.end.dateTime) : '';
+          return `
+            <div class="event-item ${cls}">
+              <span class="event-time">${start}${end ? ' – ' + end : ''}</span>
+              <span class="event-title">${esc(ev.summary || 'Untitled')}${tag}</span>
+              <button class="btn btn-sm btn-red" onclick="deleteEvent('${esc(ev.id)}')">Delete</button>
+            </div>`;
+        }).join('');
+      }
+
+      // Load slots
+      const slotData = await api(`/api/calendar/slots?date=${date}`);
+      const sg = document.getElementById('slotsGrid');
+
+      if (!slotData.ok) {
+        sg.innerHTML = '<div class="empty">Could not load slots.</div>';
+        return;
+      }
+
+      // Generate all hour slots from 8am to 6pm
+      const allSlots = [];
+      for (let h = 8; h < 18; h++) {
+        const hh = String(h).padStart(2, '0');
+        const slotStart = `${date}T${hh}:00:00`;
+        const slotEnd = `${date}T${String(h+1).padStart(2,'0')}:00:00`;
+        const isAvailable = (slotData.slots || []).some(s => {
+          const ss = new Date(s.start).getHours();
+          return ss === h;
+        });
+        // Check if blocked or booked
+        const matchingEvent = (evData.events || []).find(ev => {
+          if (!ev.start?.dateTime) return false;
+          const evH = new Date(ev.start.dateTime).getHours();
+          return evH === h;
+        });
+        let status = 'available';
+        if (matchingEvent) {
+          const sum = (matchingEvent.summary || '').toLowerCase();
+          status = (sum.includes('blocked') || sum.includes('unavailable')) ? 'blocked' : 'booked';
+        }
+        allSlots.push({ h, hh, status });
+      }
+
+      sg.innerHTML = allSlots.map(s => {
+        const label = `${s.hh}:00`;
+        if (s.status === 'available') {
+          return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:00','${String(s.h+1).padStart(2,'0')}:00')">${label}<br><small>Available — click to block</small></div>`;
+        } else if (s.status === 'blocked') {
+          return `<div class="slot blocked">${label}<br><small>Blocked</small></div>`;
+        } else {
+          return `<div class="slot booked">${label}<br><small>Booked</small></div>`;
+        }
+      }).join('');
+    }
+
+    function quickBlock(date, start, end) {
+      document.getElementById('blockDate').value = date;
+      document.getElementById('blockStart').value = start;
+      document.getElementById('blockEnd').value = end;
+      document.getElementById('blockReason').value = '';
+      document.getElementById('blockModal').classList.add('open');
+    }
+
+    function openBlockModal() {
+      document.getElementById('blockDate').value = getDate();
+      document.getElementById('blockStart').value = '09:00';
+      document.getElementById('blockEnd').value = '10:00';
+      document.getElementById('blockReason').value = '';
+      document.getElementById('blockModal').classList.add('open');
+    }
+
+    function closeBlockModal() { document.getElementById('blockModal').classList.remove('open'); }
+
+    async function createBlock() {
+      const date = document.getElementById('blockDate').value;
+      const start = document.getElementById('blockStart').value;
+      const end = document.getElementById('blockEnd').value;
+      const reason = document.getElementById('blockReason').value.trim();
+
+      const res = await api('/api/calendar/block', {
+        method: 'POST',
+        body: JSON.stringify({ date, startTime: start, endTime: end, reason }),
+      });
+
+      if (res.ok) { closeBlockModal(); loadDay(); }
+      else alert(res.error || 'Failed to block time');
+    }
+
+    async function deleteEvent(eventId) {
+      if (!confirm('Delete this event?')) return;
+      const res = await api(`/api/calendar/events/${eventId}`, { method: 'DELETE' });
+      if (res.ok) loadDay();
+      else alert(res.error || 'Failed to delete');
+    }
+
+    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    // Init
+    document.getElementById('dateInput').value = today();
+    loadDay();
+  </script>
+</body>
+</html>
