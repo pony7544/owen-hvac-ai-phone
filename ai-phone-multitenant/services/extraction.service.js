@@ -40,17 +40,22 @@ function createExtractionService(config = {}) {
   }
 
   // ─── OpenAI 结构化抽取 ─────────────────────
-  async function extractCallInfoWithOpenAI({ transcript, nowIso }) {
+  async function extractCallInfoWithOpenAI({ transcript, nowIso, customExtractionPrompt }) {
     const transcriptText = transcript
       .map((x) => `${x.role}: ${x.text}`)
       .join("\n");
+
+    // 使用租户自定义的 extraction prompt，如果没有则用默认模板
+    const systemPrompt = customExtractionPrompt
+      ? `${customExtractionPrompt}\n\nCurrent datetime: ${nowIso}`
+      : buildExtractionSystemPrompt(nowIso);
 
     const response = await openai.responses.create({
       model: "gpt-4o-mini",
       input: [
         {
           role: "system",
-          content: [{ type: "input_text", text: buildExtractionSystemPrompt(nowIso) }],
+          content: [{ type: "input_text", text: systemPrompt }],
         },
         {
           role: "user",
@@ -89,7 +94,7 @@ function createExtractionService(config = {}) {
   }
 
   // ─── 写回 session ──────────────────────────
-  async function refreshStructuredCallInfo(callSid) {
+  async function refreshStructuredCallInfo(callSid, { customExtractionPrompt } = {}) {
     if (typeof getOrCreateCallSession !== "function") {
       throw new Error("getOrCreateCallSession is required");
     }
@@ -101,6 +106,7 @@ function createExtractionService(config = {}) {
     const modelData = await extractCallInfoWithOpenAI({
       transcript: session.transcript,
       nowIso: new Date().toISOString(),
+      customExtractionPrompt,
     });
 
     const normalized = normalizeExtractedFromModel(modelData);
@@ -126,7 +132,7 @@ function createExtractionService(config = {}) {
   }
 
   // ─── 防抖包装（同一通话最快 1200ms 触发一次）──
-  async function refreshStructuredCallInfoDebounced(callSid, minIntervalMs = 1200) {
+  async function refreshStructuredCallInfoDebounced(callSid, { minIntervalMs = 1200, customExtractionPrompt } = {}) {
     if (typeof getOrCreateCallSession !== "function") {
       throw new Error("getOrCreateCallSession is required");
     }
@@ -139,7 +145,7 @@ function createExtractionService(config = {}) {
     session.extractionInFlight = true;
     session.lastExtractionAt = now;
     try {
-      return await refreshStructuredCallInfo(callSid);
+      return await refreshStructuredCallInfo(callSid, { customExtractionPrompt });
     } finally {
       session.extractionInFlight = false;
     }
