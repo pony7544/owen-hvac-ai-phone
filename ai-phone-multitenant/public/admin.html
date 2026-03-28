@@ -1,727 +1,233 @@
-// =============================================================
-// server.js — Multi-tenant AI Phone System
-// 一套代码，通过 tenants.json 配置区分不同客户。
-// 每个租户独立 webhook: /twilio/voice/:tenantId
-// =============================================================
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Platform Admin</title>
+  <style>
+    *{box-sizing:border-box;margin:0}
+    body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+    .topbar{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:#1e293b;border-bottom:1px solid #334155}
+    .topbar h1{font-size:16px;font-weight:600;color:#93c5fd}
+    .topbar a{color:#94a3b8;text-decoration:none;font-size:13px}
+    .main{max-width:900px;margin:0 auto;padding:32px 20px}
+    .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;margin-bottom:20px}
+    .card h2{font-size:15px;font-weight:600;color:#93c5fd;margin-bottom:16px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{text-align:left;padding:8px 10px;color:#64748b;font-weight:600;border-bottom:1px solid #334155}
+    td{padding:8px 10px;border-bottom:1px solid #1e293b;vertical-align:middle}
+    .btn{border:0;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
+    .btn-sm{padding:5px 10px;font-size:11px}
+    .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
+    .btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
+    .btn-gray{background:#334155;color:#cbd5e1}.btn-gray:hover{background:#475569}
+    .form-group{margin-bottom:14px}
+    .form-group label{display:block;font-size:12px;color:#94a3b8;margin-bottom:4px;font-weight:600}
+    .input{width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px 12px;font-size:13px;color:#e2e8f0;outline:none;font-family:inherit}
+    .input:focus{border-color:#3b82f6}
+    textarea.input{min-height:120px;resize:vertical;line-height:1.5}
+    .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:flex-start;padding-top:60px}
+    .modal-bg.open{display:flex}
+    .modal{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;width:600px;max-height:80vh;overflow-y:auto}
+    .modal h3{font-size:16px;margin-bottom:18px;color:#f1f5f9}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .webhook-url{font-family:monospace;font-size:12px;color:#60a5fa;background:#0f172a;padding:6px 10px;border-radius:6px;word-break:break-all;margin-top:4px}
+    .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
+    .tag-green{background:#064e3b;color:#6ee7b7}
+    .tag-gray{background:#334155;color:#94a3b8}
+    .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>Platform Admin</h1>
+    <div style="display:flex;gap:14px;align-items:center">
+      <a href="/live">Dashboard</a>
+      <a href="/logout">Logout</a>
+    </div>
+  </div>
+  <div class="main">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h2 style="margin:0">Tenants</h2>
+        <button class="btn btn-blue" onclick="openModal()">+ Add Tenant</button>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>Business</th><th>Phone</th><th>Voice</th><th>Webhook</th><th>Calendar</th><th></th></tr></thead>
+        <tbody id="tenantTable"><tr><td colspan="7" style="color:#64748b">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 
-require("dotenv").config();
-const os   = require("os");
-const fs   = require("fs");
-const express    = require("express");
-const http       = require("http");
-const path       = require("path");
-const bodyParser = require("body-parser");
-const WebSocket  = require("ws");
-const session    = require("express-session");
+  <!-- Modal -->
+  <div class="modal-bg" id="modalBg">
+    <div class="modal">
+      <h3 id="modalTitle">Add Tenant</h3>
+      <input type="hidden" id="editId"/>
+      <div class="row2">
+        <div class="form-group"><label>Tenant ID (slug)</label><input class="input" id="fId" placeholder="owen-hvac"/></div>
+        <div class="form-group"><label>Business Name</label><input class="input" id="fName" placeholder="Owen HVAC Corp"/></div>
+      </div>
+      <div class="row2">
+        <div class="form-group"><label>Phone Number</label><input class="input" id="fPhone" placeholder="+19024001234"/></div>
+        <div class="form-group"><label>Voice</label>
+          <select class="input" id="fVoice">
+            <option>alloy</option><option>ash</option><option>ballad</option><option>coral</option>
+            <option>echo</option><option>sage</option><option>shimmer</option><option>verse</option>
+            <option>marin</option><option>cedar</option>
+          </select>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="form-group"><label>Timezone</label><input class="input" id="fTz" placeholder="America/Halifax"/></div>
+        <div class="form-group"><label>Appt Duration (min)</label><input class="input" id="fDuration" type="number" value="60"/></div>
+      </div>
+      <div class="form-group"><label>Greeting (TwiML Say)</label><input class="input" id="fGreeting" placeholder="Hello, thank you for calling..."/></div>
+      <div class="form-group"><label>AI Prompt</label><textarea class="input" id="fPrompt" placeholder="You are the phone receptionist for..."></textarea></div>
 
-const { FALLBACK_PROMPT, buildExtractionSystemPrompt } = require("./prompts");
-const { connectDB } = require("./models");
-const tenantService = require("./services/tenant.service");
-const {
-  liveCalls, streamToCallSid, cleanText, normalizePhone,
-  getOrCreateCallSession, restoreCallSession, loadRecentCalls, mergeCallSessions,
-  resolveStartCallSid, pushTranscript, buildCallSummary,
-  persistToDB, persistRecordingToDB, loadRecordingFromDB,
-} = require("./services/call-session.service");
-const { createExtractionService } = require("./services/extraction.service");
-const { buildWav, TimelineRecorder } = require("./services/recording.service");
+      <h3 style="font-size:14px;margin:18px 0 12px;color:#94a3b8">Voice Controls</h3>
+      <div class="form-group">
+        <label>Speech Speed</label>
+        <select class="input" id="fSpeed">
+          <option value="slow">Slow — very clear, long pauses</option>
+          <option value="moderate" selected>Moderate — calm, natural pace</option>
+          <option value="fast">Fast — conversational</option>
+        </select>
+      </div>
+      <div class="row2">
+        <div class="form-group">
+          <label>Voice Sensitivity: <span id="vadLabel">0.5</span></label>
+          <input type="range" id="fVadThreshold" min="0.1" max="0.9" step="0.1" value="0.5" class="input" style="padding:4px 8px" oninput="document.getElementById('vadLabel').textContent=this.value">
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-top:2px"><span>More sensitive</span><span>Less sensitive</span></div>
+        </div>
+        <div class="form-group">
+          <label>Wait for reply: <span id="silenceLabel">500</span>ms</label>
+          <input type="range" id="fSilenceMs" min="300" max="2000" step="100" value="500" class="input" style="padding:4px 8px" oninput="document.getElementById('silenceLabel').textContent=this.value">
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-top:2px"><span>Quick (300ms)</span><span>Patient (2000ms)</span></div>
+        </div>
+      </div>
 
-// =========================
-// ENV 校验
-// =========================
-if (!process.env.SESSION_SECRET) { console.error("FATAL: SESSION_SECRET not set."); process.exit(1); }
-if (!process.env.OPENAI_API_KEY) { console.error("FATAL: OPENAI_API_KEY not set."); process.exit(1); }
+      <h3 style="font-size:14px;margin:18px 0 12px;color:#94a3b8">Login Credentials</h3>
+      <div class="row2">
+        <div class="form-group"><label>Admin Username</label><input class="input" id="fUser" placeholder="owen"/></div>
+        <div class="form-group"><label>Admin Password</label><input class="input" id="fPass" type="password"/></div>
+      </div>
+      <h3 style="font-size:14px;margin:18px 0 12px;color:#94a3b8">Google Calendar</h3>
+      <div class="row2">
+        <div class="form-group"><label>Client ID</label><input class="input" id="fGClientId"/></div>
+        <div class="form-group"><label>Client Secret</label><input class="input" id="fGSecret"/></div>
+      </div>
+      <div class="row2">
+        <div class="form-group"><label>Refresh Token</label><input class="input" id="fGRefresh"/></div>
+        <div class="form-group"><label>Calendar ID</label><input class="input" id="fGCalId" placeholder="primary"/></div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-gray" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-blue" id="saveBtn" onclick="saveTenant()">Save</button>
+      </div>
+    </div>
+  </div>
 
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
-const PORT              = process.env.PORT || 10000;
-const REALTIME_MODEL    = process.env.OPENAI_REALTIME_MODEL      || "gpt-4o-realtime-preview";
-const TRANSCRIPTION_MODEL = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
-const EXTRACTION_MODEL  = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-mini";
-const ADMIN_USER        = process.env.ADMIN_USER || "superadmin";
-const ADMIN_PASS        = process.env.ADMIN_PASS || "";
+  <script>
+    const BASE = location.origin;
 
-// Twilio REST Client（平台级，所有租户共用）
-let twilioClient = null;
-if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-  twilioClient = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  console.log("[Twilio] REST client initialized");
-}
-
-// Extraction service（平台级共用 OpenAI key）
-const extractionService = createExtractionService({
-  openaiApiKey: OPENAI_API_KEY,
-  extractionModel: EXTRACTION_MODEL,
-  businessTimezone: "America/Halifax",
-  getOrCreateCallSession, normalizePhone,
-  persistToRedis: persistToDB,  // extraction.service.js 内部用 persistToRedis 这个 key
-});
-
-// callSid → tenantId 映射
-const callTenantMap = new Map();
-
-// =========================
-// Express App
-// =========================
-const app    = express();
-const server = http.createServer(app);
-
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(session({
-  secret: process.env.SESSION_SECRET,
-  resave: false, saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: "lax", secure: false, maxAge: 1000*60*60*12 },
-}));
-app.use(express.static(path.join(__dirname, "public")));
-
-// =========================
-// Auth
-// =========================
-function requireAuth(req, res, next) {
-  if (req.session?.authed) return next();
-  return res.redirect("/login");
-}
-function requireApiAuth(req, res, next) {
-  if (req.session?.authed) return next();
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
-}
-function requireAdmin(req, res, next) {
-  if (req.session?.authed && req.session?.isAdmin) return next();
-  return res.status(403).json({ ok: false, error: "Admin only" });
-}
-
-// =========================
-// Pages
-// =========================
-app.get("/", (_req, res) => res.send("AI Phone System is running."));
-app.get("/login", (_req, res) => res.sendFile(path.join(__dirname, "public", "login.html")));
-app.get("/live", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "live.html")));
-app.get("/calendar", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "calendar.html")));
-app.get("/admin", requireAuth, (req, res) => {
-  if (!req.session.isAdmin) return res.redirect("/live");
-  res.sendFile(path.join(__dirname, "public", "admin.html"));
-});
-
-app.post("/login", (req, res) => {
-  const username = cleanText(req.body.username);
-  const password = req.body.password || "";
-
-  // 超级管理员
-  if (ADMIN_PASS && username === ADMIN_USER && password === ADMIN_PASS) {
-    req.session.authed = true;
-    req.session.isAdmin = true;
-    req.session.tenantId = null;
-    return res.redirect("/admin");
-  }
-
-  // 租户用户
-  const tenant = tenantService.getByUser(username);
-  if (tenant && tenant.adminPass && password === tenant.adminPass) {
-    req.session.authed = true;
-    req.session.isAdmin = false;
-    req.session.tenantId = tenant.id;
-    return res.redirect("/live");
-  }
-
-  res.status(401).send(`<html><body style="font-family:Arial;padding:24px"><h3>Login failed</h3><p>Invalid credentials.</p><p><a href="/login">Back</a></p></body></html>`);
-});
-
-app.get("/logout", (req, res) => req.session.destroy(() => res.redirect("/login")));
-app.post("/logout", (req, res) => req.session.destroy(() => res.redirect("/login")));
-
-// =========================
-// Helper: 获取当前用户的 tenant
-// =========================
-function getSessionTenant(req) {
-  const tid = req.session?.tenantId;
-  return tid ? tenantService.getTenant(tid) : null;
-}
-
-// =========================
-// Live Dashboard APIs
-// =========================
-app.get("/api/live/calls", requireApiAuth, (req, res) => {
-  const tid = req.session.tenantId;
-  const calls = Array.from(liveCalls.values())
-    .filter(c => !tid || callTenantMap.get(c.callSid) === tid || c.tenantId === tid)
-    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
-    .map(buildCallSummary);
-  res.json({ ok: true, calls });
-});
-
-app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
-  const call = liveCalls.get(req.params.callSid);
-  if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
-  const rec = call.recording;
-  res.json({ ok: true, call: {
-    callSid: call.callSid, from: call.from, to: call.to,
-    status: call.status, streamSid: call.streamSid,
-    createdAt: call.createdAt, updatedAt: call.updatedAt,
-    transcript: call.transcript, extracted: call.extracted,
-    recording: rec ? { available: !!rec.available, durationSec: rec.durationSec, createdAt: rec.createdAt } : null,
-  }});
-});
-
-app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
-  const tenant = getSessionTenant(req);
-  const cal = tenant?.calendarService;
-  if (!cal) return res.status(400).json({ ok: false, error: "No calendar configured" });
-  try {
-    const data = await cal.testCalendarConnection();
-    const tz = tenant.timezone;
-    const today = new Date().toLocaleDateString("en-CA", { timeZone: tz });
-    const events = await cal.listEventsForDay(today);
-    const slots = cal.generateSlotsForDay(today, events, 120);
-    res.json({ ok: true, connected: true, calendarId: data.id, summary: data.summary || "",
-      timeZone: data.timeZone || tz, todayDate: today,
-      todayEventCount: events.length, todayAvailableSlots: slots.length, slots });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
-
-app.post("/api/live-call/:callSid/reextract", requireApiAuth, async (req, res) => {
-  try {
-    const { callSid } = req.params;
-    const extracted = await extractionService.refreshStructuredCallInfo(callSid);
-    const tenant = getSessionTenant(req);
-    let created = null;
-    if (tenant?.calendarService) {
-      try { created = await tenant.calendarService.maybeAutoCreateAppointment(callSid); } catch (_) {}
+    async function api(url, opts) {
+      const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      return r.json();
     }
-    res.json({ ok: true, extracted, createdEventId: created?.id || null });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
 
-app.post("/api/live-call/:callSid/create-appointment", requireApiAuth, async (req, res) => {
-  const tenant = getSessionTenant(req);
-  if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
-  try {
-    const event = await tenant.calendarService.createAppointmentEvent(req.params.callSid);
-    res.json({ ok: true, eventId: event.id, event });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
-
-// =========================
-// Calendar Management APIs
-// =========================
-app.get("/api/calendar/events", requireApiAuth, async (req, res) => {
-  const tenant = getSessionTenant(req);
-  if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
-  try {
-    const events = await tenant.calendarService.listEventsForDay(req.query.date);
-    res.json({ ok: true, events });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
-
-app.get("/api/calendar/slots", requireApiAuth, async (req, res) => {
-  const tenant = getSessionTenant(req);
-  if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
-  try {
-    const events = await tenant.calendarService.listEventsForDay(req.query.date);
-    const slots = tenant.calendarService.generateSlotsForDay(req.query.date, events, 60);
-    res.json({ ok: true, slots });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
-
-app.post("/api/calendar/block", requireApiAuth, async (req, res) => {
-  const tenant = getSessionTenant(req);
-  if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
-  const { date, startTime, endTime, reason } = req.body;
-  try {
-    // 通过 Google Calendar API 直接创建 blocked event
-    const { google } = require("googleapis");
-    const oauth2 = new google.auth.OAuth2(tenant.google.clientId, tenant.google.clientSecret);
-    oauth2.setCredentials({ refresh_token: tenant.google.refreshToken });
-    const calendar = google.calendar({ version: "v3", auth: oauth2 });
-    const event = await calendar.events.insert({
-      calendarId: tenant.google.calendarId || "primary",
-      requestBody: {
-        summary: reason ? `Blocked: ${reason}` : "Blocked - Unavailable",
-        start: { dateTime: `${date}T${startTime}:00`, timeZone: tenant.timezone },
-        end:   { dateTime: `${date}T${endTime}:00`,   timeZone: tenant.timezone },
-      },
-    });
-    res.json({ ok: true, eventId: event.data.id });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
-
-app.delete("/api/calendar/events/:eventId", requireApiAuth, async (req, res) => {
-  const tenant = getSessionTenant(req);
-  if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
-  try {
-    const { google } = require("googleapis");
-    const oauth2 = new google.auth.OAuth2(tenant.google.clientId, tenant.google.clientSecret);
-    oauth2.setCredentials({ refresh_token: tenant.google.refreshToken });
-    const calendar = google.calendar({ version: "v3", auth: oauth2 });
-    await calendar.events.delete({
-      calendarId: tenant.google.calendarId || "primary",
-      eventId: req.params.eventId,
-    });
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
-});
-
-// =========================
-// Recording APIs
-// =========================
-app.get("/api/live-call/:callSid/recording/info", requireApiAuth, async (req, res) => {
-  const call = liveCalls.get(req.params.callSid);
-  if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
-  let rec = call.recording;
-  if ((!rec || rec._fromDB) && !rec?.wavBuffer) {
-    const dbRec = await loadRecordingFromDB(req.params.callSid);
-    if (dbRec) { call.recording = dbRec; rec = dbRec; }
-  }
-  if (!rec?.available) return res.json({ ok: true, available: false });
-  res.json({ ok: true, available: true, durationSec: rec.durationSec, createdAt: rec.createdAt });
-});
-
-app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, async (req, res) => {
-  const call = liveCalls.get(req.params.callSid);
-  if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
-
-  // 如果内存中没有录音数据，从 DB 加载
-  let rec = call.recording;
-  if ((!rec || rec._fromDB) && !rec?.wavBuffer) {
-    const dbRec = await loadRecordingFromDB(req.params.callSid);
-    if (dbRec) {
-      call.recording = dbRec;
-      rec = dbRec;
+    async function loadTenants() {
+      const data = await api('/api/admin/tenants');
+      if (!data.ok) return;
+      const tb = document.getElementById('tenantTable');
+      if (!data.tenants.length) { tb.innerHTML = '<tr><td colspan="7" style="color:#64748b">No tenants yet.</td></tr>'; return; }
+      tb.innerHTML = data.tenants.map(t => `
+        <tr>
+          <td><strong>${esc(t.id)}</strong></td>
+          <td>${esc(t.businessName)}</td>
+          <td>${esc(t.phoneNumber || '—')}</td>
+          <td>${esc(t.voice)}</td>
+          <td><div class="webhook-url">${BASE}/twilio/voice/${esc(t.id)}</div></td>
+          <td>${t.hasCalendar ? '<span class="tag tag-green">OK</span>' : '<span class="tag tag-gray">None</span>'}</td>
+          <td style="white-space:nowrap">
+            <button class="btn btn-sm btn-gray" onclick="editTenant('${esc(t.id)}')">Edit</button>
+            <button class="btn btn-sm btn-red" onclick="delTenant('${esc(t.id)}')">Delete</button>
+          </td>
+        </tr>
+      `).join('');
     }
-  }
-  if (!rec?.available || !rec.wavBuffer) return res.status(404).json({ ok: false, error: "Not ready" });
 
-  const channel = req.query.channel || "both";
-  let wavToSend = rec.wavBuffer;
-  if (channel === "left" || channel === "right") {
-    wavToSend = buildWav(
-      channel === "left"  ? rec._callerFrames || [] : [],
-      channel === "right" ? rec._assistantFrames || [] : [],
-      true
-    );
-  }
-  const tmpPath = path.join(os.tmpdir(), `rec-${req.params.callSid}-${channel}.wav`);
-  fs.writeFile(tmpPath, wavToSend, (err) => {
-    if (err) return res.status(500).json({ ok: false, error: "Write failed" });
-    res.sendFile(tmpPath, {
-      headers: { "Content-Type": "audio/wav", "Content-Disposition": `inline; filename="call-${req.params.callSid}.wav"` },
-    }, () => fs.unlink(tmpPath, () => {}));
-  });
-});
+    function openModal(data) {
+      document.getElementById('modalTitle').textContent = data ? 'Edit Tenant' : 'Add Tenant';
+      document.getElementById('editId').value = data?.id || '';
+      document.getElementById('fId').value = data?.id || '';
+      document.getElementById('fId').disabled = !!data;
+      document.getElementById('fName').value = data?.businessName || '';
+      document.getElementById('fPhone').value = data?.phoneNumber || '';
+      document.getElementById('fVoice').value = data?.voice || 'alloy';
+      document.getElementById('fTz').value = data?.timezone || 'America/Halifax';
+      document.getElementById('fDuration').value = data?.defaultAppointmentMinutes || 60;
+      document.getElementById('fGreeting').value = data?.greeting || '';
+      document.getElementById('fPrompt').value = data?.prompt || '';
+      document.getElementById('fSpeed').value = data?.speechSpeed || 'moderate';
+      document.getElementById('fVadThreshold').value = data?.vadThreshold ?? 0.5;
+      document.getElementById('vadLabel').textContent = data?.vadThreshold ?? 0.5;
+      document.getElementById('fSilenceMs').value = data?.silenceDurationMs ?? 500;
+      document.getElementById('silenceLabel').textContent = data?.silenceDurationMs ?? 500;
+      document.getElementById('fUser').value = data?.adminUser || '';
+      document.getElementById('fPass').value = data?.adminPass || '';
+      document.getElementById('fGClientId').value = data?.google?.clientId || '';
+      document.getElementById('fGSecret').value = data?.google?.clientSecret || '';
+      document.getElementById('fGRefresh').value = data?.google?.refreshToken || '';
+      document.getElementById('fGCalId').value = data?.google?.calendarId || 'primary';
+      document.getElementById('modalBg').classList.add('open');
+    }
 
-// =========================
-// Admin APIs — 租户 CRUD
-// =========================
-app.get("/api/admin/tenants", requireAdmin, async (_req, res) => {
-  const list = tenantService.getAllTenants().map(t => ({
-    id: t.id, businessName: t.businessName, phoneNumber: t.phoneNumber,
-    voice: t.voice, hasCalendar: !!(t.google?.clientId && t.google?.refreshToken),
-  }));
-  res.json({ ok: true, tenants: list });
-});
+    function closeModal() { document.getElementById('modalBg').classList.remove('open'); }
 
-app.get("/api/admin/tenants/:id", requireAdmin, async (req, res) => {
-  const raw = await tenantService.getTenantRaw(req.params.id);
-  if (!raw) return res.status(404).json({ ok: false, error: "Not found" });
-  res.json({ ok: true, tenant: raw });
-});
+    async function editTenant(id) {
+      const data = await api(`/api/admin/tenants/${id}`);
+      if (data.ok) openModal(data.tenant);
+    }
 
-app.post("/api/admin/tenants", requireAdmin, async (req, res) => {
-  try {
-    await tenantService.createTenant(req.body, { getOrCreateCallSession });
-    res.json({ ok: true });
-  } catch (err) { res.status(400).json({ ok: false, error: err?.message }); }
-});
-
-app.put("/api/admin/tenants/:id", requireAdmin, async (req, res) => {
-  try {
-    await tenantService.updateTenant(req.params.id, req.body, { getOrCreateCallSession });
-    res.json({ ok: true });
-  } catch (err) { res.status(400).json({ ok: false, error: err?.message }); }
-});
-
-app.delete("/api/admin/tenants/:id", requireAdmin, async (req, res) => {
-  try {
-    await tenantService.deleteTenant(req.params.id);
-    res.json({ ok: true });
-  } catch (err) { res.status(400).json({ ok: false, error: err?.message }); }
-});
-
-// =========================
-// Twilio Voice Webhook — /twilio/voice/:tenantId
-// =========================
-app.post("/twilio/voice/:tenantId", (req, res) => {
-  const { tenantId } = req.params;
-  const tenant = tenantService.getTenant(tenantId);
-
-  const callSid = req.body.CallSid || `call_${Date.now()}`;
-  const from = req.body.From || "";
-  const to   = req.body.To || "";
-
-  // 绑定 callSid → tenantId
-  callTenantMap.set(callSid, tenantId);
-
-  const callSession = getOrCreateCallSession(callSid);
-  callSession.tenantId = tenantId;
-  callSession.from = from;
-  callSession.to = to;
-  callSession.status = "initiated";
-  callSession.updatedAt = new Date().toISOString();
-
-  const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
-  if (!wsUrl) return res.status(500).send("Missing PUBLIC_WSS_URL");
-
-  const streamUrl = wsUrl.replace("https://", "wss://").replace("http://", "ws://");
-  const greeting = tenant?.greeting || "Hello, please hold while I connect you.";
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">${greeting}</Say>
-  <Connect>
-    <Stream url="${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}" />
-  </Connect>
-</Response>`;
-  res.type("text/xml").send(twiml);
-});
-
-app.post("/twilio/voice/status", (req, res) => {
-  const callSid = req.body.CallSid || "";
-  if (callSid) {
-    const s = getOrCreateCallSession(callSid);
-    s.status = req.body.CallStatus || s.status;
-    s.from = req.body.From || s.from;
-    s.to = req.body.To || s.to;
-    s.updatedAt = new Date().toISOString();
-  }
-  res.sendStatus(200);
-});
-
-// =========================
-// 录音
-// =========================
-const finalizedCalls = new Set();
-
-function finalizeRecording(callSid, recorder) {
-  if (finalizedCalls.has(callSid)) return;
-  const { callerFrames, assistantFrames } = recorder.finalize();
-  if (!callerFrames.length && !assistantFrames.length) return;
-  finalizedCalls.add(callSid);
-  try {
-    const wavBuffer = buildWav(callerFrames, assistantFrames);
-    const s = getOrCreateCallSession(callSid);
-    const durationSec = Math.round((callerFrames.length * 160) / 8000);
-    s.recording = {
-      wavBuffer, _callerFrames: callerFrames, _assistantFrames: assistantFrames,
-      durationSec, createdAt: new Date().toISOString(), available: true,
-    };
-    s.updatedAt = new Date().toISOString();
-    // 持久化到 MongoDB
-    const tenantId = callTenantMap.get(callSid) || s.tenantId || "";
-    persistToDB(callSid, s);
-    persistRecordingToDB(callSid, tenantId, wavBuffer, callerFrames, assistantFrames, durationSec);
-    console.log(`[Recording] WAV ready for ${callSid}, ~${durationSec}s`);
-  } catch (err) { console.error("[Recording] build WAV failed:", err?.message); }
-}
-
-// =========================
-// WebSocket — Twilio Media Streams
-// =========================
-const wss = new WebSocket.Server({ noServer: true });
-
-server.on("upgrade", (request, socket, head) => {
-  if (request.url.startsWith("/media-stream")) {
-    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
-  } else { socket.destroy(); }
-});
-
-wss.on("connection", async (twilioWs, request) => {
-  const urlObj = new URL(request.url, `http://${request.headers.host}`);
-  const urlCallSid = urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
-
-  await restoreCallSession(urlCallSid);
-
-  let activeCallSid = urlCallSid;
-  let callSession = getOrCreateCallSession(activeCallSid);
-  let streamSid = "";
-  let assistantTranscriptBuffer = "";
-  let sessionConfigured = false;
-  let recordingStarted = false;   // 录音从 AI 第一个音频帧开始
-
-  const recorder = new TimelineRecorder();
-
-  console.log(`[WS] Connected: ${activeCallSid}`);
-
-  // ─── 连接 OpenAI Realtime ──────────────────
-  const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
-  );
-
-  /**
-   * 在 start 事件 rebind 后调用，用真实 callSid 找到租户并配置 session
-   */
-  function configureAndGreet() {
-    if (sessionConfigured) return;
-    sessionConfigured = true;
-
-    const tenantId = callTenantMap.get(activeCallSid);
-    const tenant = tenantId ? tenantService.getTenant(tenantId) : null;
-
-    let prompt = tenant?.prompt || FALLBACK_PROMPT;
-    const voice  = tenant?.voice || "alloy";
-    const tools  = tenant?.tools || tenantService.STANDARD_TOOLS;
-    const vadThreshold = tenant?.vadThreshold ?? 0.5;
-    const silenceDurationMs = tenant?.silenceDurationMs ?? 500;
-
-    // 根据语速设置注入 prompt 指令
-    const speedMap = {
-      slow: "\n\nIMPORTANT: Speak very slowly and clearly. Pause between sentences. Give the caller plenty of time to process.",
-      moderate: "\n\nSpeak at a calm, moderate pace. Pause briefly after each sentence.",
-      fast: "\n\nSpeak at a natural conversational pace.",
-    };
-    const speedInstruction = speedMap[tenant?.speechSpeed] || speedMap.moderate;
-    prompt += speedInstruction;
-
-    console.log(`[WS] Configured: ${activeCallSid} tenant=${tenantId || 'none'} voice=${voice} vad=${vadThreshold} silence=${silenceDurationMs}ms speed=${tenant?.speechSpeed || 'moderate'}`);
-
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.send(JSON.stringify({
-        type: "session.update",
-        session: {
-          modalities: ["audio", "text"],
-          instructions: prompt,
-          tools, tool_choice: "auto",
-          voice,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: { model: TRANSCRIPTION_MODEL },
-          turn_detection: { type: "server_vad", threshold: vadThreshold, silence_duration_ms: silenceDurationMs, prefix_padding_ms: 300 },
+    async function saveTenant() {
+      const editId = document.getElementById('editId').value;
+      const body = {
+        id: document.getElementById('fId').value.trim(),
+        businessName: document.getElementById('fName').value.trim(),
+        phoneNumber: document.getElementById('fPhone').value.trim(),
+        voice: document.getElementById('fVoice').value,
+        timezone: document.getElementById('fTz').value.trim(),
+        defaultAppointmentMinutes: parseInt(document.getElementById('fDuration').value) || 60,
+        greeting: document.getElementById('fGreeting').value.trim(),
+        prompt: document.getElementById('fPrompt').value.trim(),
+        speechSpeed: document.getElementById('fSpeed').value,
+        vadThreshold: parseFloat(document.getElementById('fVadThreshold').value) || 0.5,
+        silenceDurationMs: parseInt(document.getElementById('fSilenceMs').value) || 500,
+        adminUser: document.getElementById('fUser').value.trim(),
+        adminPass: document.getElementById('fPass').value,
+        google: {
+          clientId: document.getElementById('fGClientId').value.trim(),
+          clientSecret: document.getElementById('fGSecret').value.trim(),
+          refreshToken: document.getElementById('fGRefresh').value.trim(),
+          calendarId: document.getElementById('fGCalId').value.trim() || 'primary',
         },
-      }));
-      openaiWs.send(JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio", "text"], instructions: "Greet the caller and ask how you can help today." },
-      }));
+      };
+      const url = editId ? `/api/admin/tenants/${editId}` : '/api/admin/tenants';
+      const method = editId ? 'PUT' : 'POST';
+      const res = await api(url, { method, body: JSON.stringify(body) });
+      if (res.ok) { closeModal(); loadTenants(); } else { alert(res.error || 'Failed'); }
     }
-  }
 
-  openaiWs.on("open", () => {
-    console.log("[OpenAI] Realtime connected");
-    if (streamSid) configureAndGreet();
-  });
+    async function delTenant(id) {
+      if (!confirm(`Delete tenant "${id}"?`)) return;
+      const res = await api(`/api/admin/tenants/${id}`, { method: 'DELETE' });
+      if (res.ok) loadTenants(); else alert(res.error || 'Failed');
+    }
 
-  // ─── OpenAI → Twilio ─────────────────────
-  openaiWs.on("message", async (message) => {
-    try {
-      const data = JSON.parse(message.toString());
+    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-      // 记录 OpenAI 发来的错误
-      if (data.type === "error") {
-        console.error(`[OpenAI] Error event:`, JSON.stringify(data.error || data));
-      }
-
-      if (data.type === "conversation.item.input_audio_transcription.completed" && data.transcript) {
-        const t = cleanText(data.transcript);
-        if (t) { console.log("[Caller]", t); pushTranscript(activeCallSid, "caller", t);
-          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid); } catch (_) {} }
-      }
-
-      if (data.type === "response.audio_transcript.delta" && data.delta) assistantTranscriptBuffer += data.delta;
-
-      if (data.type === "response.audio.delta" && data.delta) {
-        if (!recordingStarted) {
-          recordingStarted = true;
-          console.log(`[Recording] Started — AI first audio frame for ${activeCallSid}`);
-        }
-        recorder.pushAssistant(data.delta);
-        if (streamSid && twilioWs.readyState === WebSocket.OPEN)
-          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: data.delta } }));
-      }
-
-      if (data.type === "response.done") {
-        const t = cleanText(assistantTranscriptBuffer);
-        assistantTranscriptBuffer = "";
-        if (t) { console.log("[Assistant]", t); pushTranscript(activeCallSid, "assistant", t);
-          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid); } catch (_) {} }
-      }
-
-      // Function Calling
-      if (data.type === "response.done") {
-        const tenantId = callTenantMap.get(activeCallSid);
-        const tenant = tenantId ? tenantService.getTenant(tenantId) : null;
-        const calSvc = tenant?.calendarService;
-        const tz = tenant?.timezone || "America/Halifax";
-        const apptMin = tenant?.defaultAppointmentMinutes || 60;
-
-        for (const item of (data.response?.output || [])) {
-          if (item.type !== "function_call") continue;
-          const fnName = item.name;
-          let fnArgs = {}; try { fnArgs = JSON.parse(item.arguments || "{}"); } catch (_) {}
-          console.log(`[Tool] ${fnName}`, fnArgs);
-          let toolResult = "";
-
-          if (fnName === "check_availability" && calSvc) {
-            try {
-              const events = await calSvc.listEventsForDay(fnArgs.date);
-              const slots = calSvc.generateSlotsForDay(fnArgs.date, events, apptMin);
-              if (!slots.length) { toolResult = `No available slots on ${fnArgs.date}. Ask for another date.`; }
-              else {
-                const labels = slots.map(s => new Date(s.start).toLocaleTimeString("en-CA", { timeZone: tz, hour: "numeric", minute: "2-digit" }));
-                toolResult = `Available on ${fnArgs.date}: ${labels.join(", ")}. Confirm with caller.`;
-              }
-            } catch (err) { toolResult = `Calendar check failed: ${err?.message}`; }
-          }
-
-          if (fnName === "create_appointment" && calSvc) {
-            try {
-              const s = getOrCreateCallSession(activeCallSid);
-              Object.assign(s.extracted, {
-                callerName: fnArgs.caller_name || s.extracted.callerName,
-                callbackNumber: fnArgs.callback_number || s.extracted.callbackNumber,
-                serviceAddress: fnArgs.service_address || s.extracted.serviceAddress,
-                issueSummary: fnArgs.issue_summary || s.extracted.issueSummary,
-                preferredDate: fnArgs.preferred_date || s.extracted.preferredDate,
-                preferredTime: fnArgs.preferred_time || s.extracted.preferredTime,
-                intent: fnArgs.intent || s.extracted.intent,
-                bookingConfirmed: true,
-              });
-              const event = await calSvc.createAppointmentEvent(activeCallSid);
-              persistToDB(activeCallSid, s);
-              toolResult = `Appointment created. Event ID: ${event.id}. Confirm to caller.`;
-            } catch (err) { toolResult = `Failed: ${err?.message}. Tell caller a team member will follow up.`; }
-          }
-
-          if (fnName === "end_call") {
-            const reason = fnArgs.reason || "complete";
-            console.log(`[EndCall] ${activeCallSid}, reason: ${reason}`);
-            toolResult = "Call ending now.";
-            setTimeout(async () => {
-              try {
-                if (twilioClient) await twilioClient.calls(activeCallSid).update({ status: "completed" });
-                else { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); }
-              } catch (e) { console.error("[EndCall] failed:", e?.message); }
-            }, 3000);
-          }
-
-          if (openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output: toolResult } }));
-            if (fnName !== "end_call") openaiWs.send(JSON.stringify({ type: "response.create" }));
-          }
-        }
-      }
-    } catch (err) { console.error("[OpenAI] error:", err?.message); }
-  });
-
-  openaiWs.on("error", (err) => console.error("[OpenAI] WS error:", err?.message));
-  openaiWs.on("close", (code, reason) => console.log(`[OpenAI] disconnected code=${code} reason=${reason?.toString() || ''}`));
-
-  // ─── Twilio → OpenAI ─────────────────────
-  let mediaCount = 0;
-  twilioWs.on("message", async (msg) => {
-    try {
-      const raw = msg.toString();
-      const data = JSON.parse(raw);
-
-      // 调试：记录所有事件类型
-      if (data.event === "media") {
-        mediaCount++;
-        if (mediaCount <= 3 || mediaCount % 100 === 0) {
-          console.log(`[Twilio] media packet #${mediaCount}`);
-        }
-      } else {
-        console.log(`[Twilio] event=${data.event}`, raw.substring(0, 400));
-      }
-
-      switch (data.event) {
-        case "start": {
-          streamSid = data.start?.streamSid || "";
-          const startCallSid = resolveStartCallSid(data.start, urlCallSid);
-          if (startCallSid && startCallSid !== activeCallSid) {
-            console.log(`[WS] Rebinding ${activeCallSid} -> ${startCallSid}`);
-            mergeCallSessions(startCallSid, activeCallSid);
-            if (callTenantMap.has(activeCallSid)) {
-              callTenantMap.set(startCallSid, callTenantMap.get(activeCallSid));
-              callTenantMap.delete(activeCallSid);
-            }
-            activeCallSid = startCallSid;
-            callSession = getOrCreateCallSession(activeCallSid);
-          }
-          if (streamSid) streamToCallSid.set(streamSid, activeCallSid);
-          callSession.streamSid = streamSid;
-          callSession.status = "in_progress";
-          callSession.updatedAt = new Date().toISOString();
-          console.log(`[WS] stream started call=${activeCallSid}`);
-          if (openaiWs.readyState === WebSocket.OPEN) configureAndGreet();
-          break;
-        }
-        case "media":
-          callSession.mediaPacketCount += 1;
-
-          // 提取 streamSid（有些 Twilio 版本不发 start 事件）
-          if (!streamSid && data.streamSid) {
-            streamSid = data.streamSid;
-            streamToCallSid.set(streamSid, activeCallSid);
-            callSession.streamSid = streamSid;
-            callSession.status = "in_progress";
-            callSession.updatedAt = new Date().toISOString();
-          }
-
-          // 第一个 media 包到达时触发 configureAndGreet（兜底 start 事件缺失）
-          if (!sessionConfigured && openaiWs.readyState === WebSocket.OPEN) {
-            console.log(`[WS] First media received, configuring session for ${activeCallSid}`);
-            configureAndGreet();
-          }
-
-          if (data.media?.payload) {
-            if (recordingStarted) recorder.pushCaller(data.media.payload);
-          }
-          if (openaiWs.readyState === WebSocket.OPEN)
-            openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
-          break;
-        case "stop": {
-          // 从 stop 事件提取真正的 callSid 做最后的 rebind
-          const stopCallSid = data.stop?.callSid || "";
-          if (stopCallSid && stopCallSid !== activeCallSid) {
-            console.log(`[WS] Stop-rebinding ${activeCallSid} -> ${stopCallSid}`);
-            mergeCallSessions(stopCallSid, activeCallSid);
-            if (callTenantMap.has(activeCallSid)) {
-              callTenantMap.set(stopCallSid, callTenantMap.get(activeCallSid));
-              callTenantMap.delete(activeCallSid);
-            }
-            activeCallSid = stopCallSid;
-            callSession = getOrCreateCallSession(activeCallSid);
-          }
-          if (!streamSid && data.streamSid) streamSid = data.streamSid;
-
-          console.log(`[WS] stream stopped: ${activeCallSid}`);
-          callSession.status = "stream_closed"; callSession.updatedAt = new Date().toISOString();
-          if (streamSid) streamToCallSid.delete(streamSid);
-          if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-          finalizeRecording(activeCallSid, recorder);
-          break;
-        }
-      }
-    } catch (err) { console.error("[Twilio] error:", err?.message); }
-  });
-
-  twilioWs.on("close", () => {
-    callSession.status = "stream_closed"; callSession.updatedAt = new Date().toISOString();
-    if (streamSid) streamToCallSid.delete(streamSid);
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-    finalizeRecording(activeCallSid, recorder);
-  });
-  twilioWs.on("error", (err) => console.error("[Twilio] WS error:", err?.message));
-});
-
-// =========================
-// Start (async — connect DB first)
-// =========================
-(async () => {
-  await connectDB();
-  await tenantService.loadAll({ getOrCreateCallSession });
-  await loadRecentCalls(200);
-
-  server.listen(PORT, () => console.log(`[Server] listening on port ${PORT}`));
-})().catch(err => {
-  console.error("FATAL startup error:", err);
-  process.exit(1);
-});
+    loadTenants();
+  </script>
+</body>
+</html>
