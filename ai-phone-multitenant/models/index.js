@@ -75,8 +75,8 @@ const recordingSchema = new mongoose.Schema({
   available:       { type: Boolean, default: false },
 }, { timestamps: true });
 
-const Tenant    = mongoose.model("Tenant", tenantSchema);
-const Call      = mongoose.model("Call", callSchema);
-const Recording = mongoose.model("Recording", recordingSchema);
+const Tenant    = mongoose.models.Tenant    || mongoose.model("Tenant", tenantSchema);
+const Call      = mongoose.models.Call      || mongoose.model("Call", callSchema);
+const Recording = mongoose.models.Recording || mongoose.model("Recording", recordingSchema);
 
 module.exports = { connectDB, Tenant, Call, Recording };
