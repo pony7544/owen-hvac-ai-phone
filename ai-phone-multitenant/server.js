@@ -181,8 +181,8 @@ app.get("/api/calendar/status", requireApiAuth, async (req, res) => {
 app.post("/api/live-call/:callSid/reextract", requireApiAuth, async (req, res) => {
   try {
     const { callSid } = req.params;
-    const extracted = await extractionService.refreshStructuredCallInfo(callSid);
     const tenant = getSessionTenant(req);
+    const extracted = await extractionService.refreshStructuredCallInfo(callSid, { customExtractionPrompt: tenant?.extractionPrompt || "" });
     let created = null;
     if (tenant?.calendarService) {
       try { created = await tenant.calendarService.maybeAutoCreateAppointment(callSid); } catch (_) {}
@@ -444,7 +444,8 @@ wss.on("connection", async (twilioWs, request) => {
   let streamSid = "";
   let assistantTranscriptBuffer = "";
   let sessionConfigured = false;
-  let recordingStarted = false;   // 录音从 AI 第一个音频帧开始
+  let recordingStarted = false;
+  let tenantExtractionPrompt = "";   // 租户自定义的 extraction prompt
 
   const recorder = new TimelineRecorder();
 
@@ -471,6 +472,7 @@ wss.on("connection", async (twilioWs, request) => {
     const tools  = tenant?.tools || tenantService.STANDARD_TOOLS;
     const vadThreshold = tenant?.vadThreshold ?? 0.5;
     const silenceDurationMs = tenant?.silenceDurationMs ?? 500;
+    tenantExtractionPrompt = tenant?.extractionPrompt || "";
 
     // 根据语速设置注入 prompt 指令
     const speedMap = {
@@ -522,7 +524,7 @@ wss.on("connection", async (twilioWs, request) => {
       if (data.type === "conversation.item.input_audio_transcription.completed" && data.transcript) {
         const t = cleanText(data.transcript);
         if (t) { console.log("[Caller]", t); pushTranscript(activeCallSid, "caller", t);
-          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid); } catch (_) {} }
+          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {} }
       }
 
       if (data.type === "response.audio_transcript.delta" && data.delta) assistantTranscriptBuffer += data.delta;
@@ -541,7 +543,7 @@ wss.on("connection", async (twilioWs, request) => {
         const t = cleanText(assistantTranscriptBuffer);
         assistantTranscriptBuffer = "";
         if (t) { console.log("[Assistant]", t); pushTranscript(activeCallSid, "assistant", t);
-          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid); } catch (_) {} }
+          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {} }
       }
 
       // Function Calling
