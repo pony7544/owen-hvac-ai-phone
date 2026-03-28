@@ -26,6 +26,7 @@ const tenantSchema = new mongoose.Schema({
   adminUser:    { type: String, default: "" },
   adminPass:    { type: String, default: "" },
   prompt:       { type: String, default: "" },
+  extractionPrompt: { type: String, default: "" },
   greeting:     { type: String, default: "" },
   // 语音控制参数
   speechSpeed:        { type: String, default: "moderate", enum: ["slow", "moderate", "fast"] },
