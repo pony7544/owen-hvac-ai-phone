@@ -70,6 +70,7 @@ const EXTRACTION_MODEL     = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-m
 // ─── Twilio REST Client（用于主动挂断电话）────
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
 const twilioAuthToken  = process.env.TWILIO_AUTH_TOKEN;
+const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;  // 外呼时的 From 号码
 let twilioClient = null;
 if (twilioAccountSid && twilioAuthToken) {
   const twilio = require("twilio");
@@ -174,6 +175,10 @@ app.post("/logout", (req, res) => {
 
 app.get("/live", requireLiveAuth, (_req, res) =>
   res.sendFile(path.join(__dirname, "public", "live.html"))
+);
+
+app.get("/agent", requireLiveAuth, (_req, res) =>
+  res.sendFile(path.join(__dirname, "public", "agent.html"))
 );
 
 // =========================
@@ -286,10 +291,12 @@ function twilioVoiceHandler(req, res) {
   const from    = req.body.From || "";
   const to      = req.body.To   || "";
 
+  const isAgent = agentCalls.has(callSid);
+
   const callSession = getOrCreateCallSession(callSid);
   callSession.from   = from;
   callSession.to     = to;
-  callSession.status = "initiated";
+  callSession.status = isAgent ? "answered" : "initiated";
   callSession.updatedAt = new Date().toISOString();
 
   const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
@@ -303,11 +310,23 @@ function twilioVoiceHandler(req, res) {
     ? wsUrl.replace("http://", "ws://")
     : wsUrl;
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  const streamParam = isAgent
+    ? `${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}&amp;mode=agent`
+    : `${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}`;
+
+  // Agent 外呼不播放欢迎语，直接连接；来电播放欢迎语
+  const twiml = isAgent
+    ? `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Hello, thank you for calling ${BUSINESS_NAME}.</Say>
   <Connect>
-    <Stream url="${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}" />
+    <Stream url="${streamParam}" />
+  </Connect>
+</Response>`
+    : `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Hello, thank you for calling ${BUSINESS_NAME}. Please hold while I connect you.</Say>
+  <Connect>
+    <Stream url="${streamParam}" />
   </Connect>
 </Response>`;
 
@@ -334,6 +353,7 @@ app.post("/twilio/voice/status", (req, res) => {
 // =========================
 // 防止 stop + close 双重触发
 const finalizedCalls = new Set();
+const agentCalls     = new Map();  // callSid → { task, summary }
 
 function finalizeRecording(callSid, recorder) {
   if (finalizedCalls.has(callSid)) return;
@@ -442,6 +462,7 @@ server.on("upgrade", (request, socket, head) => {
 wss.on("connection", async (twilioWs, request) => {
   const urlObj     = new URL(request.url, `http://${request.headers.host}`);
   const urlCallSid = urlObj.searchParams.get("callSid") || `call_${Date.now()}`;
+  const mode       = urlObj.searchParams.get("mode") || "inbound";  // "inbound" | "agent"
 
   // 尝试从 Redis 恢复（服务器重启场景）
   await restoreCallSession(urlCallSid);
@@ -452,11 +473,60 @@ wss.on("connection", async (twilioWs, request) => {
   let assistantTranscriptBuffer = "";
 
   // ─── 时间轴对齐录音器 ──────────────────────
-  // 用 Twilio 的 caller 媒体流作为时钟基准（每 20ms 一包），
-  // assistant 帧按实际到达时间对齐到同一时间轴
   const recorder = new TimelineRecorder();
 
-  console.log(`[WS] Twilio connected: ${activeCallSid}`);
+  // ─── Agent 模式：构建自定义指令 ──────────────
+  const isAgent   = mode === "agent";
+  const agentData = isAgent ? agentCalls.get(activeCallSid) : null;
+
+  let sessionInstructions, sessionTools, greetingInstruction;
+
+  if (isAgent && agentData) {
+    sessionInstructions = `
+You are an AI phone agent making an outbound call on behalf of a user. Your task is:
+
+${agentData.task}
+
+Rules:
+- You are the CALLER in this conversation. The person who picks up is the callee.
+- Be polite, natural, and professional.
+- Keep responses short and phone-friendly — one or two sentences at a time.
+- Speak at a calm, moderate pace.
+- Introduce yourself briefly: "Hi, my name is Owen, I'm calling to..." then state your purpose.
+- Complete the task as described. Ask clear questions to get the information you need.
+- If the task involves making a reservation or booking, confirm all details before ending.
+- When the task is complete, thank the person, say goodbye, and call the end_call tool.
+- If the callee cannot help or the request cannot be fulfilled, politely end the call with end_call.
+`.trim();
+
+    sessionTools = [
+      {
+        type: "function",
+        name: "end_call",
+        description: "End and hang up the phone call after completing the task or when no further progress can be made.",
+        parameters: {
+          type: "object",
+          properties: {
+            reason: {
+              type: "string",
+              description: "Brief reason: 'task_completed', 'task_failed', 'callee_unavailable', etc.",
+            },
+          },
+          required: ["reason"],
+        },
+      },
+    ];
+
+    greetingInstruction = `Introduce yourself and state the purpose of this call based on your task. Be brief and natural.`;
+
+    console.log(`[WS] Agent outbound connected: ${activeCallSid}`);
+  } else {
+    sessionInstructions = HVAC_SYSTEM_PROMPT;
+    sessionTools        = HVAC_TOOLS;
+    greetingInstruction = "Greet the caller and ask how you can help today.";
+
+    console.log(`[WS] Twilio inbound connected: ${activeCallSid}`);
+  }
 
   // ─── 连接 OpenAI Realtime ──────────────────
   const openaiWs = new WebSocket(
@@ -472,13 +542,12 @@ wss.on("connection", async (twilioWs, request) => {
   openaiWs.on("open", () => {
     console.log("[OpenAI] Realtime connected");
 
-    // session.update — 注入系统提示词 + Function Calling 工具
     openaiWs.send(JSON.stringify({
       type: "session.update",
       session: {
         modalities:   ["audio", "text"],
-        instructions: HVAC_SYSTEM_PROMPT,
-        tools:        HVAC_TOOLS,
+        instructions: sessionInstructions,
+        tools:        sessionTools,
         tool_choice:  "auto",
         voice:        REALTIME_VOICE,
         input_audio_format:  "g711_ulaw",
@@ -486,19 +555,19 @@ wss.on("connection", async (twilioWs, request) => {
         input_audio_transcription: { model: TRANSCRIPTION_MODEL },
         turn_detection: {
           type:                 "server_vad",
-          threshold:            0.4,           // 语音检测灵敏度（0-1），越低越容易检测到 caller 说话
-          silence_duration_ms:  500,           // 500ms 静音即认为 caller 说完（原 700ms）
-          prefix_padding_ms:    300,           // 保留 caller 开始说话前 300ms 的音频
+          threshold:            0.5,
+          silence_duration_ms:  500,
+          prefix_padding_ms:    300,
         },
       },
     }));
 
-    // AI 主动打招呼
+    // AI 主动开场
     openaiWs.send(JSON.stringify({
       type: "response.create",
       response: {
         modalities:   ["audio", "text"],
-        instructions: "Greet the caller and ask how you can help today.",
+        instructions: greetingInstruction,
       },
     }));
   });
@@ -732,6 +801,148 @@ wss.on("connection", async (twilioWs, request) => {
   });
 
   twilioWs.on("error", (err) => console.error("[Twilio] WS error:", err?.message));
+});
+
+// =========================
+// Agent 外呼系统
+// =========================
+
+// POST /api/agent/call — 发起 AI 外呼
+app.post("/api/agent/call", requireApiAuth, async (req, res) => {
+  const { phone, task } = req.body;
+  if (!phone || !task) {
+    return res.status(400).json({ ok: false, error: "Missing phone or task" });
+  }
+  if (!twilioClient) {
+    return res.status(500).json({ ok: false, error: "Twilio client not configured. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN." });
+  }
+  if (!twilioPhoneNumber) {
+    return res.status(500).json({ ok: false, error: "TWILIO_PHONE_NUMBER not set." });
+  }
+
+  const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!wsUrl) {
+    return res.status(500).json({ ok: false, error: "Missing PUBLIC_WSS_URL or RENDER_EXTERNAL_URL." });
+  }
+
+  try {
+    // 先用 Twilio REST API 发起外呼
+    const baseUrl = wsUrl.replace("wss://", "https://").replace("ws://", "http://");
+    const call = await twilioClient.calls.create({
+      to:   phone,
+      from: twilioPhoneNumber,
+      url:  `${baseUrl}/twilio/voice`,
+      statusCallback: `${baseUrl}/twilio/voice/status`,
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+    });
+
+    const callSid = call.sid;
+
+    // 初始化 session
+    const session = getOrCreateCallSession(callSid);
+    session.from   = twilioPhoneNumber;
+    session.to     = phone;
+    session.status = "initiated";
+    session.updatedAt = new Date().toISOString();
+
+    // 存储 agent 任务指令
+    agentCalls.set(callSid, { task, summary: null });
+
+    console.log(`[Agent] Outbound call ${callSid} to ${phone}`);
+    res.json({ ok: true, callSid });
+
+  } catch (err) {
+    console.error("[Agent] Failed to create outbound call:", err?.message);
+    res.status(500).json({ ok: false, error: err?.message || "Failed to create call" });
+  }
+});
+
+// GET /api/agent/call/:callSid — 获取 agent 通话状态
+app.get("/api/agent/call/:callSid", requireApiAuth, (req, res) => {
+  const call = liveCalls.get(req.params.callSid);
+  if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
+
+  const agent = agentCalls.get(req.params.callSid);
+  const rec = call.recording;
+  res.json({
+    ok: true,
+    call: {
+      callSid:    call.callSid,
+      from:       call.from,
+      to:         call.to,
+      status:     call.status,
+      transcript: call.transcript,
+      recording:  rec ? { available: !!rec.available, durationSec: rec.durationSec } : null,
+      summary:    agent?.summary || null,
+    },
+  });
+});
+
+// POST /api/agent/call/:callSid/hangup — 主动挂断 agent 通话
+app.post("/api/agent/call/:callSid/hangup", requireApiAuth, async (req, res) => {
+  const { callSid } = req.params;
+  try {
+    if (twilioClient) {
+      await twilioClient.calls(callSid).update({ status: "completed" });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message });
+  }
+});
+
+// GET /api/agent/call/:callSid/summary — 获取/生成通话总结
+app.get("/api/agent/call/:callSid/summary", requireApiAuth, async (req, res) => {
+  const { callSid } = req.params;
+  const call  = liveCalls.get(callSid);
+  const agent = agentCalls.get(callSid);
+  if (!call)  return res.status(404).json({ ok: false, error: "Call not found" });
+  if (!agent) return res.status(404).json({ ok: false, error: "Not an agent call" });
+
+  // 如果已经生成过 summary，直接返回
+  if (agent.summary) {
+    return res.json({ ok: true, summary: agent.summary });
+  }
+
+  // 用 OpenAI 生成总结
+  const transcript = (call.transcript || [])
+    .map(t => `${t.role}: ${t.text}`)
+    .join("\n");
+
+  if (!transcript) {
+    return res.json({ ok: true, summary: "No transcript available to summarize." });
+  }
+
+  try {
+    const OpenAI = require("openai");
+    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+    const completion = await openai.chat.completions.create({
+      model: EXTRACTION_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: `You are a helpful assistant that summarizes phone calls. The AI agent was given this task: "${agent.task}". Summarize the call outcome concisely, including:
+1. Whether the task was completed successfully
+2. Key information obtained (e.g. confirmation numbers, dates, names)
+3. Any issues or follow-up needed
+Be specific and factual. Write in plain language.`,
+        },
+        {
+          role: "user",
+          content: `Here is the full call transcript:\n\n${transcript}`,
+        },
+      ],
+      max_tokens: 500,
+    });
+
+    const summary = completion.choices[0]?.message?.content || "Unable to generate summary.";
+    agent.summary = summary;
+    res.json({ ok: true, summary });
+  } catch (err) {
+    console.error("[Agent] Summary generation failed:", err?.message);
+    res.json({ ok: true, summary: `Summary generation failed: ${err?.message}` });
+  }
 });
 
 // =========================
