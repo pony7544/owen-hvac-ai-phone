@@ -83,7 +83,8 @@
         <div class="form-group"><label>Appt Duration (min)</label><input class="input" id="fDuration" type="number" value="60"/></div>
       </div>
       <div class="form-group"><label>Greeting (TwiML Say)</label><input class="input" id="fGreeting" placeholder="Hello, thank you for calling..."/></div>
-      <div class="form-group"><label>AI Prompt</label><textarea class="input" id="fPrompt" placeholder="You are the phone receptionist for..."></textarea></div>
+      <div class="form-group"><label>AI Prompt (conversation)</label><textarea class="input" id="fPrompt" placeholder="You are the phone receptionist for..."></textarea></div>
+      <div class="form-group"><label>Extraction Prompt (data extraction from transcript)</label><textarea class="input" id="fExtractionPrompt" placeholder="You extract structured booking information from a phone call transcript..."></textarea></div>
 
       <h3 style="font-size:14px;margin:18px 0 12px;color:#94a3b8">Voice Controls</h3>
       <div class="form-group">
@@ -169,6 +170,7 @@
       document.getElementById('fDuration').value = data?.defaultAppointmentMinutes || 60;
       document.getElementById('fGreeting').value = data?.greeting || '';
       document.getElementById('fPrompt').value = data?.prompt || '';
+      document.getElementById('fExtractionPrompt').value = data?.extractionPrompt || '';
       document.getElementById('fSpeed').value = data?.speechSpeed || 'moderate';
       document.getElementById('fVadThreshold').value = data?.vadThreshold ?? 0.5;
       document.getElementById('vadLabel').textContent = data?.vadThreshold ?? 0.5;
@@ -201,6 +203,7 @@
         defaultAppointmentMinutes: parseInt(document.getElementById('fDuration').value) || 60,
         greeting: document.getElementById('fGreeting').value.trim(),
         prompt: document.getElementById('fPrompt').value.trim(),
+        extractionPrompt: document.getElementById('fExtractionPrompt').value.trim(),
         speechSpeed: document.getElementById('fSpeed').value,
         vadThreshold: parseFloat(document.getElementById('fVadThreshold').value) || 0.5,
         silenceDurationMs: parseInt(document.getElementById('fSilenceMs').value) || 500,
