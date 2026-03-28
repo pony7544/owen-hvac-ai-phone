@@ -466,11 +466,22 @@ wss.on("connection", async (twilioWs, request) => {
     const tenantId = callTenantMap.get(activeCallSid);
     const tenant = tenantId ? tenantService.getTenant(tenantId) : null;
 
-    const prompt = tenant?.prompt || FALLBACK_PROMPT;
+    let prompt = tenant?.prompt || FALLBACK_PROMPT;
     const voice  = tenant?.voice || "alloy";
     const tools  = tenant?.tools || tenantService.STANDARD_TOOLS;
+    const vadThreshold = tenant?.vadThreshold ?? 0.5;
+    const silenceDurationMs = tenant?.silenceDurationMs ?? 500;
 
-    console.log(`[WS] Configured: ${activeCallSid} tenant=${tenantId || 'none'} voice=${voice}`);
+    // 根据语速设置注入 prompt 指令
+    const speedMap = {
+      slow: "\n\nIMPORTANT: Speak very slowly and clearly. Pause between sentences. Give the caller plenty of time to process.",
+      moderate: "\n\nSpeak at a calm, moderate pace. Pause briefly after each sentence.",
+      fast: "\n\nSpeak at a natural conversational pace.",
+    };
+    const speedInstruction = speedMap[tenant?.speechSpeed] || speedMap.moderate;
+    prompt += speedInstruction;
+
+    console.log(`[WS] Configured: ${activeCallSid} tenant=${tenantId || 'none'} voice=${voice} vad=${vadThreshold} silence=${silenceDurationMs}ms speed=${tenant?.speechSpeed || 'moderate'}`);
 
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(JSON.stringify({
@@ -483,7 +494,7 @@ wss.on("connection", async (twilioWs, request) => {
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
-          turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: 500, prefix_padding_ms: 300 },
+          turn_detection: { type: "server_vad", threshold: vadThreshold, silence_duration_ms: silenceDurationMs, prefix_padding_ms: 300 },
         },
       }));
       openaiWs.send(JSON.stringify({
