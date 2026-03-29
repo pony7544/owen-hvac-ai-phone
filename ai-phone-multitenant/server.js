@@ -648,13 +648,25 @@ wss.on("connection", async (twilioWs, request) => {
             } catch (err) { toolResult = `Failed: ${err?.message}. Tell caller a team member will follow up.`; }
           }
 
-          if (fnName === "end_call") {
+         if (fnName === "end_call") {
             const reason = fnArgs.reason || "complete";
             console.log(`[EndCall] ${activeCallSid}, reason: ${reason}`);
-            toolResult = "Call ending now.";
-            if (goodbyeTimer) { clearTimeout(goodbyeTimer); goodbyeTimer = null; }
-            forceHangup(reason);
+  
+          // 告诉 AI 要挂断了，让它说再见
+            toolResult = "Call ending. Say a brief goodbye now.";
+  
+          // 清除可能存在的自动挂断计时器
+          if (goodbyeTimer) { 
+            clearTimeout(goodbyeTimer); 
+            goodbyeTimer = null; 
           }
+  
+  // ✅ 修复：延迟挂断，给 AI 充足时间说完最后的话
+  console.log(`[EndCall] Delaying hangup by 6 seconds to let AI finish speaking...`);
+  setTimeout(() => {
+    forceHangup(reason);
+  }, 6000);  // 6 秒 + forceHangup 内部的 2 秒 = 总共 8 秒
+}
 
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output: toolResult } }));
