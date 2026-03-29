@@ -60,7 +60,7 @@ function createCalendarService(config = {}) {
         }
       }
     } catch (error) {
-      console.error(`[Calendar] Error getting timezone offset for ${tz} on ${dateStr} ${timeStr}:`, error);
+      console.error(`[Calendar] Error getting timezone offset for ${tz} on ${dateStr} ${timeStr}:`, error.message);
     }
     
     // 如果出错，返回默认偏移（Halifax 标准时间）
@@ -102,24 +102,49 @@ function createCalendarService(config = {}) {
   }
 
   async function testCalendarConnection() {
-    const res = await calendar.calendars.get({
-      calendarId: googleCalendarId,
-    });
-    return res.data;
+    try {
+      const res = await calendar.calendars.get({
+        calendarId: googleCalendarId,
+      });
+      console.log(`[Calendar] ✓ Connection test successful for calendar: ${res.data.summary}`);
+      return res.data;
+    } catch (error) {
+      console.error(`[Calendar] ✗ Connection test failed:`, error.message);
+      throw error;
+    }
   }
 
+  /**
+   * 获取指定日期的所有事件
+   * 修复：添加时区偏移到 timeMin 和 timeMax，确保查询正确的时间范围
+   */
   async function listEventsForDay(dateStr) {
-    // 使用 timeZone 参数让 Google Calendar API 按业务时区计算日期范围
-    const res = await calendar.events.list({
-      calendarId: googleCalendarId,
-      timeMin: `${dateStr}T00:00:00`,
-      timeMax: `${dateStr}T23:59:59`,
-      timeZone: businessTimezone,
-      singleEvents: true,
-      orderBy: "startTime",
-    });
+    try {
+      // 添加时区偏移，确保 Google Calendar API 正确解释时间范围
+      const offset = getTimezoneOffset(dateStr, "00:00", businessTimezone);
+      
+      const timeMin = `${dateStr}T00:00:00${offset}`;
+      const timeMax = `${dateStr}T23:59:59${offset}`;
+      
+      console.log(`[Calendar] Listing events for ${dateStr} (${businessTimezone})`);
+      console.log(`[Calendar] Query range: ${timeMin} to ${timeMax}`);
+      
+      const res = await calendar.events.list({
+        calendarId: googleCalendarId,
+        timeMin,
+        timeMax,
+        timeZone: businessTimezone,
+        singleEvents: true,
+        orderBy: "startTime",
+      });
 
-    return res.data.items || [];
+      const events = res.data.items || [];
+      console.log(`[Calendar] Found ${events.length} event(s) on ${dateStr}`);
+      return events;
+    } catch (error) {
+      console.error(`[Calendar] Error listing events for ${dateStr}:`, error.message);
+      throw error;
+    }
   }
 
   function generateSlotsForDay(dateStr, events, slotMinutes = 120) {
@@ -134,6 +159,7 @@ function createCalendarService(config = {}) {
         return { startMin: s.getHours() * 60 + s.getMinutes(), endMin: e.getHours() * 60 + e.getMinutes() };
       });
 
+    // 营业时间：8:00 - 18:00
     for (let startMin = 8 * 60; startMin + slotMinutes <= 18 * 60; startMin += slotMinutes) {
       const endMin = startMin + slotMinutes;
 
@@ -151,6 +177,7 @@ function createCalendarService(config = {}) {
       }
     }
 
+    console.log(`[Calendar] Generated ${slots.length} available slot(s) for ${dateStr}`);
     return slots;
   }
 
@@ -167,11 +194,19 @@ function createCalendarService(config = {}) {
       throw new Error("Unable to parse normalized preferred date/time.");
     }
 
-    // 日志输出，方便调试
-    console.log(`[Calendar] Creating appointment for ${f.callerName}`);
+    // 详细日志
+    console.log(`[Calendar] ============= Creating Appointment =============`);
+    console.log(`[Calendar] Business: ${businessName}`);
     console.log(`[Calendar] Timezone: ${businessTimezone}`);
-    console.log(`[Calendar] Start: ${parsed.startLocal}`);
-    console.log(`[Calendar] End: ${parsed.endLocal}`);
+    console.log(`[Calendar] Customer: ${f.callerName || 'N/A'}`);
+    console.log(`[Calendar] Phone: ${f.callbackNumber || 'N/A'}`);
+    console.log(`[Calendar] Address: ${f.serviceAddress || 'N/A'}`);
+    console.log(`[Calendar] Issue: ${f.issueSummary || 'N/A'}`);
+    console.log(`[Calendar] Requested Date: ${f.preferredDate}`);
+    console.log(`[Calendar] Requested Time: ${f.preferredTime}`);
+    console.log(`[Calendar] Parsed Start (RFC3339): ${parsed.startLocal}`);
+    console.log(`[Calendar] Parsed End (RFC3339): ${parsed.endLocal}`);
+    console.log(`[Calendar] ================================================`);
 
     const event = {
       summary: `Service Call - ${f.callerName || "Customer"}`,
@@ -194,19 +229,25 @@ function createCalendarService(config = {}) {
       },
     };
 
-    const res = await calendar.events.insert({
-      calendarId: googleCalendarId,
-      requestBody: event,
-    });
+    try {
+      const res = await calendar.events.insert({
+        calendarId: googleCalendarId,
+        requestBody: event,
+      });
 
-    session.extracted.appointmentCreated = true;
-    session.extracted.appointmentEventId = res.data.id || "";
-    session.updatedAt = new Date().toISOString();
+      session.extracted.appointmentCreated = true;
+      session.extracted.appointmentEventId = res.data.id || "";
+      session.updatedAt = new Date().toISOString();
 
-    console.log(`[Calendar] Appointment created successfully: ${res.data.id}`);
-    console.log(`[Calendar] Event link: ${res.data.htmlLink}`);
+      console.log(`[Calendar] ✓ Appointment created successfully`);
+      console.log(`[Calendar] Event ID: ${res.data.id}`);
+      console.log(`[Calendar] Calendar Link: ${res.data.htmlLink || 'N/A'}`);
 
-    return res.data;
+      return res.data;
+    } catch (error) {
+      console.error(`[Calendar] ✗ Failed to create appointment:`, error.message);
+      throw error;
+    }
   }
 
   async function maybeAutoCreateAppointment(callSid) {
