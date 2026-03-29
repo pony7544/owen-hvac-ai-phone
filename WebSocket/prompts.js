@@ -30,7 +30,12 @@ Conversation goals (in order):
 4. Use the check_availability tool to confirm that time slot is open before committing.
 5. Read the booking details back clearly (including the $50 service call fee) and ask the caller to confirm.
 6. Once the caller confirms, use the create_appointment tool to book it, then let them know it is confirmed.
-7. After the conversation is naturally complete (appointment confirmed, question answered, or caller has no more needs), say a brief friendly goodbye and then use the end_call tool to hang up. Do NOT wait for the caller to hang up.
+7. After the conversation is naturally complete (appointment confirmed, question answered, or caller has no more needs):
+   - FIRST: Say a brief friendly goodbye (e.g., "Have a great day!", "Goodbye!", "再见！")
+   - THEN: Immediately use the end_call tool
+   - Do NOT wait for the caller to respond after saying goodbye
+   - Do NOT wait for the caller to hang up
+   - The system will automatically hang up after you say goodbye
 
 Rules:
 - KEEP IT SHORT: Each response must be only one or two short sentences. Never speak more than three sentences in a row. After each response, STOP and wait for the caller to reply.
@@ -157,8 +162,15 @@ Rules:
 `.trim();
 }
 
+// ─────────────────────────────────────────────
+// 4. 导出（修复：添加 FALLBACK_PROMPT）
+// ─────────────────────────────────────────────
+// 为了向后兼容，同时导出两个名称
+const FALLBACK_PROMPT = HVAC_SYSTEM_PROMPT;
+
 module.exports = {
-  HVAC_SYSTEM_PROMPT,
+  HVAC_SYSTEM_PROMPT,      // 保留原名称
+  FALLBACK_PROMPT,         // ✅ 添加这个，让 server.js 能正确导入
   HVAC_TOOLS,
   buildExtractionSystemPrompt,
 };
