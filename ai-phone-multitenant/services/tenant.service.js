@@ -1,11 +1,11 @@
 // =============================================================
 // services/tenant.service.js — MongoDB 版多租户管理
-// DB 为持久化层，内存 Map 为运行时缓存（含 calendarService 实例）
+// 更新：添加营业时间、服务类型和 API Key 配置支持
 // =============================================================
 
 const { createCalendarService } = require("./calendar.service");
 
-// 懒加载 Model，避免循环依赖导致 OverwriteModelError
+// 懒加载 Model，避免循环依赖
 function getTenantModel() {
   return require("../models").Tenant;
 }
@@ -55,6 +55,7 @@ let byUser  = new Map();
 function buildRuntimeTenant(doc, getOrCreateCallSession) {
   const cfg = doc.toObject ? doc.toObject() : doc;
   let calendarService = null;
+  
   if (cfg.google?.clientId && cfg.google?.clientSecret && cfg.google?.refreshToken) {
     calendarService = createCalendarService({
       googleClientId:            cfg.google.clientId,
@@ -65,14 +66,22 @@ function buildRuntimeTenant(doc, getOrCreateCallSession) {
       defaultAppointmentMinutes: cfg.defaultAppointmentMinutes || 60,
       businessName:              cfg.businessName || cfg.id,
       getOrCreateCallSession,
+      // ===== 新增参数：传递营业时间和服务类型配置 =====
+      businessHours:             cfg.businessHours || null,
+      serviceTypes:              cfg.serviceTypes || [],
+      slotInterval:              cfg.slotInterval || 30,
     });
   }
+  
   return {
-    id: cfg.id, businessName: cfg.businessName || cfg.id,
+    id: cfg.id, 
+    businessName: cfg.businessName || cfg.id,
     timezone: cfg.timezone || "America/Halifax",
-    phoneNumber: cfg.phoneNumber || "", voice: cfg.voice || "alloy",
+    phoneNumber: cfg.phoneNumber || "", 
+    voice: cfg.voice || "alloy",
     defaultAppointmentMinutes: cfg.defaultAppointmentMinutes || 60,
-    adminUser: cfg.adminUser || "", adminPass: cfg.adminPass || "",
+    adminUser: cfg.adminUser || "", 
+    adminPass: cfg.adminPass || "",
     prompt: cfg.prompt || "",
     extractionPrompt: cfg.extractionPrompt || "",
     greeting: cfg.greeting || `Hello, thank you for calling ${cfg.businessName || cfg.id}. Please hold.`,
@@ -82,6 +91,11 @@ function buildRuntimeTenant(doc, getOrCreateCallSession) {
     tools: STANDARD_TOOLS,
     google: cfg.google || {},
     calendarService,
+    // ===== 新增字段：暴露给运行时 =====
+    businessHours: cfg.businessHours || null,
+    serviceTypes: cfg.serviceTypes || [],
+    slotInterval: cfg.slotInterval || 30,
+    apiKey: cfg.apiKey || "",  // 用于 Webhook API
   };
 }
 
