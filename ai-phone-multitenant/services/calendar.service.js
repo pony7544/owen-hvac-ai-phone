@@ -10,6 +10,10 @@ function createCalendarService(config = {}) {
     defaultAppointmentMinutes = 60,
     businessName = "Owen HVAC Corp",
     getOrCreateCallSession,
+    // ===== 新增参数 =====
+    businessHours = null,
+    serviceTypes = [],
+    slotInterval = 30,
   } = config;
 
   const oauth2Client = new google.auth.OAuth2(
@@ -35,59 +39,38 @@ function createCalendarService(config = {}) {
   }
 
   /**
-   * 获取指定时区在指定日期时间的 UTC 偏移量（如 "-04:00"）
-   * 这个函数会根据日期自动处理夏令时
+   * 获取指定时区在指定日期时间的 UTC 偏移量
    */
   function getTimezoneOffset(dateStr, timeStr, tz) {
     try {
-      // 构造日期时间对象
       const dateTime = new Date(`${dateStr}T${timeStr}:00`);
-      
-      // 使用 Intl.DateTimeFormat 的 formatToParts 获取时区偏移
       const formatter = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
-        timeZoneName: 'longOffset' // 返回 "GMT+08:00" 或 "GMT-04:00" 格式
+        timeZoneName: 'longOffset'
       });
-      
       const parts = formatter.formatToParts(dateTime);
       const timeZonePart = parts.find(part => part.type === 'timeZoneName');
-      
       if (timeZonePart && timeZonePart.value) {
-        // 解析 "GMT-04:00" 格式，提取 "-04:00"
         const match = timeZonePart.value.match(/GMT([+-]\d{2}:\d{2})/);
         if (match) {
-          return match[1]; // 返回 "-04:00" 或 "+08:00"
+          return match[1];
         }
       }
     } catch (error) {
-      console.error(`[Calendar] Error getting timezone offset for ${tz} on ${dateStr} ${timeStr}:`, error.message);
+      console.error(`[Calendar] Error getting timezone offset:`, error.message);
     }
-    
-    // 如果出错，返回默认偏移（Halifax 标准时间）
-    console.warn(`[Calendar] Using default offset -04:00 for timezone ${tz}`);
+    console.warn(`[Calendar] Using default offset -04:00`);
     return "-04:00";
   }
 
-  /**
-   * 解析首选日期时间，生成带时区偏移的 RFC3339 格式字符串
-   * @param {string} dateRaw - YYYY-MM-DD 格式
-   * @param {string} timeRaw - HH:MM 24小时格式
-   * @param {string} timezone - IANA 时区名称，如 "America/Halifax"
-   * @returns {object|null} - { startLocal, endLocal, timezone }
-   */
   function parsePreferredDateTime(dateRaw, timeRaw, timezone = businessTimezone) {
     if (!dateRaw || !timeRaw) return null;
     if (!isValidIsoDate(dateRaw)) return null;
     if (!isValidHHMM(timeRaw)) return null;
 
-    // 获取该时区在指定日期时间的 UTC 偏移量
     const offset = getTimezoneOffset(dateRaw, timeRaw, timezone);
-
-    // RFC3339 格式：本地时间 + 时区偏移
-    // 例如: "2026-03-29T14:00:00-04:00"
     const startLocal = `${dateRaw}T${timeRaw}:00${offset}`;
 
-    // 计算结束时间
     const [hh, mm] = timeRaw.split(":").map(Number);
     const totalMin = hh * 60 + mm + defaultAppointmentMinutes;
     const endHH = String(Math.floor(totalMin / 60) % 24).padStart(2, "0");
@@ -95,8 +78,8 @@ function createCalendarService(config = {}) {
     const endLocal = `${dateRaw}T${endHH}:${endMM}:00${offset}`;
 
     return {
-      startLocal,   // "2026-03-29T14:00:00-04:00"
-      endLocal,     // "2026-03-29T15:00:00-04:00"
+      startLocal,
+      endLocal,
       timezone,
     };
   }
@@ -106,28 +89,21 @@ function createCalendarService(config = {}) {
       const res = await calendar.calendars.get({
         calendarId: googleCalendarId,
       });
-      console.log(`[Calendar] ✓ Connection test successful for calendar: ${res.data.summary}`);
+      console.log(`[Calendar] ✓ Connection successful: ${res.data.summary}`);
       return res.data;
     } catch (error) {
-      console.error(`[Calendar] ✗ Connection test failed:`, error.message);
+      console.error(`[Calendar] ✗ Connection failed:`, error.message);
       throw error;
     }
   }
 
-  /**
-   * 获取指定日期的所有事件
-   * 修复：添加时区偏移到 timeMin 和 timeMax，确保查询正确的时间范围
-   */
   async function listEventsForDay(dateStr) {
     try {
-      // 添加时区偏移，确保 Google Calendar API 正确解释时间范围
       const offset = getTimezoneOffset(dateStr, "00:00", businessTimezone);
-      
       const timeMin = `${dateStr}T00:00:00${offset}`;
       const timeMax = `${dateStr}T23:59:59${offset}`;
       
-      console.log(`[Calendar] Listing events for ${dateStr} (${businessTimezone})`);
-      console.log(`[Calendar] Query range: ${timeMin} to ${timeMax}`);
+      console.log(`[Calendar] Listing events for ${dateStr}`);
       
       const res = await calendar.events.list({
         calendarId: googleCalendarId,
@@ -139,32 +115,72 @@ function createCalendarService(config = {}) {
       });
 
       const events = res.data.items || [];
-      console.log(`[Calendar] Found ${events.length} event(s) on ${dateStr}`);
+      console.log(`[Calendar] Found ${events.length} event(s)`);
       return events;
     } catch (error) {
-      console.error(`[Calendar] Error listing events for ${dateStr}:`, error.message);
+      console.error(`[Calendar] Error listing events:`, error.message);
       throw error;
     }
   }
 
-  function generateSlotsForDay(dateStr, events, slotMinutes = 120) {
+  /**
+   * 生成指定日期的可用时间槽
+   * @param {string} dateStr - YYYY-MM-DD
+   * @param {Array} events - 已有事件
+   * @param {number} slotDuration - 时间槽时长（分钟）
+   * @param {Object} customBusinessHours - 可选的营业时间配置
+   */
+  function generateSlotsForDay(dateStr, events, slotDuration, customBusinessHours = null) {
     const slots = [];
-
-    // 将事件转换为分钟范围（相对于当天 00:00 的分钟数）
+    
+    // 获取该日是星期几
+    const date = new Date(dateStr + 'T00:00:00');
+    const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    const dayName = dayNames[date.getDay()];
+    
+    // 获取营业时间配置
+    const hoursConfig = customBusinessHours || businessHours;
+    let openTime = "09:00";
+    let closeTime = "17:00";
+    let isOpen = true;
+    
+    if (hoursConfig && hoursConfig[dayName]) {
+      const dayHours = hoursConfig[dayName];
+      isOpen = dayHours.enabled !== false;
+      openTime = dayHours.open || openTime;
+      closeTime = dayHours.close || closeTime;
+    }
+    
+    if (!isOpen) {
+      console.log(`[Calendar] ${dateStr} (${dayName}) is closed`);
+      return [];
+    }
+    
+    const [openHH, openMM] = openTime.split(':').map(Number);
+    const [closeHH, closeMM] = closeTime.split(':').map(Number);
+    const openMinutes = openHH * 60 + openMM;
+    const closeMinutes = closeHH * 60 + closeMM;
+    
+    console.log(`[Calendar] ${dateStr} (${dayName}) hours: ${openTime} - ${closeTime}`);
+    
+    // 转换已有事件为分钟范围
     const busyRanges = events
       .filter(evt => evt.start?.dateTime && evt.end?.dateTime)
       .map(evt => {
         const s = new Date(evt.start.dateTime);
         const e = new Date(evt.end.dateTime);
-        return { startMin: s.getHours() * 60 + s.getMinutes(), endMin: e.getHours() * 60 + e.getMinutes() };
+        return { 
+          startMin: s.getHours() * 60 + s.getMinutes(), 
+          endMin: e.getHours() * 60 + e.getMinutes() 
+        };
       });
-
-    // 营业时间：8:00 - 18:00
-    for (let startMin = 8 * 60; startMin + slotMinutes <= 18 * 60; startMin += slotMinutes) {
-      const endMin = startMin + slotMinutes;
-
+    
+    // 生成时间槽
+    const interval = slotInterval || 30;
+    for (let startMin = openMinutes; startMin + slotDuration <= closeMinutes; startMin += interval) {
+      const endMin = startMin + slotDuration;
       const overlaps = busyRanges.some(b => startMin < b.endMin && endMin > b.startMin);
-
+      
       if (!overlaps) {
         const sh = String(Math.floor(startMin / 60)).padStart(2, "0");
         const sm = String(startMin % 60).padStart(2, "0");
@@ -176,9 +192,80 @@ function createCalendarService(config = {}) {
         });
       }
     }
-
-    console.log(`[Calendar] Generated ${slots.length} available slot(s) for ${dateStr}`);
+    
+    console.log(`[Calendar] Generated ${slots.length} slot(s) for ${dateStr}`);
     return slots;
+  }
+
+  /**
+   * 获取最近的可用时间槽
+   * @param {number} maxSlots - 最多返回多少个
+   * @param {number} lookAheadDays - 向前查找多少天
+   * @param {string|null} serviceTypeId - 服务类型 ID
+   */
+  async function getNextAvailableSlots(maxSlots = 3, lookAheadDays = 14, serviceTypeId = null) {
+    const availableSlots = [];
+    const today = new Date();
+    const todayStr = today.toLocaleDateString('en-CA', { timeZone: businessTimezone });
+    
+    // 确定时间槽时长
+    let slotDuration = defaultAppointmentMinutes;
+    let serviceName = "Service";
+    
+    if (serviceTypeId && Array.isArray(serviceTypes) && serviceTypes.length > 0) {
+      const serviceType = serviceTypes.find(st => st.id === serviceTypeId && st.enabled);
+      if (serviceType) {
+        slotDuration = serviceType.duration;
+        serviceName = serviceType.nameEn || serviceType.name;
+      }
+    }
+    
+    console.log(`[Calendar] Looking for ${maxSlots} slot(s) of ${slotDuration}min (${serviceName})`);
+    
+    for (let dayOffset = 0; dayOffset < lookAheadDays && availableSlots.length < maxSlots; dayOffset++) {
+      const checkDate = new Date(today);
+      checkDate.setDate(today.getDate() + dayOffset);
+      const dateStr = checkDate.toLocaleDateString('en-CA', { timeZone: businessTimezone });
+      
+      try {
+        const events = await listEventsForDay(dateStr);
+        const slots = generateSlotsForDay(dateStr, events, slotDuration);
+        
+        // 如果是今天，过滤掉已过去的时间
+        let filteredSlots = slots;
+        if (dateStr === todayStr) {
+          const now = new Date();
+          const currentMinutes = now.getHours() * 60 + now.getMinutes();
+          const buffer = 60;
+          
+          filteredSlots = slots.filter(slot => {
+            const slotTime = slot.start.split('T')[1];
+            const [hh, mm] = slotTime.split(':').map(Number);
+            const slotMinutes = hh * 60 + mm;
+            return slotMinutes > currentMinutes + buffer;
+          });
+        }
+        
+        // 添加到结果
+        for (const slot of filteredSlots) {
+          if (availableSlots.length >= maxSlots) break;
+          availableSlots.push({
+            date: dateStr,
+            startTime: slot.start.split('T')[1].substring(0, 5),
+            endTime: slot.end.split('T')[1].substring(0, 5),
+            dateTimeStart: slot.start,
+            dateTimeEnd: slot.end,
+            duration: slotDuration,
+            serviceType: serviceName
+          });
+        }
+      } catch (err) {
+        console.error(`[Calendar] Error checking ${dateStr}:`, err.message);
+      }
+    }
+    
+    console.log(`[Calendar] Found ${availableSlots.length} available slot(s)`);
+    return availableSlots;
   }
 
   async function createAppointmentEvent(callSid) {
@@ -194,7 +281,6 @@ function createCalendarService(config = {}) {
       throw new Error("Unable to parse normalized preferred date/time.");
     }
 
-    // 详细日志
     console.log(`[Calendar] ============= Creating Appointment =============`);
     console.log(`[Calendar] Business: ${businessName}`);
     console.log(`[Calendar] Timezone: ${businessTimezone}`);
@@ -220,8 +306,8 @@ function createCalendarService(config = {}) {
         `Booked by AI phone assistant for ${businessName}.`,
       ].join("\n"),
       start: {
-        dateTime: parsed.startLocal,  // 带时区偏移的完整 RFC3339 格式
-        timeZone: parsed.timezone,     // 同时保留时区信息
+        dateTime: parsed.startLocal,
+        timeZone: parsed.timezone,
       },
       end: {
         dateTime: parsed.endLocal,
@@ -279,12 +365,13 @@ function createCalendarService(config = {}) {
     testCalendarConnection,
     listEventsForDay,
     generateSlotsForDay,
+    getNextAvailableSlots,  // ✅ 新增导出
     createAppointmentEvent,
     maybeAutoCreateAppointment,
     parsePreferredDateTime,
     isValidIsoDate,
     isValidHHMM,
-    getTimezoneOffset, // 导出以便测试
+    getTimezoneOffset,
   };
 }
 
