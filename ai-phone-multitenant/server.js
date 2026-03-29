@@ -5,6 +5,8 @@
 // =============================================================
 
 require("dotenv").config();
+const { CallStats } = require("./models");
+const { buildSystemPrompt, buildTools } = require("./prompts");
 const os   = require("os");
 const fs   = require("fs");
 const express    = require("express");
@@ -99,6 +101,9 @@ app.get("/", (_req, res) => res.send("AI Phone System is running."));
 app.get("/login", (_req, res) => res.sendFile(path.join(__dirname, "public", "login.html")));
 app.get("/live", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "live.html")));
 app.get("/calendar", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "calendar.html")));
+app.get("/analytics", requireAuth, (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "analytics.html"));
+});
 app.get("/admin", requireAuth, (req, res) => {
   if (!req.session.isAdmin) return res.redirect("/live");
   res.sendFile(path.join(__dirname, "public", "admin.html"));
@@ -309,7 +314,143 @@ app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, async (req, 
     }, () => fs.unlink(tmpPath, () => {}));
   });
 });
-
+// 月度统计查询
+app.get("/api/analytics/monthly", requireApiAuth, async (req, res) => {
+  try {
+    const tenantId = req.session.tenantId;
+    const { year, month } = req.query;
+    
+    if (!year || !month) {
+      return res.status(400).json({ ok: false, error: "Year and month required" });
+    }
+    
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0, 23, 59, 59);
+    
+    const { Call } = require("./models");
+    const calls = await Call.find({
+      tenantId,
+      createdAt: { $gte: startDate, $lte: endDate }
+    }).sort({ createdAt: -1 }).limit(100);
+    
+    // 计算统计数据
+    const stats = {
+      totalCalls: calls.length,
+      totalDuration: calls.reduce((sum, c) => sum + (c.duration || 0), 0),
+      avgDuration: 0,
+      appointmentsBooked: calls.filter(c => c.extracted?.appointmentCreated).length,
+      callsBySource: {},
+      dailyStats: {}
+    };
+    
+    if (stats.totalCalls > 0) {
+      stats.avgDuration = Math.round(stats.totalDuration / stats.totalCalls);
+    }
+    
+    // 按来源分组
+    calls.forEach(call => {
+      const from = call.from || 'Unknown';
+      if (!stats.callsBySource[from]) {
+        stats.callsBySource[from] = { from, count: 0, totalDuration: 0 };
+      }
+      stats.callsBySource[from].count++;
+      stats.callsBySource[from].totalDuration += (call.duration || 0);
+    });
+    
+    stats.callsBySource = Object.values(stats.callsBySource)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+    
+    // 按日期分组
+    calls.forEach(call => {
+      const date = new Date(call.createdAt).toISOString().split('T')[0];
+      if (!stats.dailyStats[date]) {
+        stats.dailyStats[date] = { date, count: 0, duration: 0 };
+      }
+      stats.dailyStats[date].count++;
+      stats.dailyStats[date].duration += (call.duration || 0);
+    });
+    
+    stats.dailyStats = Object.values(stats.dailyStats)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    
+    res.json({ ok: true, stats, calls: calls.slice(0, 50) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+ 
+// 导出 CSV
+app.get("/api/analytics/export", requireApiAuth, async (req, res) => {
+  try {
+    const tenantId = req.session.tenantId;
+    const { year, month, format } = req.query;
+    
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0, 23, 59, 59);
+    
+    const { Call } = require("./models");
+    const calls = await Call.find({
+      tenantId,
+      createdAt: { $gte: startDate, $lte: endDate }
+    }).sort({ createdAt: -1 });
+    
+    if (format === 'csv') {
+      const csv = [
+        ['Date', 'Time', 'From', 'Duration (seconds)', 'Customer Name', 'Status', 'Appointment'].join(','),
+        ...calls.map(c => [
+          new Date(c.createdAt).toLocaleDateString(),
+          new Date(c.createdAt).toLocaleTimeString(),
+          c.from,
+          c.duration || 0,
+          (c.extracted?.callerName || '').replace(/,/g, ' '),
+          c.status,
+          c.extracted?.appointmentCreated ? 'Yes' : 'No'
+        ].join(','))
+      ].join('\n');
+      
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="calls-${year}-${month}.csv"`);
+      res.send(csv);
+    } else {
+      res.json({ ok: true, calls });
+    }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+ 
+// Webhook API（公开，需要 API Key）
+app.get("/api/webhook/analytics", async (req, res) => {
+  try {
+    const { apiKey, tenantId, year, month } = req.query;
+    
+    const tenant = tenantService.getTenant(tenantId);
+    if (!tenant || tenant.apiKey !== apiKey) {
+      return res.status(401).json({ ok: false, error: "Invalid API key" });
+    }
+    
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0, 23, 59, 59);
+    
+    const { Call } = require("./models");
+    const calls = await Call.find({
+      tenantId,
+      createdAt: { $gte: startDate, $lte: endDate }
+    });
+    
+    const stats = {
+      totalCalls: calls.length,
+      totalDuration: calls.reduce((sum, c) => sum + (c.duration || 0), 0),
+      avgDuration: calls.length > 0 ? Math.round(calls.reduce((sum, c) => sum + (c.duration || 0), 0) / calls.length) : 0,
+      appointmentsBooked: calls.filter(c => c.extracted?.appointmentCreated).length
+    };
+    
+    res.json({ ok: true, stats });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 // =========================
 // Admin APIs — 租户 CRUD
 // =========================
