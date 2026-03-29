@@ -34,24 +34,69 @@ function createCalendarService(config = {}) {
     return /^\d{2}:\d{2}$/.test(s);
   }
 
+  /**
+   * 获取指定时区在指定日期时间的 UTC 偏移量（如 "-04:00"）
+   * 这个函数会根据日期自动处理夏令时
+   */
+  function getTimezoneOffset(dateStr, timeStr, tz) {
+    try {
+      // 构造日期时间对象
+      const dateTime = new Date(`${dateStr}T${timeStr}:00`);
+      
+      // 使用 Intl.DateTimeFormat 的 formatToParts 获取时区偏移
+      const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        timeZoneName: 'longOffset' // 返回 "GMT+08:00" 或 "GMT-04:00" 格式
+      });
+      
+      const parts = formatter.formatToParts(dateTime);
+      const timeZonePart = parts.find(part => part.type === 'timeZoneName');
+      
+      if (timeZonePart && timeZonePart.value) {
+        // 解析 "GMT-04:00" 格式，提取 "-04:00"
+        const match = timeZonePart.value.match(/GMT([+-]\d{2}:\d{2})/);
+        if (match) {
+          return match[1]; // 返回 "-04:00" 或 "+08:00"
+        }
+      }
+    } catch (error) {
+      console.error(`[Calendar] Error getting timezone offset for ${tz} on ${dateStr} ${timeStr}:`, error);
+    }
+    
+    // 如果出错，返回默认偏移（Halifax 标准时间）
+    console.warn(`[Calendar] Using default offset -04:00 for timezone ${tz}`);
+    return "-04:00";
+  }
+
+  /**
+   * 解析首选日期时间，生成带时区偏移的 RFC3339 格式字符串
+   * @param {string} dateRaw - YYYY-MM-DD 格式
+   * @param {string} timeRaw - HH:MM 24小时格式
+   * @param {string} timezone - IANA 时区名称，如 "America/Halifax"
+   * @returns {object|null} - { startLocal, endLocal, timezone }
+   */
   function parsePreferredDateTime(dateRaw, timeRaw, timezone = businessTimezone) {
     if (!dateRaw || !timeRaw) return null;
     if (!isValidIsoDate(dateRaw)) return null;
     if (!isValidHHMM(timeRaw)) return null;
 
-    // 直接用本地时间字符串，不经过 Date 对象（避免 UTC 转换偏移）
-    const startLocal = `${dateRaw}T${timeRaw}:00`;
+    // 获取该时区在指定日期时间的 UTC 偏移量
+    const offset = getTimezoneOffset(dateRaw, timeRaw, timezone);
 
-    // 计算结束时间：手动加分钟
+    // RFC3339 格式：本地时间 + 时区偏移
+    // 例如: "2026-03-29T14:00:00-04:00"
+    const startLocal = `${dateRaw}T${timeRaw}:00${offset}`;
+
+    // 计算结束时间
     const [hh, mm] = timeRaw.split(":").map(Number);
     const totalMin = hh * 60 + mm + defaultAppointmentMinutes;
     const endHH = String(Math.floor(totalMin / 60) % 24).padStart(2, "0");
     const endMM = String(totalMin % 60).padStart(2, "0");
-    const endLocal = `${dateRaw}T${endHH}:${endMM}:00`;
+    const endLocal = `${dateRaw}T${endHH}:${endMM}:00${offset}`;
 
     return {
-      startLocal,   // "2026-03-29T14:00:00" — 本地时间，不含时区
-      endLocal,     // "2026-03-29T15:00:00"
+      startLocal,   // "2026-03-29T14:00:00-04:00"
+      endLocal,     // "2026-03-29T15:00:00-04:00"
       timezone,
     };
   }
@@ -117,10 +162,16 @@ function createCalendarService(config = {}) {
     const session = getOrCreateCallSession(callSid);
     const f = session.extracted || {};
 
-    const parsed = parsePreferredDateTime(f.preferredDate, f.preferredTime);
+    const parsed = parsePreferredDateTime(f.preferredDate, f.preferredTime, businessTimezone);
     if (!parsed) {
       throw new Error("Unable to parse normalized preferred date/time.");
     }
+
+    // 日志输出，方便调试
+    console.log(`[Calendar] Creating appointment for ${f.callerName}`);
+    console.log(`[Calendar] Timezone: ${businessTimezone}`);
+    console.log(`[Calendar] Start: ${parsed.startLocal}`);
+    console.log(`[Calendar] End: ${parsed.endLocal}`);
 
     const event = {
       summary: `Service Call - ${f.callerName || "Customer"}`,
@@ -134,8 +185,8 @@ function createCalendarService(config = {}) {
         `Booked by AI phone assistant for ${businessName}.`,
       ].join("\n"),
       start: {
-        dateTime: parsed.startLocal,
-        timeZone: parsed.timezone,
+        dateTime: parsed.startLocal,  // 带时区偏移的完整 RFC3339 格式
+        timeZone: parsed.timezone,     // 同时保留时区信息
       },
       end: {
         dateTime: parsed.endLocal,
@@ -151,6 +202,9 @@ function createCalendarService(config = {}) {
     session.extracted.appointmentCreated = true;
     session.extracted.appointmentEventId = res.data.id || "";
     session.updatedAt = new Date().toISOString();
+
+    console.log(`[Calendar] Appointment created successfully: ${res.data.id}`);
+    console.log(`[Calendar] Event link: ${res.data.htmlLink}`);
 
     return res.data;
   }
@@ -189,6 +243,7 @@ function createCalendarService(config = {}) {
     parsePreferredDateTime,
     isValidIsoDate,
     isValidHHMM,
+    getTimezoneOffset, // 导出以便测试
   };
 }
 
