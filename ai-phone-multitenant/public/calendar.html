@@ -55,7 +55,7 @@
     <div class="topbar-nav">
       <a href="/live">Dashboard</a>
       <a href="/calendar">Calendar</a>
-      <a href="/analytics">Analytics</a> 
+      <a href="/analytics">Analytics</a>
       <a href="/logout">Logout</a>
     </div>
   </div>
@@ -105,13 +105,34 @@
   </div>
 
   <script>
-    function today() { return new Date().toLocaleDateString('en-CA'); }
-    function getDate() { return document.getElementById('dateInput').value || today(); }
+    // ── 日期工具函数（全部使用本地时间，避免 UTC 时区偏移）──────────────
+    function today() {
+      const d = new Date();
+      return formatDate(d);
+    }
 
-    function shiftDate(days) {
-      const d = new Date(getDate());
-      d.setDate(d.getDate() + days);
-      document.getElementById('dateInput').value = d.toLocaleDateString('en-CA');
+    // "yyyy-mm-dd" 字符串 → 本地 Date 对象（关键修复）
+    function parseLocalDate(str) {
+      const [y, m, d] = str.split('-').map(Number);
+      return new Date(y, m - 1, d);
+    }
+
+    // Date 对象 → "yyyy-mm-dd" 字符串
+    function formatDate(d) {
+      const yyyy = d.getFullYear();
+      const mm   = String(d.getMonth() + 1).padStart(2, '0');
+      const dd   = String(d.getDate()).padStart(2, '0');
+      return `${yyyy}-${mm}-${dd}`;
+    }
+
+    function getDate() {
+      return document.getElementById('dateInput').value || today();
+    }
+
+    function shiftDate(delta) {
+      const d = parseLocalDate(getDate()); // ← 修复：本地解析，不走 UTC
+      d.setDate(d.getDate() + delta);
+      document.getElementById('dateInput').value = formatDate(d);
       loadDay();
     }
 
@@ -119,6 +140,7 @@
       document.getElementById('dateInput').value = today();
       loadDay();
     }
+    // ────────────────────────────────────────────────────────────────────
 
     function fmtTime(iso) {
       return new Date(iso).toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit', hour12: true });
@@ -168,17 +190,9 @@
       const allSlots = [];
       for (let h = 8; h < 18; h++) {
         const hh = String(h).padStart(2, '0');
-        const slotStart = `${date}T${hh}:00:00`;
-        const slotEnd = `${date}T${String(h+1).padStart(2,'0')}:00:00`;
-        const isAvailable = (slotData.slots || []).some(s => {
-          const ss = new Date(s.start).getHours();
-          return ss === h;
-        });
-        // Check if blocked or booked
         const matchingEvent = (evData.events || []).find(ev => {
           if (!ev.start?.dateTime) return false;
-          const evH = new Date(ev.start.dateTime).getHours();
-          return evH === h;
+          return new Date(ev.start.dateTime).getHours() === h;
         });
         let status = 'available';
         if (matchingEvent) {
@@ -190,8 +204,9 @@
 
       sg.innerHTML = allSlots.map(s => {
         const label = `${s.hh}:00`;
+        const nextHH = String(s.h + 1).padStart(2, '0');
         if (s.status === 'available') {
-          return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:00','${String(s.h+1).padStart(2,'0')}:00')">${label}<br><small>Available — click to block</small></div>`;
+          return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:00','${nextHH}:00')">${label}<br><small>Available — click to block</small></div>`;
         } else if (s.status === 'blocked') {
           return `<div class="slot blocked">${label}<br><small>Blocked</small></div>`;
         } else {
@@ -219,16 +234,14 @@
     function closeBlockModal() { document.getElementById('blockModal').classList.remove('open'); }
 
     async function createBlock() {
-      const date = document.getElementById('blockDate').value;
-      const start = document.getElementById('blockStart').value;
-      const end = document.getElementById('blockEnd').value;
+      const date   = document.getElementById('blockDate').value;
+      const start  = document.getElementById('blockStart').value;
+      const end    = document.getElementById('blockEnd').value;
       const reason = document.getElementById('blockReason').value.trim();
-
       const res = await api('/api/calendar/block', {
         method: 'POST',
         body: JSON.stringify({ date, startTime: start, endTime: end, reason }),
       });
-
       if (res.ok) { closeBlockModal(); loadDay(); }
       else alert(res.error || 'Failed to block time');
     }
