@@ -36,8 +36,6 @@
     .tag-green{background:#064e3b;color:#6ee7b7}
     .tag-gray{background:#334155;color:#94a3b8}
     .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
-    
-    /* 新增: 营业时间样式 */
     .business-hours-grid{display:grid;gap:10px;margin-top:12px}
     .hour-row{display:grid;grid-template-columns:140px 1fr 30px 1fr;gap:8px;align-items:center;padding:8px;background:#0f172a;border-radius:6px}
     .hour-row label{display:flex;align-items:center;gap:8px;font-size:13px;color:#cbd5e1;margin:0;cursor:pointer}
@@ -109,7 +107,7 @@
       <div class="row2">
         <div class="form-group">
           <label>Voice Sensitivity: <span id="vadLabel">0.5</span></label>
-          <input type="range" class="input" id="fVadThreshold" min="0" max="1" step="0.1" value="0.5" 
+          <input type="range" class="input" id="fVadThreshold" min="0" max="1" step="0.1" value="0.5"
                  oninput="document.getElementById('vadLabel').textContent=this.value"/>
         </div>
         <div class="form-group">
@@ -119,51 +117,51 @@
         </div>
       </div>
 
-      <!-- 新增: 营业时间设置 -->
+      <!-- 营业时间 — ID 全部使用完整单词，与 JS capitalize(day) 保持一致 -->
       <div class="section-divider">
         <h3 style="font-size:14px;margin:0 0 12px;color:#94a3b8">Business Hours</h3>
         <div class="business-hours-grid">
           <div class="hour-row" id="rowMonday">
-            <label><input type="checkbox" id="bhMonEnabled" checked onchange="toggleDayRow('monday')"/> Monday</label>
-            <input type="time" class="input" id="bhMonOpen" value="09:00"/>
+            <label><input type="checkbox" id="bhMondayEnabled" checked onchange="toggleDayRow('monday')"/> Monday</label>
+            <input type="time" class="input" id="bhMondayOpen" value="09:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhMonClose" value="17:00"/>
+            <input type="time" class="input" id="bhMondayClose" value="17:00"/>
           </div>
           <div class="hour-row" id="rowTuesday">
-            <label><input type="checkbox" id="bhTueEnabled" checked onchange="toggleDayRow('tuesday')"/> Tuesday</label>
-            <input type="time" class="input" id="bhTueOpen" value="09:00"/>
+            <label><input type="checkbox" id="bhTuesdayEnabled" checked onchange="toggleDayRow('tuesday')"/> Tuesday</label>
+            <input type="time" class="input" id="bhTuesdayOpen" value="09:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhTueClose" value="17:00"/>
+            <input type="time" class="input" id="bhTuesdayClose" value="17:00"/>
           </div>
           <div class="hour-row" id="rowWednesday">
-            <label><input type="checkbox" id="bhWedEnabled" checked onchange="toggleDayRow('wednesday')"/> Wednesday</label>
-            <input type="time" class="input" id="bhWedOpen" value="09:00"/>
+            <label><input type="checkbox" id="bhWednesdayEnabled" checked onchange="toggleDayRow('wednesday')"/> Wednesday</label>
+            <input type="time" class="input" id="bhWednesdayOpen" value="09:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhWedClose" value="17:00"/>
+            <input type="time" class="input" id="bhWednesdayClose" value="17:00"/>
           </div>
           <div class="hour-row" id="rowThursday">
-            <label><input type="checkbox" id="bhThuEnabled" checked onchange="toggleDayRow('thursday')"/> Thursday</label>
-            <input type="time" class="input" id="bhThuOpen" value="09:00"/>
+            <label><input type="checkbox" id="bhThursdayEnabled" checked onchange="toggleDayRow('thursday')"/> Thursday</label>
+            <input type="time" class="input" id="bhThursdayOpen" value="09:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhThuClose" value="17:00"/>
+            <input type="time" class="input" id="bhThursdayClose" value="17:00"/>
           </div>
           <div class="hour-row" id="rowFriday">
-            <label><input type="checkbox" id="bhFriEnabled" checked onchange="toggleDayRow('friday')"/> Friday</label>
-            <input type="time" class="input" id="bhFriOpen" value="09:00"/>
+            <label><input type="checkbox" id="bhFridayEnabled" checked onchange="toggleDayRow('friday')"/> Friday</label>
+            <input type="time" class="input" id="bhFridayOpen" value="09:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhFriClose" value="17:00"/>
+            <input type="time" class="input" id="bhFridayClose" value="17:00"/>
           </div>
-          <div class="hour-row" id="rowSaturday">
-            <label><input type="checkbox" id="bhSatEnabled" onchange="toggleDayRow('saturday')"/> Saturday</label>
-            <input type="time" class="input" id="bhSatOpen" value="10:00"/>
+          <div class="hour-row disabled" id="rowSaturday">
+            <label><input type="checkbox" id="bhSaturdayEnabled" onchange="toggleDayRow('saturday')"/> Saturday</label>
+            <input type="time" class="input" id="bhSaturdayOpen" value="10:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhSatClose" value="14:00"/>
+            <input type="time" class="input" id="bhSaturdayClose" value="14:00"/>
           </div>
           <div class="hour-row disabled" id="rowSunday">
-            <label><input type="checkbox" id="bhSunEnabled" onchange="toggleDayRow('sunday')"/> Sunday</label>
-            <input type="time" class="input" id="bhSunOpen" value="10:00"/>
+            <label><input type="checkbox" id="bhSundayEnabled" onchange="toggleDayRow('sunday')"/> Sunday</label>
+            <input type="time" class="input" id="bhSundayOpen" value="10:00"/>
             <span>to</span>
-            <input type="time" class="input" id="bhSunClose" value="14:00"/>
+            <input type="time" class="input" id="bhSundayClose" value="14:00"/>
           </div>
         </div>
       </div>
@@ -222,18 +220,17 @@
       `).join('');
     }
 
-    function toggleDayRow(day) {
-      const enabled = document.getElementById(`bh${capitalize(day)}Enabled`).checked;
-      const row = document.getElementById(`row${capitalize(day)}`);
-      if (enabled) {
-        row.classList.remove('disabled');
-      } else {
-        row.classList.add('disabled');
-      }
-    }
-
     function capitalize(s) {
       return s.charAt(0).toUpperCase() + s.slice(1);
+    }
+
+    // ID 格式: bh{Fullday}Enabled / bh{Fullday}Open / bh{Fullday}Close
+    // row ID:  row{Fullday}
+    // 全部与 HTML 一致，无需映射表
+    function toggleDayRow(day) {
+      const cap = capitalize(day);
+      const enabled = document.getElementById(`bh${cap}Enabled`).checked;
+      document.getElementById(`row${cap}`).classList.toggle('disabled', !enabled);
     }
 
     function openModal(data) {
@@ -260,28 +257,29 @@
       document.getElementById('fGSecret').value = data?.google?.clientSecret || '';
       document.getElementById('fGRefresh').value = data?.google?.refreshToken || '';
       document.getElementById('fGCalId').value = data?.google?.calendarId || 'primary';
-      
-      // 新增: 加载营业时间数据
+
+      // 营业时间 — 使用完整单词 ID，与 HTML 完全匹配
       const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+      const defaultClose = { saturday: '14:00', sunday: '14:00' };
+      const defaultOpen  = { saturday: '10:00', sunday: '10:00' };
+      const defaultEnabled = { saturday: false, sunday: false };
+
       days.forEach(day => {
+        const cap     = capitalize(day);
         const dayData = data?.businessHours?.[day];
-        const enabled = dayData?.enabled !== false; // 默认 true
-        const open = dayData?.open || '09:00';
-        const close = dayData?.close || '17:00';
-        
-        document.getElementById(`bh${capitalize(day)}Enabled`).checked = enabled;
-        document.getElementById(`bh${capitalize(day)}Open`).value = open;
-        document.getElementById(`bh${capitalize(day)}Close`).value = close;
-        
-        // 更新行样式
-        const row = document.getElementById(`row${capitalize(day)}`);
-        if (enabled) {
-          row.classList.remove('disabled');
-        } else {
-          row.classList.add('disabled');
-        }
+        const enabled = dayData ? dayData.enabled !== false : (defaultEnabled[day] !== true ? defaultEnabled[day] !== false : true);
+        // 更清晰的默认值逻辑
+        const isWeekend = day === 'saturday' || day === 'sunday';
+        const resolvedEnabled = dayData ? dayData.enabled !== false : !isWeekend;
+        const resolvedOpen    = dayData?.open  || defaultOpen[day]  || '09:00';
+        const resolvedClose   = dayData?.close || defaultClose[day] || '17:00';
+
+        document.getElementById(`bh${cap}Enabled`).checked = resolvedEnabled;
+        document.getElementById(`bh${cap}Open`).value      = resolvedOpen;
+        document.getElementById(`bh${cap}Close`).value     = resolvedClose;
+        document.getElementById(`row${cap}`).classList.toggle('disabled', !resolvedEnabled);
       });
-      
+
       document.getElementById('modalBg').classList.add('open');
     }
 
@@ -294,46 +292,18 @@
 
     async function saveTenant() {
       const editId = document.getElementById('editId').value;
-      
-      // 收集营业时间数据
-      const businessHours = {
-        monday: {
-          enabled: document.getElementById('bhMonEnabled').checked,
-          open: document.getElementById('bhMonOpen').value,
-          close: document.getElementById('bhMonClose').value
-        },
-        tuesday: {
-          enabled: document.getElementById('bhTueEnabled').checked,
-          open: document.getElementById('bhTueOpen').value,
-          close: document.getElementById('bhTueClose').value
-        },
-        wednesday: {
-          enabled: document.getElementById('bhWedEnabled').checked,
-          open: document.getElementById('bhWedOpen').value,
-          close: document.getElementById('bhWedClose').value
-        },
-        thursday: {
-          enabled: document.getElementById('bhThuEnabled').checked,
-          open: document.getElementById('bhThuOpen').value,
-          close: document.getElementById('bhThuClose').value
-        },
-        friday: {
-          enabled: document.getElementById('bhFriEnabled').checked,
-          open: document.getElementById('bhFriOpen').value,
-          close: document.getElementById('bhFriClose').value
-        },
-        saturday: {
-          enabled: document.getElementById('bhSatEnabled').checked,
-          open: document.getElementById('bhSatOpen').value,
-          close: document.getElementById('bhSatClose').value
-        },
-        sunday: {
-          enabled: document.getElementById('bhSunEnabled').checked,
-          open: document.getElementById('bhSunOpen').value,
-          close: document.getElementById('bhSunClose').value
-        }
-      };
-      
+
+      const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+      const businessHours = {};
+      days.forEach(day => {
+        const cap = capitalize(day);
+        businessHours[day] = {
+          enabled: document.getElementById(`bh${cap}Enabled`).checked,
+          open:    document.getElementById(`bh${cap}Open`).value,
+          close:   document.getElementById(`bh${cap}Close`).value,
+        };
+      });
+
       const body = {
         id: document.getElementById('fId').value.trim(),
         businessName: document.getElementById('fName').value.trim(),
@@ -349,7 +319,7 @@
         silenceDurationMs: parseInt(document.getElementById('fSilenceMs').value) || 500,
         adminUser: document.getElementById('fUser').value.trim(),
         adminPass: document.getElementById('fPass').value,
-        businessHours: businessHours, // ✅ 新增: 包含营业时间数据
+        businessHours,
         google: {
           clientId: document.getElementById('fGClientId').value.trim(),
           clientSecret: document.getElementById('fGSecret').value.trim(),
@@ -357,7 +327,8 @@
           calendarId: document.getElementById('fGCalId').value.trim() || 'primary',
         },
       };
-      const url = editId ? `/api/admin/tenants/${editId}` : '/api/admin/tenants';
+
+      const url    = editId ? `/api/admin/tenants/${editId}` : '/api/admin/tenants';
       const method = editId ? 'PUT' : 'POST';
       const res = await api(url, { method, body: JSON.stringify(body) });
       if (res.ok) { closeModal(); loadTenants(); } else { alert(res.error || 'Failed'); }
