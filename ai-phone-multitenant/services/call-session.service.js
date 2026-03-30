@@ -28,19 +28,25 @@ function createEmptyExtracted() {
 // ─── MongoDB 持久化（非阻塞）─────────────────
 async function persistToDB(callSid, sessionData) {
   try {
+    const update = {
+      callSid:          sessionData.callSid,
+      tenantId:         sessionData.tenantId || "",
+      from:             sessionData.from,
+      to:               sessionData.to,
+      status:           sessionData.status,
+      streamSid:        sessionData.streamSid || "",
+      transcript:       sessionData.transcript,
+      extracted:        sessionData.extracted,
+      mediaPacketCount: sessionData.mediaPacketCount || 0,
+    };
+    // 只在有值时写入，避免覆盖已有数据
+    if (sessionData.startTime) update.startTime = sessionData.startTime;
+    if (sessionData.endTime)   update.endTime   = sessionData.endTime;
+    if (sessionData.duration)  update.duration  = sessionData.duration;
+
     await getCallModel().findOneAndUpdate(
       { callSid },
-      {
-        callSid:         sessionData.callSid,
-        tenantId:        sessionData.tenantId || "",
-        from:            sessionData.from,
-        to:              sessionData.to,
-        status:          sessionData.status,
-        streamSid:       sessionData.streamSid || "",
-        transcript:      sessionData.transcript,
-        extracted:       sessionData.extracted,
-        mediaPacketCount: sessionData.mediaPacketCount || 0,
-      },
+      { $set: update },        // ← 改成 $set，安全
       { upsert: true, new: true }
     );
   } catch (err) {
