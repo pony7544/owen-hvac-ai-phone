@@ -2,6 +2,7 @@
 // server.js — Multi-tenant AI Phone System
 // 一套代码，通过 tenants.json 配置区分不同客户。
 // 每个租户独立 webhook: /twilio/voice/:tenantId
+// 每个租户独立 status:  /twilio/status/:tenantId
 // =============================================================
 
 require("dotenv").config();
@@ -34,13 +35,13 @@ const { buildWav, TimelineRecorder } = require("./services/recording.service");
 if (!process.env.SESSION_SECRET) { console.error("FATAL: SESSION_SECRET not set."); process.exit(1); }
 if (!process.env.OPENAI_API_KEY) { console.error("FATAL: OPENAI_API_KEY not set."); process.exit(1); }
 
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
-const PORT              = process.env.PORT || 10000;
-const REALTIME_MODEL    = process.env.OPENAI_REALTIME_MODEL      || "gpt-4o-realtime-preview";
-const TRANSCRIPTION_MODEL = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
-const EXTRACTION_MODEL  = process.env.OPENAI_EXTRACTION_MODEL    || "gpt-4o-mini";
-const ADMIN_USER        = process.env.ADMIN_USER || "superadmin";
-const ADMIN_PASS        = process.env.ADMIN_PASS || "";
+const OPENAI_API_KEY      = process.env.OPENAI_API_KEY;
+const PORT                = process.env.PORT || 10000;
+const REALTIME_MODEL      = process.env.OPENAI_REALTIME_MODEL       || "gpt-4o-realtime-preview";
+const TRANSCRIPTION_MODEL = process.env.OPENAI_TRANSCRIPTION_MODEL  || "gpt-4o-mini-transcribe";
+const EXTRACTION_MODEL    = process.env.OPENAI_EXTRACTION_MODEL     || "gpt-4o-mini";
+const ADMIN_USER          = process.env.ADMIN_USER || "superadmin";
+const ADMIN_PASS          = process.env.ADMIN_PASS || "";
 
 // Twilio REST Client（平台级，所有租户共用）
 let twilioClient = null;
@@ -49,18 +50,18 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
   console.log("[Twilio] REST client initialized");
 }
 
-// Extraction service（平台级共用 OpenAI key）
+// Extraction service
 const extractionService = createExtractionService({
   openaiApiKey: OPENAI_API_KEY,
   extractionModel: EXTRACTION_MODEL,
   businessTimezone: "America/Halifax",
   getOrCreateCallSession, normalizePhone,
-  persistToRedis: persistToDB,  // extraction.service.js 内部用 persistToRedis 这个 key
+  persistToRedis: persistToDB,
 });
 
 // callSid → tenantId 映射
 const callTenantMap = new Map();
-// 待匹配的 callSid 队列（webhook 创建，WS 连接时消费）
+// 待匹配的 callSid 队列
 const pendingCallSids = [];
 
 // =========================
@@ -101,9 +102,7 @@ app.get("/", (_req, res) => res.send("AI Phone System is running."));
 app.get("/login", (_req, res) => res.sendFile(path.join(__dirname, "public", "login.html")));
 app.get("/live", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "live.html")));
 app.get("/calendar", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "calendar.html")));
-app.get("/analytics", requireAuth, (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "analytics.html"));
-});
+app.get("/analytics", requireAuth, (_req, res) => res.sendFile(path.join(__dirname, "public", "analytics.html")));
 app.get("/admin", requireAuth, (req, res) => {
   if (!req.session.isAdmin) return res.redirect("/live");
   res.sendFile(path.join(__dirname, "public", "admin.html"));
@@ -137,12 +136,71 @@ app.get("/logout", (req, res) => req.session.destroy(() => res.redirect("/login"
 app.post("/logout", (req, res) => req.session.destroy(() => res.redirect("/login")));
 
 // =========================
-// Helper: 获取当前用户的 tenant
+// Helper
 // =========================
 function getSessionTenant(req) {
   const tid = req.session?.tenantId;
   return tid ? tenantService.getTenant(tid) : null;
 }
+
+// =========================
+// Twilio Status Callback — 核心处理函数
+// 所有租户的 status 回调都走这里，用 CallSid 区分，不会混淆
+// =========================
+function handleStatusCallback(body, tenantId) {
+  const callSid = body.CallSid || "";
+  if (!callSid) return;
+
+  const s = getOrCreateCallSession(callSid);
+
+  // tenantId 优先从 URL 参数取（最准确），其次从 map 查，最后从 session 读
+  const resolvedTenantId = tenantId || callTenantMap.get(callSid) || s.tenantId || "";
+  if (resolvedTenantId && !s.tenantId) s.tenantId = resolvedTenantId;
+
+  const prevStatus = s.status;
+  s.status    = body.CallStatus || s.status;
+  s.from      = body.From || s.from;
+  s.to        = body.To  || s.to;
+  s.updatedAt = new Date().toISOString();
+
+  // 通话接通时记录 startTime
+  if (s.status === "in-progress" && !s.startTime) {
+    s.startTime = new Date();
+  }
+
+  // 通话结束时记录 duration 和 endTime
+  // Twilio 在 CallStatus = completed/busy/failed/no-answer 时回传 CallDuration
+  const duration = parseInt(body.CallDuration || "0", 10);
+  if (duration > 0) {
+    s.duration = duration;
+    s.endTime  = new Date();
+    console.log(`[Status] callSid=${callSid} tenant=${resolvedTenantId} status=${s.status} duration=${duration}s`);
+  } else {
+    console.log(`[Status] callSid=${callSid} tenant=${resolvedTenantId} status=${s.status} (${prevStatus} → ${s.status})`);
+  }
+
+  // 持久化到 MongoDB（包含 duration/startTime/endTime）
+  persistToDB(callSid, s);
+}
+
+// ── 每个租户自己的 status URL（推荐在 Twilio 控制台配置这个）
+// 格式: POST /twilio/status/:tenantId
+// Twilio 控制台 → Phone Numbers → 对应号码 → Status Callback URL:
+//   https://你的域名/twilio/status/owen-hvac
+//   https://你的域名/twilio/status/another-tenant
+app.post("/twilio/status/:tenantId", (req, res) => {
+  const { tenantId } = req.params;
+  console.log(`[Status] Received for tenant=${tenantId}`);
+  handleStatusCallback(req.body, tenantId);
+  res.sendStatus(200);
+});
+
+// ── 兜底通用 status（向后兼容，老配置仍能用）
+app.post("/twilio/voice/status", (req, res) => {
+  console.log(`[Status] Received on generic endpoint`);
+  handleStatusCallback(req.body, null);
+  res.sendStatus(200);
+});
 
 // =========================
 // Live Dashboard APIs
@@ -164,6 +222,7 @@ app.get("/api/live-call/:callSid", requireApiAuth, (req, res) => {
     callSid: call.callSid, from: call.from, to: call.to,
     status: call.status, streamSid: call.streamSid,
     createdAt: call.createdAt, updatedAt: call.updatedAt,
+    duration: call.duration || 0,
     transcript: call.transcript, extracted: call.extracted,
     recording: rec ? { available: !!rec.available, durationSec: rec.durationSec, createdAt: rec.createdAt } : null,
   }});
@@ -234,7 +293,6 @@ app.post("/api/calendar/block", requireApiAuth, async (req, res) => {
   if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
   const { date, startTime, endTime, reason } = req.body;
   try {
-    // 通过 Google Calendar API 直接创建 blocked event
     const { google } = require("googleapis");
     const oauth2 = new google.auth.OAuth2(tenant.google.clientId, tenant.google.clientSecret);
     oauth2.setCredentials({ refresh_token: tenant.google.refreshToken });
@@ -286,14 +344,10 @@ app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, async (req, 
   const call = liveCalls.get(req.params.callSid);
   if (!call) return res.status(404).json({ ok: false, error: "Call not found" });
 
-  // 如果内存中没有录音数据，从 DB 加载
   let rec = call.recording;
   if ((!rec || rec._fromDB) && !rec?.wavBuffer) {
     const dbRec = await loadRecordingFromDB(req.params.callSid);
-    if (dbRec) {
-      call.recording = dbRec;
-      rec = dbRec;
-    }
+    if (dbRec) { call.recording = dbRec; rec = dbRec; }
   }
   if (!rec?.available || !rec.wavBuffer) return res.status(404).json({ ok: false, error: "Not ready" });
 
@@ -301,7 +355,7 @@ app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, async (req, 
   let wavToSend = rec.wavBuffer;
   if (channel === "left" || channel === "right") {
     wavToSend = buildWav(
-      channel === "left"  ? rec._callerFrames || [] : [],
+      channel === "left"  ? rec._callerFrames    || [] : [],
       channel === "right" ? rec._assistantFrames || [] : [],
       true
     );
@@ -314,143 +368,116 @@ app.get("/api/live-call/:callSid/recording/stream", requireApiAuth, async (req, 
     }, () => fs.unlink(tmpPath, () => {}));
   });
 });
-// 月度统计查询
+
+// =========================
+// Analytics APIs
+// =========================
 app.get("/api/analytics/monthly", requireApiAuth, async (req, res) => {
   try {
     const tenantId = req.session.tenantId;
     const { year, month } = req.query;
-    
-    if (!year || !month) {
-      return res.status(400).json({ ok: false, error: "Year and month required" });
-    }
-    
+    if (!year || !month) return res.status(400).json({ ok: false, error: "Year and month required" });
+
     const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0, 23, 59, 59);
-    
+    const endDate   = new Date(year, month, 0, 23, 59, 59);
+
     const { Call } = require("./models");
     const calls = await Call.find({
       tenantId,
-      createdAt: { $gte: startDate, $lte: endDate }
+      createdAt: { $gte: startDate, $lte: endDate },
     }).sort({ createdAt: -1 }).limit(100);
-    
-    // 计算统计数据
+
     const stats = {
       totalCalls: calls.length,
       totalDuration: calls.reduce((sum, c) => sum + (c.duration || 0), 0),
       avgDuration: 0,
       appointmentsBooked: calls.filter(c => c.extracted?.appointmentCreated).length,
       callsBySource: {},
-      dailyStats: {}
+      dailyStats: {},
     };
-    
+
     if (stats.totalCalls > 0) {
       stats.avgDuration = Math.round(stats.totalDuration / stats.totalCalls);
     }
-    
-    // 按来源分组
+
     calls.forEach(call => {
-      const from = call.from || 'Unknown';
-      if (!stats.callsBySource[from]) {
-        stats.callsBySource[from] = { from, count: 0, totalDuration: 0 };
-      }
+      const from = call.from || "Unknown";
+      if (!stats.callsBySource[from]) stats.callsBySource[from] = { from, count: 0, totalDuration: 0 };
       stats.callsBySource[from].count++;
       stats.callsBySource[from].totalDuration += (call.duration || 0);
     });
-    
-    stats.callsBySource = Object.values(stats.callsBySource)
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10);
-    
-    // 按日期分组
+    stats.callsBySource = Object.values(stats.callsBySource).sort((a, b) => b.count - a.count).slice(0, 10);
+
     calls.forEach(call => {
-      const date = new Date(call.createdAt).toISOString().split('T')[0];
-      if (!stats.dailyStats[date]) {
-        stats.dailyStats[date] = { date, count: 0, duration: 0 };
-      }
+      const date = new Date(call.createdAt).toISOString().split("T")[0];
+      if (!stats.dailyStats[date]) stats.dailyStats[date] = { date, count: 0, duration: 0 };
       stats.dailyStats[date].count++;
       stats.dailyStats[date].duration += (call.duration || 0);
     });
-    
-    stats.dailyStats = Object.values(stats.dailyStats)
-      .sort((a, b) => new Date(a.date) - new Date(b.date));
-    
+    stats.dailyStats = Object.values(stats.dailyStats).sort((a, b) => new Date(a.date) - new Date(b.date));
+
     res.json({ ok: true, stats, calls: calls.slice(0, 50) });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
- 
-// 导出 CSV
+
 app.get("/api/analytics/export", requireApiAuth, async (req, res) => {
   try {
     const tenantId = req.session.tenantId;
     const { year, month, format } = req.query;
-    
+
     const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0, 23, 59, 59);
-    
+    const endDate   = new Date(year, month, 0, 23, 59, 59);
+
     const { Call } = require("./models");
     const calls = await Call.find({
       tenantId,
-      createdAt: { $gte: startDate, $lte: endDate }
+      createdAt: { $gte: startDate, $lte: endDate },
     }).sort({ createdAt: -1 });
-    
-    if (format === 'csv') {
+
+    if (format === "csv") {
       const csv = [
-        ['Date', 'Time', 'From', 'Duration (seconds)', 'Customer Name', 'Status', 'Appointment'].join(','),
+        ["Date", "Time", "From", "Duration (seconds)", "Customer Name", "Status", "Appointment"].join(","),
         ...calls.map(c => [
           new Date(c.createdAt).toLocaleDateString(),
           new Date(c.createdAt).toLocaleTimeString(),
           c.from,
           c.duration || 0,
-          (c.extracted?.callerName || '').replace(/,/g, ' '),
+          (c.extracted?.callerName || "").replace(/,/g, " "),
           c.status,
-          c.extracted?.appointmentCreated ? 'Yes' : 'No'
-        ].join(','))
-      ].join('\n');
-      
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="calls-${year}-${month}.csv"`);
+          c.extracted?.appointmentCreated ? "Yes" : "No",
+        ].join(",")),
+      ].join("\n");
+
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", `attachment; filename="calls-${year}-${month}.csv"`);
       res.send(csv);
     } else {
       res.json({ ok: true, calls });
     }
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
- 
-// Webhook API（公开，需要 API Key）
+
 app.get("/api/webhook/analytics", async (req, res) => {
   try {
     const { apiKey, tenantId, year, month } = req.query;
-    
     const tenant = tenantService.getTenant(tenantId);
-    if (!tenant || tenant.apiKey !== apiKey) {
-      return res.status(401).json({ ok: false, error: "Invalid API key" });
-    }
-    
+    if (!tenant || tenant.apiKey !== apiKey) return res.status(401).json({ ok: false, error: "Invalid API key" });
+
     const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0, 23, 59, 59);
-    
+    const endDate   = new Date(year, month, 0, 23, 59, 59);
+
     const { Call } = require("./models");
-    const calls = await Call.find({
-      tenantId,
-      createdAt: { $gte: startDate, $lte: endDate }
-    });
-    
+    const calls = await Call.find({ tenantId, createdAt: { $gte: startDate, $lte: endDate } });
     const stats = {
       totalCalls: calls.length,
       totalDuration: calls.reduce((sum, c) => sum + (c.duration || 0), 0),
       avgDuration: calls.length > 0 ? Math.round(calls.reduce((sum, c) => sum + (c.duration || 0), 0) / calls.length) : 0,
-      appointmentsBooked: calls.filter(c => c.extracted?.appointmentCreated).length
+      appointmentsBooked: calls.filter(c => c.extracted?.appointmentCreated).length,
     };
-    
     res.json({ ok: true, stats });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
+
 // =========================
 // Admin APIs — 租户 CRUD
 // =========================
@@ -497,26 +524,29 @@ app.post("/twilio/voice/:tenantId", (req, res) => {
   const tenant = tenantService.getTenant(tenantId);
 
   const callSid = req.body.CallSid || `call_${Date.now()}`;
-  const from = req.body.From || "";
-  const to   = req.body.To || "";
+  const from    = req.body.From || "";
+  const to      = req.body.To   || "";
 
-  // 绑定 callSid → tenantId
   callTenantMap.set(callSid, tenantId);
-  // 放入待匹配队列，WS 连接时消费
   pendingCallSids.push({ callSid, ts: Date.now() });
 
   const callSession = getOrCreateCallSession(callSid);
-  callSession.tenantId = tenantId;
-  callSession.from = from;
-  callSession.to = to;
-  callSession.status = "initiated";
+  callSession.tenantId  = tenantId;
+  callSession.from      = from;
+  callSession.to        = to;
+  callSession.status    = "initiated";
+  callSession.startTime = new Date(); // ✅ 通话开始时间
   callSession.updatedAt = new Date().toISOString();
 
-  const wsUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
-  if (!wsUrl) return res.status(500).send("Missing PUBLIC_WSS_URL");
+  const publicUrl = process.env.PUBLIC_WSS_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!publicUrl) return res.status(500).send("Missing PUBLIC_WSS_URL");
 
-  const streamUrl = wsUrl.replace("https://", "wss://").replace("http://", "ws://");
-  const greeting = tenant?.greeting || "Hello, please hold while I connect you.";
+  const streamUrl = publicUrl.replace("https://", "wss://").replace("http://", "ws://");
+  const greeting  = tenant?.greeting || "Hello, please hold while I connect you.";
+
+  // ✅ statusCallback 写在 TwiML 里，自动绑定到本租户的 status URL
+  // Twilio 会在通话状态变更时（包括 completed）POST 到这个地址，带上 CallDuration
+  const statusCallbackUrl = `${publicUrl}/twilio/status/${tenantId}`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -525,19 +555,17 @@ app.post("/twilio/voice/:tenantId", (req, res) => {
     <Stream url="${streamUrl}/media-stream?callSid=${encodeURIComponent(callSid)}" />
   </Connect>
 </Response>`;
-  res.type("text/xml").send(twiml);
-});
 
-app.post("/twilio/voice/status", (req, res) => {
-  const callSid = req.body.CallSid || "";
-  if (callSid) {
-    const s = getOrCreateCallSession(callSid);
-    s.status = req.body.CallStatus || s.status;
-    s.from = req.body.From || s.from;
-    s.to = req.body.To || s.to;
-    s.updatedAt = new Date().toISOString();
+  // 用 Twilio REST API 更新这通电话的 statusCallback（TwiML 里无法在 <Connect> 上直接加）
+  if (twilioClient && callSid.startsWith("CA")) {
+    twilioClient.calls(callSid).update({
+      statusCallback: statusCallbackUrl,
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+    }).catch(err => console.warn(`[Twilio] statusCallback update failed: ${err?.message}`));
   }
-  res.sendStatus(200);
+
+  res.type("text/xml").send(twiml);
 });
 
 // =========================
@@ -551,15 +579,14 @@ function finalizeRecording(callSid, recorder) {
   if (!callerFrames.length && !assistantFrames.length) return;
   finalizedCalls.add(callSid);
   try {
-    const wavBuffer = buildWav(callerFrames, assistantFrames);
-    const s = getOrCreateCallSession(callSid);
+    const wavBuffer  = buildWav(callerFrames, assistantFrames);
+    const s          = getOrCreateCallSession(callSid);
     const durationSec = Math.round((callerFrames.length * 160) / 8000);
     s.recording = {
       wavBuffer, _callerFrames: callerFrames, _assistantFrames: assistantFrames,
       durationSec, createdAt: new Date().toISOString(), available: true,
     };
     s.updatedAt = new Date().toISOString();
-    // 持久化到 MongoDB
     const tenantId = callTenantMap.get(callSid) || s.tenantId || "";
     persistToDB(callSid, s);
     persistRecordingToDB(callSid, tenantId, wavBuffer, callerFrames, assistantFrames, durationSec);
@@ -584,7 +611,6 @@ wss.on("connection", async (twilioWs, request) => {
 
   console.log(`[WS] Raw URL callSid: "${urlCallSid}", pending queue size: ${pendingCallSids.length}`);
 
-  // 如果 URL 参数没有真正的 Twilio CallSid（CA开头），从 pending 队列取
   if (!urlCallSid || !urlCallSid.startsWith("CA")) {
     const now = Date.now();
     while (pendingCallSids.length && now - pendingCallSids[0].ts > 30000) pendingCallSids.shift();
@@ -600,19 +626,18 @@ wss.on("connection", async (twilioWs, request) => {
 
   await restoreCallSession(urlCallSid);
 
-  let activeCallSid = urlCallSid;
-  let callSession = getOrCreateCallSession(activeCallSid);
-  let streamSid = "";
+  let activeCallSid   = urlCallSid;
+  let callSession     = getOrCreateCallSession(activeCallSid);
+  let streamSid       = "";
   let assistantTranscriptBuffer = "";
   let sessionConfigured = false;
-  let recordingStarted = false;
+  let recordingStarted  = false;
   let tenantExtractionPrompt = "";
-  let endCallTriggered = false;        // end_call 是否已触发
-  let goodbyeTimer = null;             // 告别后的自动挂断计时器
+  let endCallTriggered = false;
+  let goodbyeTimer     = null;
 
   const recorder = new TimelineRecorder();
 
-  // 强制挂断函数
   function forceHangup(reason) {
     if (endCallTriggered) return;
     endCallTriggered = true;
@@ -632,39 +657,33 @@ wss.on("connection", async (twilioWs, request) => {
 
   console.log(`[WS] Connected: ${activeCallSid}`);
 
-  // ─── 连接 OpenAI Realtime ──────────────────
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
   );
 
-  /**
-   * 在 start 事件 rebind 后调用，用真实 callSid 找到租户并配置 session
-   */
   function configureAndGreet() {
     if (sessionConfigured) return;
     sessionConfigured = true;
 
     const tenantId = callTenantMap.get(activeCallSid);
-    const tenant = tenantId ? tenantService.getTenant(tenantId) : null;
+    const tenant   = tenantId ? tenantService.getTenant(tenantId) : null;
 
-    let prompt = tenant?.prompt || FALLBACK_PROMPT;
-    const voice  = tenant?.voice || "alloy";
-    const tools  = tenant?.tools || tenantService.STANDARD_TOOLS;
-    const vadThreshold = tenant?.vadThreshold ?? 0.5;
+    let prompt   = tenant?.prompt || FALLBACK_PROMPT;
+    const voice  = tenant?.voice  || "alloy";
+    const tools  = tenant?.tools  || tenantService.STANDARD_TOOLS;
+    const vadThreshold      = tenant?.vadThreshold      ?? 0.5;
     const silenceDurationMs = tenant?.silenceDurationMs ?? 500;
-    tenantExtractionPrompt = tenant?.extractionPrompt || "";
+    tenantExtractionPrompt  = tenant?.extractionPrompt  || "";
 
-    // 根据语速设置注入 prompt 指令
     const speedMap = {
-      slow: "\n\nIMPORTANT: Speak very slowly and clearly. Pause between sentences. Give the caller plenty of time to process.",
+      slow:     "\n\nIMPORTANT: Speak very slowly and clearly. Pause between sentences. Give the caller plenty of time to process.",
       moderate: "\n\nSpeak at a calm, moderate pace. Pause briefly after each sentence.",
-      fast: "\n\nSpeak at a natural conversational pace.",
+      fast:     "\n\nSpeak at a natural conversational pace.",
     };
-    const speedInstruction = speedMap[tenant?.speechSpeed] || speedMap.moderate;
-    prompt += speedInstruction;
+    prompt += speedMap[tenant?.speechSpeed] || speedMap.moderate;
 
-    console.log(`[WS] Configured: ${activeCallSid} tenant=${tenantId || 'none'} voice=${voice} vad=${vadThreshold} silence=${silenceDurationMs}ms speed=${tenant?.speechSpeed || 'moderate'}`);
+    console.log(`[WS] Configured: ${activeCallSid} tenant=${tenantId || "none"} voice=${voice} vad=${vadThreshold} silence=${silenceDurationMs}ms speed=${tenant?.speechSpeed || "moderate"}`);
 
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(JSON.stringify({
@@ -692,23 +711,26 @@ wss.on("connection", async (twilioWs, request) => {
     if (streamSid) configureAndGreet();
   });
 
-  // ─── OpenAI → Twilio ─────────────────────
   openaiWs.on("message", async (message) => {
     try {
       const data = JSON.parse(message.toString());
 
-      // 记录 OpenAI 发来的错误
       if (data.type === "error") {
         console.error(`[OpenAI] Error event:`, JSON.stringify(data.error || data));
       }
 
       if (data.type === "conversation.item.input_audio_transcription.completed" && data.transcript) {
         const t = cleanText(data.transcript);
-        if (t) { console.log("[Caller]", t); pushTranscript(activeCallSid, "caller", t);
-          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {} }
+        if (t) {
+          console.log("[Caller]", t);
+          pushTranscript(activeCallSid, "caller", t);
+          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {}
+        }
       }
 
-      if (data.type === "response.audio_transcript.delta" && data.delta) assistantTranscriptBuffer += data.delta;
+      if (data.type === "response.audio_transcript.delta" && data.delta) {
+        assistantTranscriptBuffer += data.delta;
+      }
 
       if (data.type === "response.audio.delta" && data.delta) {
         if (!recordingStarted) {
@@ -723,22 +745,23 @@ wss.on("connection", async (twilioWs, request) => {
       if (data.type === "response.done") {
         const t = cleanText(assistantTranscriptBuffer);
         assistantTranscriptBuffer = "";
-        if (t) { console.log("[Assistant]", t); pushTranscript(activeCallSid, "assistant", t);
-          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {} }
+        if (t) {
+          console.log("[Assistant]", t);
+          pushTranscript(activeCallSid, "assistant", t);
+          try { await extractionService.refreshStructuredCallInfoDebounced(activeCallSid, { customExtractionPrompt: tenantExtractionPrompt }); } catch (_) {}
+        }
 
-        // 检测 AI 是否在说再见 — 如果是，启动自动挂断计时器
         if (t && !endCallTriggered) {
           const lower = t.toLowerCase();
           const goodbyePatterns = ["goodbye", "bye", "再见", "see you", "have a great day", "take care", "au revoir", "bonne journée"];
-          const isGoodbye = goodbyePatterns.some(p => lower.includes(p));
-          if (isGoodbye) {
+          if (goodbyePatterns.some(p => lower.includes(p))) {
             if (goodbyeTimer) clearTimeout(goodbyeTimer);
             goodbyeTimer = setTimeout(() => {
               if (!endCallTriggered) {
                 console.log(`[AutoHangup] AI said goodbye but didn't call end_call, forcing hangup`);
                 forceHangup("ai_said_goodbye_no_end_call");
               }
-            }, 8000);  // 8 秒后如果 end_call 还没触发就强制挂断
+            }, 8000);
           }
         }
       }
@@ -746,10 +769,10 @@ wss.on("connection", async (twilioWs, request) => {
       // Function Calling
       if (data.type === "response.done") {
         const tenantId = callTenantMap.get(activeCallSid);
-        const tenant = tenantId ? tenantService.getTenant(tenantId) : null;
-        const calSvc = tenant?.calendarService;
-        const tz = tenant?.timezone || "America/Halifax";
-        const apptMin = tenant?.defaultAppointmentMinutes || 60;
+        const tenant   = tenantId ? tenantService.getTenant(tenantId) : null;
+        const calSvc   = tenant?.calendarService;
+        const tz       = tenant?.timezone || "America/Halifax";
+        const apptMin  = tenant?.defaultAppointmentMinutes || 60;
 
         for (const item of (data.response?.output || [])) {
           if (item.type !== "function_call") continue;
@@ -761,7 +784,7 @@ wss.on("connection", async (twilioWs, request) => {
           if (fnName === "check_availability" && calSvc) {
             try {
               const events = await calSvc.listEventsForDay(fnArgs.date);
-              const slots = calSvc.generateSlotsForDay(fnArgs.date, events, apptMin);
+              const slots  = calSvc.generateSlotsForDay(fnArgs.date, events, apptMin);
               if (!slots.length) { toolResult = `No available slots on ${fnArgs.date}. Ask for another date.`; }
               else {
                 const labels = slots.map(s => new Date(s.start).toLocaleTimeString("en-CA", { timeZone: tz, hour: "numeric", minute: "2-digit" }));
@@ -774,13 +797,13 @@ wss.on("connection", async (twilioWs, request) => {
             try {
               const s = getOrCreateCallSession(activeCallSid);
               Object.assign(s.extracted, {
-                callerName: fnArgs.caller_name || s.extracted.callerName,
-                callbackNumber: fnArgs.callback_number || s.extracted.callbackNumber,
-                serviceAddress: fnArgs.service_address || s.extracted.serviceAddress,
-                issueSummary: fnArgs.issue_summary || s.extracted.issueSummary,
-                preferredDate: fnArgs.preferred_date || s.extracted.preferredDate,
-                preferredTime: fnArgs.preferred_time || s.extracted.preferredTime,
-                intent: fnArgs.intent || s.extracted.intent,
+                callerName:      fnArgs.caller_name      || s.extracted.callerName,
+                callbackNumber:  fnArgs.callback_number  || s.extracted.callbackNumber,
+                serviceAddress:  fnArgs.service_address  || s.extracted.serviceAddress,
+                issueSummary:    fnArgs.issue_summary     || s.extracted.issueSummary,
+                preferredDate:   fnArgs.preferred_date   || s.extracted.preferredDate,
+                preferredTime:   fnArgs.preferred_time   || s.extracted.preferredTime,
+                intent:          fnArgs.intent           || s.extracted.intent,
                 bookingConfirmed: true,
               });
               const event = await calSvc.createAppointmentEvent(activeCallSid);
@@ -789,25 +812,14 @@ wss.on("connection", async (twilioWs, request) => {
             } catch (err) { toolResult = `Failed: ${err?.message}. Tell caller a team member will follow up.`; }
           }
 
-         if (fnName === "end_call") {
+          if (fnName === "end_call") {
             const reason = fnArgs.reason || "complete";
             console.log(`[EndCall] ${activeCallSid}, reason: ${reason}`);
-  
-          // 告诉 AI 要挂断了，让它说再见
             toolResult = "Call ending. Say a brief goodbye now.";
-  
-          // 清除可能存在的自动挂断计时器
-          if (goodbyeTimer) { 
-            clearTimeout(goodbyeTimer); 
-            goodbyeTimer = null; 
+            if (goodbyeTimer) { clearTimeout(goodbyeTimer); goodbyeTimer = null; }
+            console.log(`[EndCall] Delaying hangup by 6 seconds to let AI finish speaking...`);
+            setTimeout(() => forceHangup(reason), 6000);
           }
-  
-  // ✅ 修复：延迟挂断，给 AI 充足时间说完最后的话
-  console.log(`[EndCall] Delaying hangup by 6 seconds to let AI finish speaking...`);
-  setTimeout(() => {
-    forceHangup(reason);
-  }, 6000);  // 6 秒 + forceHangup 内部的 2 秒 = 总共 8 秒
-}
 
           if (openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output: toolResult } }));
@@ -819,21 +831,17 @@ wss.on("connection", async (twilioWs, request) => {
   });
 
   openaiWs.on("error", (err) => console.error("[OpenAI] WS error:", err?.message));
-  openaiWs.on("close", (code, reason) => console.log(`[OpenAI] disconnected code=${code} reason=${reason?.toString() || ''}`));
+  openaiWs.on("close", (code, reason) => console.log(`[OpenAI] disconnected code=${code} reason=${reason?.toString() || ""}`));
 
-  // ─── Twilio → OpenAI ─────────────────────
   let mediaCount = 0;
   twilioWs.on("message", async (msg) => {
     try {
-      const raw = msg.toString();
+      const raw  = msg.toString();
       const data = JSON.parse(raw);
 
-      // 调试：记录所有事件类型
       if (data.event === "media") {
         mediaCount++;
-        if (mediaCount <= 3 || mediaCount % 100 === 0) {
-          console.log(`[Twilio] media packet #${mediaCount}`);
-        }
+        if (mediaCount <= 3 || mediaCount % 100 === 0) console.log(`[Twilio] media packet #${mediaCount}`);
       } else {
         console.log(`[Twilio] event=${data.event}`, raw.substring(0, 400));
       }
@@ -850,11 +858,11 @@ wss.on("connection", async (twilioWs, request) => {
               callTenantMap.delete(activeCallSid);
             }
             activeCallSid = startCallSid;
-            callSession = getOrCreateCallSession(activeCallSid);
+            callSession   = getOrCreateCallSession(activeCallSid);
           }
           if (streamSid) streamToCallSid.set(streamSid, activeCallSid);
           callSession.streamSid = streamSid;
-          callSession.status = "in_progress";
+          callSession.status    = "in_progress";
           callSession.updatedAt = new Date().toISOString();
           console.log(`[WS] stream started call=${activeCallSid}`);
           if (openaiWs.readyState === WebSocket.OPEN) configureAndGreet();
@@ -862,30 +870,25 @@ wss.on("connection", async (twilioWs, request) => {
         }
         case "media":
           callSession.mediaPacketCount += 1;
-
-          // 提取 streamSid（有些 Twilio 版本不发 start 事件）
           if (!streamSid && data.streamSid) {
             streamSid = data.streamSid;
             streamToCallSid.set(streamSid, activeCallSid);
             callSession.streamSid = streamSid;
-            callSession.status = "in_progress";
+            callSession.status    = "in_progress";
             callSession.updatedAt = new Date().toISOString();
           }
-
-          // 第一个 media 包到达时触发 configureAndGreet（兜底 start 事件缺失）
           if (!sessionConfigured && openaiWs.readyState === WebSocket.OPEN) {
             console.log(`[WS] First media received, configuring session for ${activeCallSid}`);
             configureAndGreet();
           }
-
           if (data.media?.payload) {
             if (recordingStarted) recorder.pushCaller(data.media.payload);
           }
           if (openaiWs.readyState === WebSocket.OPEN)
             openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
           break;
+
         case "stop": {
-          // 从 stop 事件提取真正的 callSid 做最后的 rebind
           const stopCallSid = data.stop?.callSid || "";
           if (stopCallSid && stopCallSid !== activeCallSid) {
             console.log(`[WS] Stop-rebinding ${activeCallSid} -> ${stopCallSid}`);
@@ -895,12 +898,12 @@ wss.on("connection", async (twilioWs, request) => {
               callTenantMap.delete(activeCallSid);
             }
             activeCallSid = stopCallSid;
-            callSession = getOrCreateCallSession(activeCallSid);
+            callSession   = getOrCreateCallSession(activeCallSid);
           }
           if (!streamSid && data.streamSid) streamSid = data.streamSid;
-
           console.log(`[WS] stream stopped: ${activeCallSid}`);
-          callSession.status = "stream_closed"; callSession.updatedAt = new Date().toISOString();
+          callSession.status    = "stream_closed";
+          callSession.updatedAt = new Date().toISOString();
           if (streamSid) streamToCallSid.delete(streamSid);
           if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
           finalizeRecording(activeCallSid, recorder);
@@ -911,7 +914,8 @@ wss.on("connection", async (twilioWs, request) => {
   });
 
   twilioWs.on("close", () => {
-    callSession.status = "stream_closed"; callSession.updatedAt = new Date().toISOString();
+    callSession.status    = "stream_closed";
+    callSession.updatedAt = new Date().toISOString();
     if (streamSid) streamToCallSid.delete(streamSid);
     if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
     finalizeRecording(activeCallSid, recorder);
@@ -920,13 +924,12 @@ wss.on("connection", async (twilioWs, request) => {
 });
 
 // =========================
-// Start (async — connect DB first)
+// Start
 // =========================
 (async () => {
   await connectDB();
   await tenantService.loadAll({ getOrCreateCallSession });
   await loadRecentCalls(200);
-
   server.listen(PORT, () => console.log(`[Server] listening on port ${PORT}`));
 })().catch(err => {
   console.error("FATAL startup error:", err);
