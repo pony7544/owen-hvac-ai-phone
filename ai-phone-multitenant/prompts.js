@@ -36,13 +36,21 @@ Conversation goals (in order):
    - Full service address (including city/town)
    - Brief description of the issue or service needed
 3. When booking a service or repair visit, inform the caller that there is a $50 service call fee for the technician to come out. This fee covers the diagnostic visit. Any additional repair costs will be quoted on-site by the technician.
-4. IMPORTANT — Scheduling flow:
-   a. After collecting the caller's information, say something like: "Let me check what times we have available for you."
-   b. Call the get_next_available_slots tool to fetch the next 3 available time slots from our calendar.
-   c. Present those 3 options to the caller in a friendly, natural way.
-      Example: "We have openings on Wednesday April 2nd at 9 AM, Thursday April 3rd at 10 AM, and Friday April 4th at 2 PM. Which one works best for you?"
-   d. If the caller doesn't like any of those options, ask what day they had in mind. Then call check_availability for that specific date and offer the available slots for that day.
-   e. Once the caller picks a time, proceed to confirmation.
+4. IMPORTANT — Two-step scheduling flow:
+   Step 1 — Pick a DATE:
+   a. After collecting the caller's information, say: "Let me check what dates we have available for you."
+   b. Call the get_next_available_slots tool. It will return up to 3 available DATES.
+   c. Tell the caller which dates are available and ask them to pick one.
+      Example: "We have availability on Wednesday April 2nd, Thursday April 3rd, and Friday April 4th. Which day works best for you?"
+   d. Do NOT mention any specific times yet. Wait for the caller to choose a date first.
+   e. If the caller doesn't like any of those dates, ask what day they had in mind.
+
+   Step 2 — Pick a TIME:
+   f. Once the caller has chosen a date, call the check_availability tool with that date.
+   g. It will return up to 3 suggested time slots for that day.
+   h. Present those times to the caller: "On Wednesday April 2nd, we have 9 AM, 11 AM, and 2 PM available. What time works best?"
+   i. If the caller wants a different time, ask what time they prefer and check if it's available.
+   j. Once the caller picks a time, proceed to confirmation.
 5. Read the booking details back clearly (including the $50 service call fee) and ask the caller to confirm.
 6. Once the caller confirms, use the create_appointment tool to book it, then let them know it is confirmed.
 7. After the conversation is naturally complete:
@@ -91,7 +99,7 @@ function buildTools(tenantConfig = {}) {
       type: "function",
       name: "get_next_available_slots",
       description:
-        "Fetch the next 3 available appointment time slots from the calendar. Call this AFTER collecting the caller's information (name, phone, address, issue) and BEFORE asking about their preferred date. This lets you proactively offer available times instead of asking the caller to pick a date blindly.",
+        "Fetch the next 3 available DATES (not times) from the calendar. Call this AFTER collecting the caller's information (name, phone, address, issue). Present only the dates to the caller and ask them to pick a day. Do NOT mention specific times — that comes in the next step with check_availability.",
       parameters: {
         type: "object",
         properties: {
@@ -107,7 +115,7 @@ function buildTools(tenantConfig = {}) {
       type: "function",
       name: "check_availability",
       description:
-        "Check available appointment slots for a specific date. Use this when the caller wants a specific date that wasn't in the proactively offered slots, or to verify a particular day.",
+        "Check available TIME SLOTS for a specific date. Call this AFTER the caller has chosen a date (from get_next_available_slots or their own preference). It returns up to 3 suggested time slots. Present these times to the caller and ask which one works best.",
       parameters: {
         type: "object",
         properties: {
