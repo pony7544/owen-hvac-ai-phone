@@ -163,15 +163,18 @@ function createCalendarService(config = {}) {
     
     console.log(`[Calendar] ${dateStr} (${dayName}) hours: ${openTime} - ${closeTime}`);
     
-    // 转换已有事件为分钟范围
+    // 转换已有事件为分钟范围（使用营业时区）
     const busyRanges = events
       .filter(evt => evt.start?.dateTime && evt.end?.dateTime)
       .map(evt => {
-        const s = new Date(evt.start.dateTime);
-        const e = new Date(evt.end.dateTime);
+        // 用营业时区格式化，确保小时/分钟是本地时间
+        const sStr = new Date(evt.start.dateTime).toLocaleString("en-US", { timeZone: businessTimezone, hour12: false, hour: "2-digit", minute: "2-digit" });
+        const eStr = new Date(evt.end.dateTime).toLocaleString("en-US", { timeZone: businessTimezone, hour12: false, hour: "2-digit", minute: "2-digit" });
+        const [sHH, sMM] = sStr.split(":").map(Number);
+        const [eHH, eMM] = eStr.split(":").map(Number);
         return { 
-          startMin: s.getHours() * 60 + s.getMinutes(), 
-          endMin: e.getHours() * 60 + e.getMinutes() 
+          startMin: sHH * 60 + sMM, 
+          endMin: eHH * 60 + eMM 
         };
       });
     
@@ -231,11 +234,13 @@ function createCalendarService(config = {}) {
         const events = await listEventsForDay(dateStr);
         const slots = generateSlotsForDay(dateStr, events, slotDuration);
         
-        // 如果是今天，过滤掉已过去的时间
+        // 如果是今天，过滤掉已过去的时间（使用营业时区的当前时间）
         let filteredSlots = slots;
         if (dateStr === todayStr) {
-          const now = new Date();
-          const currentMinutes = now.getHours() * 60 + now.getMinutes();
+          // 获取营业时区的当前小时和分钟
+          const nowInTz = new Date().toLocaleString("en-US", { timeZone: businessTimezone, hour12: false, hour: "2-digit", minute: "2-digit" });
+          const [nowHH, nowMM] = nowInTz.split(":").map(Number);
+          const currentMinutes = nowHH * 60 + nowMM;
           const buffer = 60;
           
           filteredSlots = slots.filter(slot => {
