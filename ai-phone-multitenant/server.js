@@ -669,9 +669,11 @@ wss.on("connection", async (twilioWs, request) => {
     const tenantId = callTenantMap.get(activeCallSid);
     const tenant   = tenantId ? tenantService.getTenant(tenantId) : null;
 
-    let prompt   = tenant?.prompt || FALLBACK_PROMPT;
+    // 如果租户有自定义 prompt 就用它，否则用 buildSystemPrompt 动态生成（含当前日期）
+    let prompt   = tenant?.prompt || buildSystemPrompt(tenant || {});
     const voice  = tenant?.voice  || "alloy";
-    const tools  = tenant?.tools  || tenantService.STANDARD_TOOLS;
+    // 使用 buildTools 动态生成工具列表（含 get_next_available_slots）
+    const tools  = buildTools(tenant || {});
     const vadThreshold      = tenant?.vadThreshold      ?? 0.5;
     const silenceDurationMs = tenant?.silenceDurationMs ?? 500;
     tenantExtractionPrompt  = tenant?.extractionPrompt  || "";
@@ -780,6 +782,28 @@ wss.on("connection", async (twilioWs, request) => {
           let fnArgs = {}; try { fnArgs = JSON.parse(item.arguments || "{}"); } catch (_) {}
           console.log(`[Tool] ${fnName}`, fnArgs);
           let toolResult = "";
+
+          if (fnName === "get_next_available_slots" && calSvc) {
+            try {
+              const maxSlots = Math.min(fnArgs.max_slots || 3, 5);
+              const slots = await calSvc.getNextAvailableSlots(maxSlots, 14);
+              if (!slots.length) {
+                toolResult = "No available slots found in the next 14 days. Ask the caller for a preferred date and we will try to accommodate.";
+              } else {
+                const slotDescriptions = slots.map(s => {
+                  const dateObj = new Date(s.dateTimeStart || `${s.date}T${s.startTime}:00`);
+                  const dayName = dateObj.toLocaleDateString("en-CA", { timeZone: tz, weekday: "long" });
+                  const monthDay = dateObj.toLocaleDateString("en-CA", { timeZone: tz, month: "long", day: "numeric" });
+                  const timeLabel = new Date(`${s.date}T${s.startTime}:00`).toLocaleTimeString("en-CA", { timeZone: tz, hour: "numeric", minute: "2-digit" });
+                  return `${dayName} ${monthDay} at ${timeLabel} (${s.date} ${s.startTime})`;
+                });
+                toolResult = `Here are the next ${slots.length} available slots:\n${slotDescriptions.join("\n")}\n\nPresent these options to the caller in a friendly way and ask which one works best. Use natural language for dates and times.`;
+              }
+            } catch (err) {
+              console.error(`[Tool] get_next_available_slots error:`, err?.message);
+              toolResult = `Could not check calendar: ${err?.message}. Ask the caller for a preferred date instead.`;
+            }
+          }
 
           if (fnName === "check_availability" && calSvc) {
             try {
