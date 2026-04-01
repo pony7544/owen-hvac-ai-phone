@@ -1,228 +1,524 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Live Dashboard</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analytics - AI Phone System</title>
   <style>
-    *{box-sizing:border-box;margin:0}
-    body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
-    .topbar{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:#1e293b;border-bottom:1px solid #334155;position:sticky;top:0;z-index:50}
-    .topbar h1{font-size:16px;font-weight:600;color:#93c5fd}
-    .topbar-nav{display:flex;gap:8px;align-items:center}
-    .topbar-nav a{color:#94a3b8;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px;transition:.15s}
-    .topbar-nav a:hover{background:rgba(255,255,255,.06);color:#e2e8f0}
-    .layout{display:grid;grid-template-columns:300px 1fr;height:calc(100vh - 56px)}
-    .sidebar{background:#1e293b;border-right:1px solid #334155;display:flex;flex-direction:column;overflow:hidden}
-    .sidebar-header{padding:16px;font-size:14px;font-weight:600;color:#64748b;border-bottom:1px solid #334155;display:flex;align-items:center;justify-content:space-between}
-    .sidebar-body{flex:1;overflow-y:auto;padding:8px}
-    .call-card{padding:12px 14px;border-radius:10px;margin-bottom:4px;cursor:pointer;transition:.12s;border:1px solid transparent}
-    .call-card:hover{background:rgba(255,255,255,.04);border-color:#334155}
-    .call-card.active{background:rgba(59,130,246,.1);border-color:#3b82f6}
-    .call-from{font-size:15px;font-weight:600;color:#f1f5f9;margin-bottom:4px}
-    .call-meta{font-size:12px;color:#64748b;line-height:1.5}
-    .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600}
-    .tag-green{background:#064e3b;color:#6ee7b7}
-    .tag-yellow{background:#78350f;color:#fbbf24}
-    .tag-blue{background:#1e3a8a;color:#93c5fd}
-    .tag-gray{background:#334155;color:#94a3b8}
-    .main{overflow-y:auto;padding:24px}
-    .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-    .card{background:#1e293b;border:1px solid #334155;border-radius:12px;overflow:hidden;margin-bottom:20px}
-    .card-header{padding:14px 18px;font-size:13px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #334155;display:flex;align-items:center;justify-content:space-between}
-    .card-body{padding:16px 18px}
-    .transcript{max-height:420px;overflow-y:auto}
-    .bubble{padding:10px 14px;border-radius:10px;margin-bottom:6px;font-size:13px;line-height:1.55}
-    .bubble.assistant{background:rgba(59,130,246,.1);border-left:3px solid #3b82f6}
-    .bubble.caller{background:rgba(251,191,36,.08);border-left:3px solid #f59e0b}
-    .bubble-role{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;opacity:.6;margin-bottom:3px}
-    .fields{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-    .field-label{font-size:11px;color:#64748b;font-weight:600;margin-bottom:3px;text-transform:uppercase;letter-spacing:.3px}
-    .field-value{font-size:13px;color:#cbd5e1;padding:8px 10px;background:#0f172a;border-radius:8px;border:1px solid #1e293b;min-height:34px;word-break:break-word;line-height:1.4}
-    .field-full{grid-column:1/-1}
-    .btn{border:0;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
-    .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
-    .btn-gray{background:#334155;color:#cbd5e1}.btn-gray:hover{background:#475569}
-    .actions-row{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
-    .rec-badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px}
-    .rec-ready{background:#064e3b;color:#6ee7b7}
-    .rec-not{background:#334155;color:#94a3b8}
-    .channel-tabs{display:flex;gap:4px;margin-bottom:10px}
-    .ch-tab{flex:1;padding:6px 0;border:1px solid #334155;border-radius:6px;background:transparent;font-size:12px;font-weight:600;cursor:pointer;color:#94a3b8;text-align:center;transition:.12s}
-    .ch-tab:hover{background:rgba(255,255,255,.04)}
-    .ch-tab.active-caller{background:rgba(251,191,36,.12);border-color:#f59e0b;color:#fbbf24}
-    .ch-tab.active-assistant{background:rgba(59,130,246,.12);border-color:#3b82f6;color:#93c5fd}
-    .ch-tab.active-both{background:rgba(139,92,246,.12);border-color:#7c3aed;color:#a78bfa}
-    audio{width:100%;margin-top:6px;border-radius:6px}
-    .cal-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-    .cal-dot.on{background:#22c55e}.cal-dot.off{background:#ef4444}
-    .empty{color:#475569;font-size:13px;text-align:center;padding:32px 0}
-    @media(max-width:1024px){.detail-grid{grid-template-columns:1fr}}
-    @media(max-width:768px){.layout{grid-template-columns:1fr;height:auto}.sidebar{max-height:280px}}
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a; 
+      color: #e2e8f0;
+    }
+    
+    /* Top Bar */
+    .topbar {
+      height: 56px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+    }
+    .topbar-title { 
+      font-size: 18px; 
+      font-weight: 700; 
+      color: #f1f5f9; 
+    }
+    .topbar-nav { 
+      display: flex; 
+      gap: 8px; 
+      align-items: center; 
+    }
+    .topbar-nav a {
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 13px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      transition: .15s;
+    }
+    .topbar-nav a:hover { 
+      background: rgba(255,255,255,.06); 
+      color: #e2e8f0; 
+    }
+    .topbar-nav a.active { 
+      background: rgba(59,130,246,.15); 
+      color: #3b82f6; 
+    }
+    .logout-btn {
+      padding: 6px 16px;
+      background: rgba(239,68,68,.1);
+      color: #f87171;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: .15s;
+    }
+    .logout-btn:hover { 
+      background: rgba(239,68,68,.2); 
+    }
+    
+    /* Main Container */
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    
+    /* Header */
+    .page-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+    }
+    .page-title {
+      font-size: 28px;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+    .header-controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .header-controls select,
+    .header-controls button {
+      padding: 8px 14px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #e2e8f0;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: .15s;
+    }
+    .header-controls select:hover,
+    .header-controls button:hover {
+      border-color: #475569;
+      background: #253142;
+    }
+    .header-controls button {
+      background: rgba(59,130,246,.1);
+      border-color: #3b82f6;
+      color: #3b82f6;
+    }
+    .header-controls button:hover {
+      background: rgba(59,130,246,.2);
+    }
+    
+    /* Stats Cards */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+      transition: .15s;
+    }
+    .stat-card:hover {
+      border-color: #475569;
+    }
+    .stat-label {
+      font-size: 13px;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 8px;
+    }
+    .stat-value {
+      font-size: 32px;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 4px;
+    }
+    .stat-subtitle {
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    
+    /* Chart Cards */
+    .chart-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .chart-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #f1f5f9;
+      margin-bottom: 16px;
+    }
+    .chart-container {
+      position: relative;
+      height: 280px;
+    }
+    
+    /* Table */
+    .table-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .table-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .table-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #f1f5f9;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      padding: 12px 20px;
+      text-align: left;
+      border-bottom: 1px solid #334155;
+    }
+    th {
+      background: #0f172a;
+      font-size: 12px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    td {
+      font-size: 13px;
+      color: #cbd5e1;
+    }
+    tbody tr:hover {
+      background: rgba(255,255,255,.02);
+    }
+    .status-badge {
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .status-completed { background: #064e3b; color: #6ee7b7; }
+    .status-in_progress { background: #1e3a8a; color: #93c5fd; }
+    .status-missed { background: #7f1d1d; color: #fca5a5; }
+    
+    /* Loading */
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #64748b;
+    }
+    
+    /* Empty State */
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #64748b;
+    }
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+      opacity: .5;
+    }
   </style>
 </head>
 <body>
+  <!-- Top Bar -->
   <div class="topbar">
-    <h1>Live Dashboard</h1>
+    <div class="topbar-title">AI Phone System</div>
     <div class="topbar-nav">
+      <a href="/live">Dashboard</a>
       <a href="/calendar">Calendar</a>
-      <a href="/live">Calls</a>
-      <a href="/analytics">Analytics</a> 
-      <a href="/logout">Logout</a>
+      <a href="/analytics" class="active">Analytics</a>
+      <button class="logout-btn" onclick="logout()">Logout</button>
     </div>
   </div>
-  <div class="layout">
-    <div class="sidebar">
-      <div class="sidebar-header">Recent Calls <button class="btn btn-gray" id="refreshBtn" style="padding:4px 10px;font-size:11px">Refresh</button></div>
-      <div class="sidebar-body" id="callsList"><div class="empty">Loading...</div></div>
-    </div>
-    <div class="main" id="mainArea">
-      <div class="empty" id="noSelection">Select a call from the sidebar to view details.</div>
-      <div id="detailArea" style="display:none">
-        <div class="detail-grid">
-          <div class="card">
-            <div class="card-header" id="transcriptHeader">Transcript</div>
-            <div class="card-body"><div class="transcript" id="transcriptPanel"><div class="empty">No transcript yet.</div></div></div>
-          </div>
-          <div class="card">
-            <div class="card-header">Extracted Info <span style="display:flex;align-items:center;gap:4px;font-size:11px;text-transform:none;letter-spacing:0"><span class="cal-dot" id="calDot"></span><span id="calendarConnectedTag">Calendar</span></span></div>
-            <div class="card-body">
-              <div class="fields">
-                <div><div class="field-label">From</div><div class="field-value" id="fFrom"></div></div>
-                <div><div class="field-label">Status</div><div class="field-value" id="fStatus"></div></div>
-                <div><div class="field-label">Caller Name</div><div class="field-value" id="fName"></div></div>
-                <div><div class="field-label">Phone</div><div class="field-value" id="fPhone"></div></div>
-                <div class="field-full"><div class="field-label">Service Address</div><div class="field-value" id="fAddress"></div></div>
-                <div class="field-full"><div class="field-label">Issue</div><div class="field-value" id="fIssue"></div></div>
-                <div><div class="field-label">Date</div><div class="field-value" id="fDate"></div></div>
-                <div><div class="field-label">Time</div><div class="field-value" id="fTime"></div></div>
-                <div><div class="field-label">Intent</div><div class="field-value" id="fIntent"></div></div>
-                <div><div class="field-label">Confirmed</div><div class="field-value" id="fConfirmed"></div></div>
-              </div>
-              <div class="actions-row">
-                <button class="btn btn-gray" id="reextractBtn">Re-extract</button>
-                <button class="btn btn-blue" id="createAppointmentBtn">Create Appointment</button>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">Recording <span class="rec-badge rec-not" id="recStatusBadge">Not ready</span></div>
-          <div class="card-body">
-            <div id="recNotReadyNote" style="color:#475569;font-size:13px">Click play after call ends.</div>
-            <div style="margin-bottom:10px"><button class="btn btn-gray" id="playRecordingBtn">Play Recording</button></div>
-            <div id="playerWrap" style="display:none">
-              <div class="channel-tabs">
-                <button class="ch-tab active-both" id="tabBoth" onclick="switchChannel('both')">Both</button>
-                <button class="ch-tab" id="tabCaller" onclick="switchChannel('left')">Caller</button>
-                <button class="ch-tab" id="tabAssistant" onclick="switchChannel('right')">AI</button>
-              </div>
-              <audio id="recordingPlayer" controls></audio>
-            </div>
-          </div>
-        </div>
+
+  <!-- Main Container -->
+  <div class="container">
+    <!-- Page Header -->
+    <div class="page-header">
+      <h1 class="page-title">Call Analytics</h1>
+      <div class="header-controls">
+        <select id="month-selector" onchange="loadStats()"></select>
+        <select id="year-selector" onchange="loadStats()"></select>
+        <button onclick="exportData()">Export CSV</button>
       </div>
     </div>
+
+    <!-- Stats Cards -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Calls</div>
+        <div class="stat-value" id="total-calls">0</div>
+        <div class="stat-subtitle">This period</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Duration</div>
+        <div class="stat-value" id="total-duration">0:00:00</div>
+        <div class="stat-subtitle">HH:MM:SS</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Average Duration</div>
+        <div class="stat-value" id="avg-duration">0:00</div>
+        <div class="stat-subtitle">MM:SS per call</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Appointments Booked</div>
+        <div class="stat-value" id="appointments-booked">0</div>
+        <div class="stat-subtitle">Successful bookings</div>
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="chart-card">
+      <div class="chart-title">Daily Call Volume</div>
+      <div class="chart-container">
+        <canvas id="daily-chart"></canvas>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-title">Calls by Source (Top 10)</div>
+      <div class="chart-container">
+        <canvas id="source-chart"></canvas>
+      </div>
+    </div>
+
+    <!-- Calls Table -->
+    <div class="table-card">
+      <div class="table-header">
+        <div class="table-title">Recent Calls</div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Date & Time</th>
+            <th>From</th>
+            <th>Duration</th>
+            <th>Customer Name</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="calls-list">
+          <tr>
+            <td colspan="5" class="loading">Loading...</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
   <script>
-    let selectedCallSid=null, callsCache=[];
-    function setText(id,v){const el=document.getElementById(id);if(el)el.textContent=v||"";}
-    function esc(v){return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
-    async function fetchJson(url,opts){const r=await fetch(url,opts);if(!r.ok){let m=`HTTP ${r.status}`;try{m=(await r.json()).error||m;}catch(_){}throw new Error(m);}return r.json();}
-    function tagClass(s){s=String(s||"").toLowerCase();if(s.includes("complete")||s.includes("ready"))return"tag-green";if(s.includes("fail")||s.includes("error"))return"tag-yellow";if(s.includes("progress"))return"tag-blue";return"tag-gray";}
-
-    // 租户时区
+    let dailyChart = null;
+    let sourceChart = null;
     let TENANT_TZ = "America/Halifax";
+    
+    // Initialize
+    document.addEventListener('DOMContentLoaded', async () => {
+      // 加载租户时区
+      try {
+        const r = await fetch("/api/tenant/info", { headers: { "Content-Type": "application/json" } });
+        const info = await r.json();
+        if (info.ok && info.timezone) TENANT_TZ = info.timezone;
+      } catch (_) {}
+      initDateSelectors();
+      loadStats();
+    });
 
-    function renderCalls(calls){
-      const root=document.getElementById("callsList");
-      if(!calls.length){root.innerHTML='<div class="empty">No calls yet.</div>';return;}
-      root.innerHTML=calls.map(c=>{
-        const active=selectedCallSid===c.callSid?"active":"";
-        const intent=c.extracted?.intent||c.intent||"";
-        const time=c.updatedAt?new Date(c.updatedAt).toLocaleTimeString("en-CA",{timeZone:TENANT_TZ,hour:"2-digit",minute:"2-digit"}):"";
-        return`<div class="call-card ${active}" data-sid="${esc(c.callSid)}"><div class="call-from">${esc(c.from||"Unknown")}</div><div class="call-meta"><span class="tag ${tagClass(c.status)}">${esc(c.status||"")}</span>${intent?` <span class="tag tag-blue">${esc(intent)}</span>`:""}<span style="float:right">${time}</span></div></div>`;
-      }).join("");
-      root.querySelectorAll(".call-card").forEach(el=>{el.addEventListener("click",()=>{
-        selectedCallSid=el.dataset.sid;renderCalls(callsCache);loadCallDetail(selectedCallSid);
-        document.getElementById("noSelection").style.display="none";document.getElementById("detailArea").style.display="block";
-      });});
-    }
-
-    function renderTranscript(call){
-      const p=document.getElementById("transcriptPanel");
-      if(!call?.transcript?.length){p.innerHTML='<div class="empty">No transcript yet.</div>';return;}
-      p.innerHTML=call.transcript.map(i=>`<div class="bubble ${i.role==="assistant"?"assistant":"caller"}"><div class="bubble-role">${esc(i.role||"caller")}</div><div>${esc(i.text||"")}</div></div>`).join("");
-      p.scrollTop=p.scrollHeight;
-    }
-
-    function renderFields(call){
-      if(!call){["fFrom","fStatus","fIntent","fName","fPhone","fAddress","fIssue","fDate","fTime","fConfirmed"].forEach(id=>setText(id,""));return;}
-      const f=call.extracted||{};
-      setText("fFrom",call.from||"");setText("fStatus",call.status||"");setText("fIntent",f.intent||call.intent||"");
-      setText("fName",f.callerName||"");setText("fPhone",f.callbackNumber||"");setText("fAddress",f.serviceAddress||"");
-      setText("fIssue",f.issueSummary||"");setText("fDate",f.preferredDate||"");setText("fTime",f.preferredTime||"");
-      setText("fConfirmed",f.bookingConfirmed?"Yes":"No");
-    }
-
-    let currentChannel="both";
-    function renderRecording(call){
-      const rec=call?.recording||null,badge=document.getElementById("recStatusBadge"),player=document.getElementById("recordingPlayer");
-      if(rec?.available){badge.textContent="Ready";badge.className="rec-badge rec-ready";document.getElementById("recNotReadyNote").style.display="none";}
-      else{badge.textContent="Not ready";badge.className="rec-badge rec-not";
-        if(!player.getAttribute("src")){document.getElementById("playerWrap").style.display="none";document.getElementById("recNotReadyNote").style.display="block";}
+    function initDateSelectors() {
+      const monthSelector = document.getElementById('month-selector');
+      const yearSelector = document.getElementById('year-selector');
+      
+      const now = new Date();
+      const currentMonth = now.getMonth() + 1;
+      const currentYear = now.getFullYear();
+      
+      // Generate month options
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      months.forEach((month, idx) => {
+        const option = document.createElement('option');
+        option.value = idx + 1;
+        option.textContent = month;
+        if (idx + 1 === currentMonth) option.selected = true;
+        monthSelector.appendChild(option);
+      });
+      
+      // Generate year options (last 3 years)
+      for (let y = currentYear; y >= currentYear - 2; y--) {
+        const option = document.createElement('option');
+        option.value = y;
+        option.textContent = y;
+        if (y === currentYear) option.selected = true;
+        yearSelector.appendChild(option);
       }
     }
 
-    function switchChannel(ch){
-      if(!selectedCallSid)return;currentChannel=ch;
-      document.getElementById("tabBoth").className="ch-tab"+(ch==="both"?" active-both":"");
-      document.getElementById("tabCaller").className="ch-tab"+(ch==="left"?" active-caller":"");
-      document.getElementById("tabAssistant").className="ch-tab"+(ch==="right"?" active-assistant":"");
-      const p=document.getElementById("recordingPlayer"),was=!p.paused,ct=p.currentTime;
-      p.src=`/api/live-call/${encodeURIComponent(selectedCallSid)}/recording/stream?channel=${ch}&t=${Date.now()}`;
-      p.load();p.currentTime=ct;if(was)p.play().catch(()=>{});
+    async function loadStats() {
+      const month = document.getElementById('month-selector').value;
+      const year = document.getElementById('year-selector').value;
+      
+      try {
+        const response = await fetch(`/api/analytics/monthly?year=${year}&month=${month}`);
+        const data = await response.json();
+        
+        if (data.ok) {
+          updateStatsCards(data.stats);
+          updateCharts(data.stats);
+          updateCallsList(data.calls);
+        } else {
+          console.error('Failed to load stats:', data.error);
+        }
+      } catch (err) {
+        console.error('Error loading stats:', err);
+      }
     }
 
-    async function playCurrentRecording(){
-      if(!selectedCallSid)return;
-      try{
-        const d=await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/recording/info`);
-        if(!d.available){alert("Recording not ready yet.");return;}
-        document.getElementById("recStatusBadge").textContent="Ready";
-        document.getElementById("recStatusBadge").className="rec-badge rec-ready";
-        currentChannel="both";
-        document.getElementById("tabBoth").className="ch-tab active-both";
-        document.getElementById("tabCaller").className="ch-tab";
-        document.getElementById("tabAssistant").className="ch-tab";
-        document.getElementById("playerWrap").style.display="block";
-        document.getElementById("recNotReadyNote").style.display="none";
-        const p=document.getElementById("recordingPlayer");
-        p.src=`/api/live-call/${encodeURIComponent(selectedCallSid)}/recording/stream?channel=both&t=${Date.now()}`;
-        p.load();await p.play().catch(()=>{});
-      }catch(e){alert(e.message||"Failed");}
+    function updateStatsCards(stats) {
+      document.getElementById('total-calls').textContent = stats.totalCalls || 0;
+      document.getElementById('total-duration').textContent = formatDuration(stats.totalDuration || 0);
+      document.getElementById('avg-duration').textContent = formatDuration(stats.avgDuration || 0);
+      document.getElementById('appointments-booked').textContent = stats.appointmentsBooked || 0;
     }
 
-    async function loadCalls(){
-      const d=await fetchJson("/api/live/calls");callsCache=d.calls||[];renderCalls(callsCache);
-      if(!selectedCallSid&&callsCache.length){selectedCallSid=callsCache[0].callSid;renderCalls(callsCache);
-        document.getElementById("noSelection").style.display="none";document.getElementById("detailArea").style.display="block";}
-      if(selectedCallSid)await loadCallDetail(selectedCallSid,false);
+    function formatDuration(seconds) {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (h > 0) {
+        return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      }
+      return `${m}:${String(s).padStart(2, '0')}`;
     }
-    async function loadCallDetail(sid,showErr=true){try{const d=await fetchJson(`/api/live-call/${encodeURIComponent(sid)}`);renderTranscript(d.call);renderFields(d.call);renderRecording(d.call);}catch(e){if(showErr)console.error(e);}}
-    async function loadCalendarStatus(){const dot=document.getElementById("calDot"),tag=document.getElementById("calendarConnectedTag");try{await fetchJson("/api/calendar/status");dot.className="cal-dot on";tag.textContent="Connected";}catch(_){dot.className="cal-dot off";tag.textContent="Error";}}
 
-    document.getElementById("refreshBtn").addEventListener("click",async()=>{await loadCalls();await loadCalendarStatus();});
-    document.getElementById("reextractBtn").addEventListener("click",async()=>{if(!selectedCallSid)return;await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/reextract`,{method:"POST"});await loadCallDetail(selectedCallSid);await loadCalls();});
-    document.getElementById("createAppointmentBtn").addEventListener("click",async()=>{if(!selectedCallSid)return;try{const d=await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/create-appointment`,{method:"POST"});alert(`Appointment created.${d.eventId?" ID: "+d.eventId:""}`);}catch(e){alert(e.message||"Failed");}await loadCallDetail(selectedCallSid);await loadCalls();});
-    document.getElementById("playRecordingBtn").addEventListener("click",playCurrentRecording);
+    function updateCharts(stats) {
+      const dailyData = stats.dailyStats || [];
+      const sourceData = stats.callsBySource || [];
+      
+      // Daily Chart
+      const dailyCtx = document.getElementById('daily-chart').getContext('2d');
+      if (dailyChart) dailyChart.destroy();
+      
+      dailyChart = new Chart(dailyCtx, {
+        type: 'line',
+        data: {
+          labels: dailyData.map(d => new Date(d.date).getDate()),
+          datasets: [{
+            label: 'Calls',
+            data: dailyData.map(d => d.count),
+            borderColor: '#3b82f6',
+            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+            tension: 0.4,
+            fill: true
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false }
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              ticks: { color: '#64748b' },
+              grid: { color: '#334155' }
+            },
+            x: {
+              ticks: { color: '#64748b' },
+              grid: { color: '#334155' }
+            }
+          }
+        }
+      });
+      
+      // Source Chart
+      const sourceCtx = document.getElementById('source-chart').getContext('2d');
+      if (sourceChart) sourceChart.destroy();
+      
+      sourceChart = new Chart(sourceCtx, {
+        type: 'bar',
+        data: {
+          labels: sourceData.map(s => s.from),
+          datasets: [{
+            label: 'Calls',
+            data: sourceData.map(s => s.count),
+            backgroundColor: 'rgba(16, 185, 129, 0.7)',
+            borderColor: '#10b981',
+            borderWidth: 1
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false }
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              ticks: { color: '#64748b' },
+              grid: { color: '#334155' }
+            },
+            x: {
+              ticks: { color: '#64748b' },
+              grid: { display: false }
+            }
+          }
+        }
+      });
+    }
 
-    (async()=>{
-      // 加载租户时区
-      try{const info=await fetchJson("/api/tenant/info");if(info.timezone)TENANT_TZ=info.timezone;}catch(_){}
-      await loadCalls();await loadCalendarStatus();
-    })();
-    setInterval(async()=>{await loadCalls();await loadCalendarStatus();},3000);
+    function updateCallsList(calls) {
+      const tbody = document.getElementById('calls-list');
+      tbody.innerHTML = '';
+      
+      if (!calls || calls.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><div class="empty-state-icon">📞</div><div>No calls found for this period</div></td></tr>';
+        return;
+      }
+      
+      calls.forEach(call => {
+        const row = document.createElement('tr');
+        const date = new Date(call.createdAt);
+        row.innerHTML = `
+          <td>${date.toLocaleDateString("en-CA", {timeZone: TENANT_TZ})} ${date.toLocaleTimeString("en-CA", {timeZone: TENANT_TZ, hour: '2-digit', minute:'2-digit'})}</td>
+          <td>${call.from || '-'}</td>
+          <td>${formatDuration(call.duration || 0)}</td>
+          <td>${call.extracted?.callerName || '-'}</td>
+          <td><span class="status-badge status-${call.status}">${call.status}</span></td>
+        `;
+        tbody.appendChild(row);
+      });
+    }
+
+    function exportData() {
+      const month = document.getElementById('month-selector').value;
+      const year = document.getElementById('year-selector').value;
+      window.location.href = `/api/analytics/export?year=${year}&month=${month}&format=csv`;
+    }
+
+    function logout() {
+      fetch('/logout', { method: 'POST' })
+        .then(() => window.location.href = '/login');
+    }
   </script>
 </body>
 </html>
