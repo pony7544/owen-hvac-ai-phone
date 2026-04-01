@@ -131,13 +131,16 @@
     async function fetchJson(url,opts){const r=await fetch(url,opts);if(!r.ok){let m=`HTTP ${r.status}`;try{m=(await r.json()).error||m;}catch(_){}throw new Error(m);}return r.json();}
     function tagClass(s){s=String(s||"").toLowerCase();if(s.includes("complete")||s.includes("ready"))return"tag-green";if(s.includes("fail")||s.includes("error"))return"tag-yellow";if(s.includes("progress"))return"tag-blue";return"tag-gray";}
 
+    // 租户时区
+    let TENANT_TZ = "America/Halifax";
+
     function renderCalls(calls){
       const root=document.getElementById("callsList");
       if(!calls.length){root.innerHTML='<div class="empty">No calls yet.</div>';return;}
       root.innerHTML=calls.map(c=>{
         const active=selectedCallSid===c.callSid?"active":"";
         const intent=c.extracted?.intent||c.intent||"";
-        const time=c.updatedAt?new Date(c.updatedAt).toLocaleTimeString("en-CA",{hour:"2-digit",minute:"2-digit"}):"";
+        const time=c.updatedAt?new Date(c.updatedAt).toLocaleTimeString("en-CA",{timeZone:TENANT_TZ,hour:"2-digit",minute:"2-digit"}):"";
         return`<div class="call-card ${active}" data-sid="${esc(c.callSid)}"><div class="call-from">${esc(c.from||"Unknown")}</div><div class="call-meta"><span class="tag ${tagClass(c.status)}">${esc(c.status||"")}</span>${intent?` <span class="tag tag-blue">${esc(intent)}</span>`:""}<span style="float:right">${time}</span></div></div>`;
       }).join("");
       root.querySelectorAll(".call-card").forEach(el=>{el.addEventListener("click",()=>{
@@ -214,7 +217,11 @@
     document.getElementById("createAppointmentBtn").addEventListener("click",async()=>{if(!selectedCallSid)return;try{const d=await fetchJson(`/api/live-call/${encodeURIComponent(selectedCallSid)}/create-appointment`,{method:"POST"});alert(`Appointment created.${d.eventId?" ID: "+d.eventId:""}`);}catch(e){alert(e.message||"Failed");}await loadCallDetail(selectedCallSid);await loadCalls();});
     document.getElementById("playRecordingBtn").addEventListener("click",playCurrentRecording);
 
-    (async()=>{await loadCalls();await loadCalendarStatus();})();
+    (async()=>{
+      // 加载租户时区
+      try{const info=await fetchJson("/api/tenant/info");if(info.timezone)TENANT_TZ=info.timezone;}catch(_){}
+      await loadCalls();await loadCalendarStatus();
+    })();
     setInterval(async()=>{await loadCalls();await loadCalendarStatus();},3000);
   </script>
 </body>
