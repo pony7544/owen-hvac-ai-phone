@@ -205,6 +205,21 @@ app.post("/twilio/voice/status", (req, res) => {
 // =========================
 // Live Dashboard APIs
 // =========================
+
+// 租户基本信息 API（前端用来获取 timezone 等配置）
+app.get("/api/tenant/info", requireApiAuth, (req, res) => {
+  const tenant = getSessionTenant(req);
+  if (!tenant) return res.json({ ok: true, timezone: "America/Halifax", businessName: "" });
+  res.json({
+    ok: true,
+    timezone: tenant.timezone || "America/Halifax",
+    businessName: tenant.businessName || "",
+    businessHours: tenant.businessHours || null,
+    slotInterval: tenant.slotInterval || 30,
+    defaultAppointmentMinutes: tenant.defaultAppointmentMinutes || 60,
+  });
+});
+
 app.get("/api/live/calls", requireApiAuth, (req, res) => {
   const tid = req.session.tenantId;
   const calls = Array.from(liveCalls.values())
@@ -790,11 +805,21 @@ wss.on("connection", async (twilioWs, request) => {
               if (!slots.length) {
                 toolResult = "No available slots found in the next 14 days. Ask the caller for a preferred date and we will try to accommodate.";
               } else {
+                // s.date = "2026-04-01", s.startTime = "09:00" — 都是营业时区本地时间
+                // 不能用 new Date() 解析，否则会被当成 UTC 导致时区偏移
                 const slotDescriptions = slots.map(s => {
-                  const dateObj = new Date(s.dateTimeStart || `${s.date}T${s.startTime}:00`);
-                  const dayName = dateObj.toLocaleDateString("en-CA", { timeZone: tz, weekday: "long" });
-                  const monthDay = dateObj.toLocaleDateString("en-CA", { timeZone: tz, month: "long", day: "numeric" });
-                  const timeLabel = new Date(`${s.date}T${s.startTime}:00`).toLocaleTimeString("en-CA", { timeZone: tz, hour: "numeric", minute: "2-digit" });
+                  // 用带时区偏移的方式构建日期以获取正确的星期几和月/日
+                  const offset = calSvc.getTimezoneOffset(s.date, s.startTime, tz);
+                  const dateObj = new Date(`${s.date}T${s.startTime}:00${offset}`);
+                  const dayName = dateObj.toLocaleDateString("en-US", { timeZone: tz, weekday: "long" });
+                  const monthDay = dateObj.toLocaleDateString("en-US", { timeZone: tz, month: "long", day: "numeric" });
+
+                  // 直接从 HH:MM 本地时间格式化，不经过 Date 对象
+                  const [hh, mm] = s.startTime.split(":").map(Number);
+                  const ampm = hh >= 12 ? "PM" : "AM";
+                  const h12 = hh % 12 || 12;
+                  const timeLabel = mm === 0 ? `${h12} ${ampm}` : `${h12}:${String(mm).padStart(2,"0")} ${ampm}`;
+
                   return `${dayName} ${monthDay} at ${timeLabel} (${s.date} ${s.startTime})`;
                 });
                 toolResult = `Here are the next ${slots.length} available slots:\n${slotDescriptions.join("\n")}\n\nPresent these options to the caller in a friendly way and ask which one works best. Use natural language for dates and times.`;
@@ -811,7 +836,14 @@ wss.on("connection", async (twilioWs, request) => {
               const slots  = calSvc.generateSlotsForDay(fnArgs.date, events, apptMin);
               if (!slots.length) { toolResult = `No available slots on ${fnArgs.date}. Ask for another date.`; }
               else {
-                const labels = slots.map(s => new Date(s.start).toLocaleTimeString("en-CA", { timeZone: tz, hour: "numeric", minute: "2-digit" }));
+                // slot.start 格式是 "2026-04-01T09:00:00"（本地时间，无时区），直接提取 HH:MM
+                const labels = slots.map(s => {
+                  const timePart = s.start.split('T')[1].substring(0, 5);
+                  const [hh, mm] = timePart.split(":").map(Number);
+                  const ampm = hh >= 12 ? "PM" : "AM";
+                  const h12 = hh % 12 || 12;
+                  return mm === 0 ? `${h12} ${ampm}` : `${h12}:${String(mm).padStart(2,"0")} ${ampm}`;
+                });
                 toolResult = `Available on ${fnArgs.date}: ${labels.join(", ")}. Confirm with caller.`;
               }
             } catch (err) { toolResult = `Calendar check failed: ${err?.message}`; }
