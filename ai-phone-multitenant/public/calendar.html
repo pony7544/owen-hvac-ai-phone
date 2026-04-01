@@ -16,6 +16,7 @@
     .card h2{font-size:15px;font-weight:600;color:#93c5fd;margin-bottom:16px}
     .date-nav{display:flex;align-items:center;gap:12px;margin-bottom:20px}
     .date-nav input{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 12px;color:#e2e8f0;font-size:14px}
+    .tz-label{font-size:11px;color:#64748b;margin-left:8px}
     .btn{border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:.15s}
     .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
     .btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
@@ -27,6 +28,7 @@
     .slot.available:hover{background:#065f46}
     .slot.blocked{background:#7f1d1d;border-color:#991b1b;color:#fca5a5;cursor:default}
     .slot.booked{background:#1e3a5f;border-color:#1e40af;color:#93c5fd;cursor:default}
+    .slot.past{background:#1e293b;border-color:#334155;color:#475569;cursor:default}
     .events-list{margin-top:16px}
     .event-item{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-radius:8px;margin-bottom:8px;font-size:13px}
     .event-item.booking{background:#172554;border:1px solid #1e3a8a}
@@ -68,6 +70,7 @@
         <input type="date" id="dateInput" onchange="loadDay()"/>
         <button class="btn btn-gray" onclick="shiftDate(1)">Next &rarr;</button>
         <button class="btn btn-gray" onclick="goToday()">Today</button>
+        <span class="tz-label" id="tzLabel"></span>
         <span style="margin-left:auto">
           <button class="btn btn-blue" onclick="openBlockModal()">+ Block Time</button>
         </span>
@@ -105,13 +108,24 @@
   </div>
 
   <script>
-    // ── 日期工具函数（全部使用本地时间，避免 UTC 时区偏移）──────────────
-    function today() {
-      const d = new Date();
-      return formatDate(d);
+    // ── 租户时区（从 API 加载）──────────────────────
+    let TENANT_TZ = "America/Halifax"; // 默认值，启动后会被 API 覆盖
+
+    // 获取租户时区下的"今天"日期字符串 YYYY-MM-DD
+    function todayInTz() {
+      return new Date().toLocaleDateString("en-CA", { timeZone: TENANT_TZ });
     }
 
-    // "yyyy-mm-dd" 字符串 → 本地 Date 对象（关键修复）
+    // 获取租户时区下的当前小时和分钟
+    function nowInTz() {
+      const str = new Date().toLocaleString("en-US", {
+        timeZone: TENANT_TZ, hour12: false, hour: "2-digit", minute: "2-digit"
+      });
+      const [hh, mm] = str.split(":").map(Number);
+      return { hour: hh, minute: mm };
+    }
+
+    // "yyyy-mm-dd" 字符串 → 本地 Date 对象（用于 Prev/Next 按钮）
     function parseLocalDate(str) {
       const [y, m, d] = str.split('-').map(Number);
       return new Date(y, m - 1, d);
@@ -126,24 +140,34 @@
     }
 
     function getDate() {
-      return document.getElementById('dateInput').value || today();
+      return document.getElementById('dateInput').value || todayInTz();
     }
 
     function shiftDate(delta) {
-      const d = parseLocalDate(getDate()); // ← 修复：本地解析，不走 UTC
+      const d = parseLocalDate(getDate());
       d.setDate(d.getDate() + delta);
       document.getElementById('dateInput').value = formatDate(d);
       loadDay();
     }
 
     function goToday() {
-      document.getElementById('dateInput').value = today();
+      document.getElementById('dateInput').value = todayInTz();
       loadDay();
     }
-    // ────────────────────────────────────────────────────────────────────
 
+    // 格式化 Google Calendar 的 ISO dateTime 为租户时区的时间
     function fmtTime(iso) {
-      return new Date(iso).toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit', hour12: true });
+      return new Date(iso).toLocaleTimeString('en-CA', {
+        timeZone: TENANT_TZ, hour: '2-digit', minute: '2-digit', hour12: true
+      });
+    }
+
+    // 从 ISO dateTime 字符串提取租户时区下的小时数
+    function getHourInTz(isoDateTime) {
+      const str = new Date(isoDateTime).toLocaleString("en-US", {
+        timeZone: TENANT_TZ, hour12: false, hour: "2-digit"
+      });
+      return parseInt(str);
     }
 
     async function api(url, opts) {
@@ -186,16 +210,25 @@
         return;
       }
 
+      // 判断是否是今天（租户时区）
+      const isToday = (date === todayInTz());
+      const now = nowInTz();
+
       // Generate all hour slots from 8am to 6pm
       const allSlots = [];
       for (let h = 8; h < 18; h++) {
         const hh = String(h).padStart(2, '0');
         const matchingEvent = (evData.events || []).find(ev => {
           if (!ev.start?.dateTime) return false;
-          return new Date(ev.start.dateTime).getHours() === h;
+          // 用租户时区提取事件的本地小时
+          return getHourInTz(ev.start.dateTime) === h;
         });
+
         let status = 'available';
-        if (matchingEvent) {
+        // 如果是今天（租户时区），已过去的时段标记为 past
+        if (isToday && h <= now.hour) {
+          status = 'past';
+        } else if (matchingEvent) {
           const sum = (matchingEvent.summary || '').toLowerCase();
           status = (sum.includes('blocked') || sum.includes('unavailable')) ? 'blocked' : 'booked';
         }
@@ -209,6 +242,8 @@
           return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:00','${nextHH}:00')">${label}<br><small>Available — click to block</small></div>`;
         } else if (s.status === 'blocked') {
           return `<div class="slot blocked">${label}<br><small>Blocked</small></div>`;
+        } else if (s.status === 'past') {
+          return `<div class="slot past">${label}<br><small>Past</small></div>`;
         } else {
           return `<div class="slot booked">${label}<br><small>Booked</small></div>`;
         }
@@ -255,9 +290,24 @@
 
     function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-    // Init
-    document.getElementById('dateInput').value = today();
-    loadDay();
+    // ── 初始化：先加载租户时区，再渲染页面 ──────────────
+    async function init() {
+      try {
+        const info = await api("/api/tenant/info");
+        if (info.ok && info.timezone) {
+          TENANT_TZ = info.timezone;
+        }
+      } catch (_) {}
+
+      // 显示时区标识
+      document.getElementById('tzLabel').textContent = `Timezone: ${TENANT_TZ}`;
+
+      // 用租户时区的今天初始化日期选择器
+      document.getElementById('dateInput').value = todayInTz();
+      loadDay();
+    }
+
+    init();
   </script>
 </body>
 </html>
