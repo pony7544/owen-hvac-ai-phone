@@ -30,11 +30,15 @@
     .slot.booked{background:#1e3a5f;border-color:#1e40af;color:#93c5fd;cursor:default}
     .slot.past{background:#1e293b;border-color:#334155;color:#475569;cursor:default}
     .events-list{margin-top:16px}
-    .event-item{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-radius:8px;margin-bottom:8px;font-size:13px}
+    .event-item{padding:14px 16px;border-radius:8px;margin-bottom:10px;font-size:13px}
     .event-item.booking{background:#172554;border:1px solid #1e3a8a}
     .event-item.blocked{background:#450a0a;border:1px solid #7f1d1d}
-    .event-time{font-weight:600;min-width:120px}
-    .event-title{flex:1;margin:0 12px}
+    .event-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+    .event-time{font-weight:600}
+    .event-title{font-weight:600;flex:1;margin:0 12px}
+    .event-details{display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:12px;color:#94a3b8;margin-top:6px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08)}
+    .event-details .detail-label{color:#64748b;font-weight:600}
+    .event-details .detail-value{color:#cbd5e1}
     .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;margin-left:8px}
     .tag-blue{background:#1e3a8a;color:#93c5fd}
     .tag-red{background:#7f1d1d;color:#fca5a5}
@@ -192,11 +196,38 @@
           const tag = isBlocked ? '<span class="tag tag-red">Blocked</span>' : '<span class="tag tag-blue">Booking</span>';
           const start = ev.start?.dateTime ? fmtTime(ev.start.dateTime) : 'All day';
           const end = ev.end?.dateTime ? fmtTime(ev.end.dateTime) : '';
+
+          // 从 description 中解析详细信息
+          const desc = ev.description || '';
+          const info = {};
+          desc.split('\n').forEach(line => {
+            const m = line.match(/^(.+?):\s*(.+)$/);
+            if (m) info[m[1].trim().toLowerCase()] = m[2].trim();
+          });
+          const phone   = info['phone']   || '';
+          const address = info['address'] || ev.location || '';
+          const issue   = info['issue']   || '';
+          const name    = info['customer name'] || '';
+
+          // 预约类型：显示详细信息；blocked 类型只显示标题
+          let detailsHtml = '';
+          if (!isBlocked && (phone || address || issue)) {
+            detailsHtml = `<div class="event-details">
+              ${name    ? `<div><span class="detail-label">Customer:</span> <span class="detail-value">${esc(name)}</span></div>` : ''}
+              ${phone   ? `<div><span class="detail-label">Phone:</span> <span class="detail-value">${esc(phone)}</span></div>` : ''}
+              ${address ? `<div><span class="detail-label">Address:</span> <span class="detail-value">${esc(address)}</span></div>` : ''}
+              ${issue   ? `<div><span class="detail-label">Issue:</span> <span class="detail-value">${esc(issue)}</span></div>` : ''}
+            </div>`;
+          }
+
           return `
             <div class="event-item ${cls}">
-              <span class="event-time">${start}${end ? ' – ' + end : ''}</span>
-              <span class="event-title">${esc(ev.summary || 'Untitled')}${tag}</span>
-              <button class="btn btn-sm btn-red" onclick="deleteEvent('${esc(ev.id)}')">Delete</button>
+              <div class="event-header">
+                <span class="event-time">${start}${end ? ' – ' + end : ''}</span>
+                <span class="event-title">${esc(ev.summary || 'Untitled')}${tag}</span>
+                <button class="btn btn-sm btn-red" onclick="deleteEvent('${esc(ev.id)}')">Delete</button>
+              </div>
+              ${detailsHtml}
             </div>`;
         }).join('');
       }
