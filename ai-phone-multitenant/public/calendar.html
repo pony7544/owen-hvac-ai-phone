@@ -114,6 +114,7 @@
   <script>
     // ── 租户时区（从 API 加载）──────────────────────
     let TENANT_TZ = "America/Halifax"; // 默认值，启动后会被 API 覆盖
+    let TENANT_APPT_DURATION = 60;     // 预约时长（分钟），默认60
 
     // 获取租户时区下的"今天"日期字符串 YYYY-MM-DD
     function todayInTz() {
@@ -170,6 +171,14 @@
     function getHourInTz(isoDateTime) {
       const str = new Date(isoDateTime).toLocaleString("en-US", {
         timeZone: TENANT_TZ, hour12: false, hour: "2-digit"
+      });
+      return parseInt(str);
+    }
+
+    // 从 ISO dateTime 字符串提取租户时区下的分钟数
+    function getMinuteInTz(isoDateTime) {
+      const str = new Date(isoDateTime).toLocaleString("en-US", {
+        timeZone: TENANT_TZ, hour12: false, minute: "2-digit"
       });
       return parseInt(str);
     }
@@ -245,38 +254,59 @@
       const isToday = (date === todayInTz());
       const now = nowInTz();
 
-      // Generate all hour slots from 8am to 6pm
-      const allSlots = [];
-      for (let h = 8; h < 18; h++) {
-        const hh = String(h).padStart(2, '0');
-        const matchingEvent = (evData.events || []).find(ev => {
-          if (!ev.start?.dateTime) return false;
-          // 用租户时区提取事件的本地小时
-          return getHourInTz(ev.start.dateTime) === h;
+      // 把所有事件转成占用的时间范围（小时级别）
+      const busyRanges = (evData.events || [])
+        .filter(ev => ev.start?.dateTime && ev.end?.dateTime)
+        .map(ev => {
+          const startH = getHourInTz(ev.start.dateTime);
+          const startM = getMinuteInTz(ev.start.dateTime);
+          const endH   = getHourInTz(ev.end.dateTime);
+          const endM   = getMinuteInTz(ev.end.dateTime);
+          const sum     = (ev.summary || '').toLowerCase();
+          const type    = (sum.includes('blocked') || sum.includes('unavailable')) ? 'blocked' : 'booked';
+          return { startMin: startH * 60 + startM, endMin: endH * 60 + endM, type };
         });
 
+      // 用 appt duration 作为格子宽度（默认60分钟）
+      const slotDur = TENANT_APPT_DURATION || 60;
+      // 营业时间 8:00 - 18:00
+      const openMin = 8 * 60;
+      const closeMin = 18 * 60;
+
+      const allSlots = [];
+      for (let startMin = openMin; startMin + slotDur <= closeMin; startMin += slotDur) {
+        const endMin = startMin + slotDur;
+        const h = Math.floor(startMin / 60);
+        const m = startMin % 60;
+        const hh = String(h).padStart(2, '0');
+        const mm = String(m).padStart(2, '0');
+        const endHH = String(Math.floor(endMin / 60)).padStart(2, '0');
+        const endMM = String(endMin % 60).padStart(2, '0');
+
+        // 检查这个时间段是否与任何事件重叠
+        const overlapping = busyRanges.find(b => startMin < b.endMin && endMin > b.startMin);
+
         let status = 'available';
-        // 如果是今天（租户时区），已过去的时段标记为 past
-        if (isToday && h <= now.hour) {
+        if (isToday && startMin < (now.hour * 60 + now.minute)) {
           status = 'past';
-        } else if (matchingEvent) {
-          const sum = (matchingEvent.summary || '').toLowerCase();
-          status = (sum.includes('blocked') || sum.includes('unavailable')) ? 'blocked' : 'booked';
+        } else if (overlapping) {
+          status = overlapping.type; // 'booked' 或 'blocked'
         }
-        allSlots.push({ h, hh, status });
+
+        allSlots.push({ startMin, endMin, h, m, hh, mm, endHH, endMM, status });
       }
 
       sg.innerHTML = allSlots.map(s => {
-        const label = `${s.hh}:00`;
-        const nextHH = String(s.h + 1).padStart(2, '0');
+        const label = `${s.hh}:${s.mm}`;
+        const endLabel = `${s.endHH}:${s.endMM}`;
         if (s.status === 'available') {
-          return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:00','${nextHH}:00')">${label}<br><small>Available — click to block</small></div>`;
+          return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:${s.mm}','${s.endHH}:${s.endMM}')">${label} – ${endLabel}<br><small>Available</small></div>`;
         } else if (s.status === 'blocked') {
-          return `<div class="slot blocked">${label}<br><small>Blocked</small></div>`;
+          return `<div class="slot blocked">${label} – ${endLabel}<br><small>Blocked</small></div>`;
         } else if (s.status === 'past') {
-          return `<div class="slot past">${label}<br><small>Past</small></div>`;
+          return `<div class="slot past">${label} – ${endLabel}<br><small>Past</small></div>`;
         } else {
-          return `<div class="slot booked">${label}<br><small>Booked</small></div>`;
+          return `<div class="slot booked">${label} – ${endLabel}<br><small>Booked</small></div>`;
         }
       }).join('');
     }
@@ -327,6 +357,9 @@
         const info = await api("/api/tenant/info");
         if (info.ok && info.timezone) {
           TENANT_TZ = info.timezone;
+        }
+        if (info.ok && info.defaultAppointmentMinutes) {
+          TENANT_APPT_DURATION = info.defaultAppointmentMinutes;
         }
       } catch (_) {}
 
