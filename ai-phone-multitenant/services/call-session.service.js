@@ -20,7 +20,8 @@ function normalizePhone(phone) { return phone ? phone.replace(/[^\d+]/g, "").tri
 function createEmptyExtracted() {
   return {
     intent: "", callerName: "", callbackNumber: "", serviceAddress: "",
-    issueSummary: "", preferredDate: "", preferredTime: "", preferredDateTime: "",
+    city: "", issueSummary: "", serviceType: "",
+    preferredDate: "", preferredTime: "", preferredDateTime: "",
     bookingConfirmed: false, appointmentCreated: false, appointmentEventId: "",
   };
 }
@@ -214,7 +215,9 @@ function mergeCallSessions(targetSid, sourceSid) {
     callerName: te.callerName || se.callerName || "",
     callbackNumber: te.callbackNumber || se.callbackNumber || "",
     serviceAddress: te.serviceAddress || se.serviceAddress || "",
+    city: te.city || se.city || "",
     issueSummary: te.issueSummary || se.issueSummary || "",
+    serviceType: te.serviceType || se.serviceType || "",
     preferredDate: te.preferredDate || se.preferredDate || "",
     preferredTime: te.preferredTime || se.preferredTime || "",
     preferredDateTime: te.preferredDateTime || se.preferredDateTime || "",
