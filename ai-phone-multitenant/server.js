@@ -800,29 +800,31 @@ wss.on("connection", async (twilioWs, request) => {
 
           if (fnName === "get_next_available_slots" && calSvc) {
             try {
-              const maxSlots = Math.min(fnArgs.max_slots || 3, 5);
-              const slots = await calSvc.getNextAvailableSlots(maxSlots, 14);
+              // 获取足够多的 slot 以覆盖多个不同日期
+              const slots = await calSvc.getNextAvailableSlots(20, 14);
               if (!slots.length) {
                 toolResult = "No available slots found in the next 14 days. Ask the caller for a preferred date and we will try to accommodate.";
               } else {
-                // s.date = "2026-04-01", s.startTime = "09:00" — 都是营业时区本地时间
-                // 不能用 new Date() 解析，否则会被当成 UTC 导致时区偏移
-                const slotDescriptions = slots.map(s => {
-                  // 用带时区偏移的方式构建日期以获取正确的星期几和月/日
-                  const offset = calSvc.getTimezoneOffset(s.date, s.startTime, tz);
-                  const dateObj = new Date(`${s.date}T${s.startTime}:00${offset}`);
+                // 按日期去重，只取前3个不同的日期
+                const seenDates = new Set();
+                const uniqueDates = [];
+                for (const s of slots) {
+                  if (!seenDates.has(s.date)) {
+                    seenDates.add(s.date);
+                    uniqueDates.push(s.date);
+                    if (uniqueDates.length >= 3) break;
+                  }
+                }
+
+                const dateDescriptions = uniqueDates.map(dateStr => {
+                  const offset = calSvc.getTimezoneOffset(dateStr, "09:00", tz);
+                  const dateObj = new Date(`${dateStr}T09:00:00${offset}`);
                   const dayName = dateObj.toLocaleDateString("en-US", { timeZone: tz, weekday: "long" });
                   const monthDay = dateObj.toLocaleDateString("en-US", { timeZone: tz, month: "long", day: "numeric" });
-
-                  // 直接从 HH:MM 本地时间格式化，不经过 Date 对象
-                  const [hh, mm] = s.startTime.split(":").map(Number);
-                  const ampm = hh >= 12 ? "PM" : "AM";
-                  const h12 = hh % 12 || 12;
-                  const timeLabel = mm === 0 ? `${h12} ${ampm}` : `${h12}:${String(mm).padStart(2,"0")} ${ampm}`;
-
-                  return `${dayName} ${monthDay} at ${timeLabel} (${s.date} ${s.startTime})`;
+                  return `${dayName} ${monthDay} (${dateStr})`;
                 });
-                toolResult = `Here are the next ${slots.length} available slots:\n${slotDescriptions.join("\n")}\n\nPresent these options to the caller in a friendly way and ask which one works best. Use natural language for dates and times.`;
+
+                toolResult = `Available dates:\n${dateDescriptions.join("\n")}\n\nIMPORTANT: Only tell the caller which DATES are available. Do NOT mention specific times yet. Example: "We have availability on Wednesday April 2nd, Thursday April 3rd, and Friday April 4th. Which day works best for you?" After the caller picks a date, call the check_availability tool with that date to get the specific time slots.`;
               }
             } catch (err) {
               console.error(`[Tool] get_next_available_slots error:`, err?.message);
@@ -833,18 +835,28 @@ wss.on("connection", async (twilioWs, request) => {
           if (fnName === "check_availability" && calSvc) {
             try {
               const events = await calSvc.listEventsForDay(fnArgs.date);
-              const slots  = calSvc.generateSlotsForDay(fnArgs.date, events, apptMin);
-              if (!slots.length) { toolResult = `No available slots on ${fnArgs.date}. Ask for another date.`; }
+              const allSlots = calSvc.generateSlotsForDay(fnArgs.date, events, apptMin);
+
+              // 最多取3个时间段推荐给客户
+              const topSlots = allSlots.slice(0, 3);
+
+              if (!topSlots.length) { toolResult = `No available time slots on ${fnArgs.date}. Ask the caller if another date works.`; }
               else {
-                // slot.start 格式是 "2026-04-01T09:00:00"（本地时间，无时区），直接提取 HH:MM
-                const labels = slots.map(s => {
+                const offset = calSvc.getTimezoneOffset(fnArgs.date, "09:00", tz);
+                const dateObj = new Date(`${fnArgs.date}T09:00:00${offset}`);
+                const dayName = dateObj.toLocaleDateString("en-US", { timeZone: tz, weekday: "long" });
+                const monthDay = dateObj.toLocaleDateString("en-US", { timeZone: tz, month: "long", day: "numeric" });
+
+                const labels = topSlots.map(s => {
                   const timePart = s.start.split('T')[1].substring(0, 5);
                   const [hh, mm] = timePart.split(":").map(Number);
                   const ampm = hh >= 12 ? "PM" : "AM";
                   const h12 = hh % 12 || 12;
                   return mm === 0 ? `${h12} ${ampm}` : `${h12}:${String(mm).padStart(2,"0")} ${ampm}`;
                 });
-                toolResult = `Available on ${fnArgs.date}: ${labels.join(", ")}. Confirm with caller.`;
+
+                const totalAvailable = allSlots.length;
+                toolResult = `On ${dayName} ${monthDay} (${fnArgs.date}), here are ${topSlots.length} suggested time slots: ${labels.join(", ")}. (${totalAvailable} total slots available that day.)\n\nPresent these ${topSlots.length} times to the caller and ask which one works best. If the caller wants a different time, there are ${totalAvailable} slots total — ask what time they prefer and check if it's available.`;
               }
             } catch (err) { toolResult = `Calendar check failed: ${err?.message}`; }
           }
