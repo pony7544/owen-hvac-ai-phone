@@ -329,9 +329,16 @@
   <script>
     let dailyChart = null;
     let sourceChart = null;
+    let TENANT_TZ = "America/Halifax";
     
     // Initialize
-    document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('DOMContentLoaded', async () => {
+      // 加载租户时区
+      try {
+        const r = await fetch("/api/tenant/info", { headers: { "Content-Type": "application/json" } });
+        const info = await r.json();
+        if (info.ok && info.timezone) TENANT_TZ = info.timezone;
+      } catch (_) {}
       initDateSelectors();
       loadStats();
     });
@@ -492,7 +499,7 @@
         const row = document.createElement('tr');
         const date = new Date(call.createdAt);
         row.innerHTML = `
-          <td>${date.toLocaleDateString()} ${date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</td>
+          <td>${date.toLocaleDateString("en-CA", {timeZone: TENANT_TZ})} ${date.toLocaleTimeString("en-CA", {timeZone: TENANT_TZ, hour: '2-digit', minute:'2-digit'})}</td>
           <td>${call.from || '-'}</td>
           <td>${formatDuration(call.duration || 0)}</td>
           <td>${call.extracted?.callerName || '-'}</td>
