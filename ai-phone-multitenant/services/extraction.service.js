@@ -25,13 +25,15 @@ function createExtractionService(config = {}) {
       typeof data.preferred_time === "string" ? data.preferred_time.trim() : "";
 
     return {
-      intent:          typeof data.intent   === "string" ? data.intent.trim()   : "",
-      callerName:      typeof data.name     === "string" ? data.name.trim()     : "",
-      callbackNumber:  typeof data.phone    === "string" && typeof normalizePhone === "function"
+      intent:          typeof data.intent        === "string" ? data.intent.trim()        : "",
+      callerName:      typeof data.name          === "string" ? data.name.trim()          : "",
+      callbackNumber:  typeof data.phone         === "string" && typeof normalizePhone === "function"
                          ? normalizePhone(data.phone)
                          : typeof data.phone === "string" ? data.phone.trim() : "",
-      serviceAddress:  typeof data.address  === "string" ? data.address.trim()  : "",
-      issueSummary:    typeof data.issue    === "string" ? data.issue.trim()    : "",
+      serviceAddress:  typeof data.address       === "string" ? data.address.trim()       : "",
+      city:            typeof data.city           === "string" ? data.city.trim()           : "",
+      issueSummary:    typeof data.issue          === "string" ? data.issue.trim()          : "",
+      serviceType:     typeof data.service_type   === "string" ? data.service_type.trim()   : "",
       preferredDate,
       preferredTime,
       preferredDateTime: preferredDate && preferredTime ? `${preferredDate} ${preferredTime}` : "",
@@ -75,14 +77,16 @@ function createExtractionService(config = {}) {
               name:             { type: "string" },
               phone:            { type: "string" },
               address:          { type: "string" },
+              city:             { type: "string" },
               issue:            { type: "string" },
+              service_type:     { type: "string" },
               preferred_date:   { type: "string" },
               preferred_time:   { type: "string" },
               booking_confirmed:{ type: "boolean" },
             },
             required: [
-              "intent", "name", "phone", "address", "issue",
-              "preferred_date", "preferred_time", "booking_confirmed",
+              "intent", "name", "phone", "address", "city", "issue",
+              "service_type", "preferred_date", "preferred_time", "booking_confirmed",
             ],
           },
         },
@@ -116,7 +120,9 @@ function createExtractionService(config = {}) {
       callerName:       normalized.callerName,
       callbackNumber:   normalized.callbackNumber,
       serviceAddress:   normalized.serviceAddress,
+      city:             normalized.city,
       issueSummary:     normalized.issueSummary,
+      serviceType:      normalized.serviceType,
       preferredDate:    normalized.preferredDate,
       preferredTime:    normalized.preferredTime,
       preferredDateTime:normalized.preferredDateTime,
