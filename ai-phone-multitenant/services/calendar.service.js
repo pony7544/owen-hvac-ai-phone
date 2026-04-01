@@ -179,7 +179,9 @@ function createCalendarService(config = {}) {
       });
     
     // 生成时间槽
-    const interval = slotInterval || 30;
+    // interval 不能小于 slotDuration，否则会生成重叠的时间槽（如 8:00-10:00 和 8:30-10:30）
+    const rawInterval = slotInterval || 30;
+    const interval = Math.max(rawInterval, slotDuration);
     for (let startMin = openMinutes; startMin + slotDuration <= closeMinutes; startMin += interval) {
       const endMin = startMin + slotDuration;
       const overlaps = busyRanges.some(b => startMin < b.endMin && endMin > b.startMin);
