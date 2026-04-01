@@ -4,47 +4,15 @@
 // =============================================================
 
 const { createCalendarService } = require("./calendar.service");
+const { buildTools } = require("../prompts");
 
 // 懒加载 Model，避免循环依赖
 function getTenantModel() {
   return require("../models").Tenant;
 }
 
-const STANDARD_TOOLS = [
-  {
-    type: "function", name: "check_availability",
-    description: "Check available appointment slots for a given date.",
-    parameters: {
-      type: "object",
-      properties: { date: { type: "string", description: "YYYY-MM-DD" } },
-      required: ["date"],
-    },
-  },
-  {
-    type: "function", name: "create_appointment",
-    description: "Create a confirmed appointment after the caller verbally confirmed.",
-    parameters: {
-      type: "object",
-      properties: {
-        caller_name: { type: "string" }, callback_number: { type: "string" },
-        service_address: { type: "string" }, issue_summary: { type: "string" },
-        preferred_date: { type: "string", description: "YYYY-MM-DD" },
-        preferred_time: { type: "string", description: "HH:MM 24h" },
-        intent: { type: "string", enum: ["service_or_repair","quote_request","maintenance","new_installation","general_inquiry","other"] },
-      },
-      required: ["caller_name","callback_number","service_address","issue_summary","preferred_date","preferred_time","intent"],
-    },
-  },
-  {
-    type: "function", name: "end_call",
-    description: "Hang up the call after saying goodbye.",
-    parameters: {
-      type: "object",
-      properties: { reason: { type: "string" } },
-      required: ["reason"],
-    },
-  },
-];
+// 使用 prompts.js 的 buildTools 动态生成工具（含 get_next_available_slots）
+const STANDARD_TOOLS = buildTools();
 
 // ─── 内存缓存 ────────────────────────────────
 let tenantsCache = new Map();  // tenantId → runtime tenant object
