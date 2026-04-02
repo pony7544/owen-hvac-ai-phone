@@ -241,7 +241,7 @@
         }).join('');
       }
 
-      // Load slots
+      // Load slots — 后端已经根据 appt duration 和已有事件正确生成了可用时间段
       const slotData = await api(`/api/calendar/slots?date=${date}`);
       const sg = document.getElementById('slotsGrid');
 
@@ -250,63 +250,69 @@
         return;
       }
 
-      // 判断是否是今天（租户时区）
       const isToday = (date === todayInTz());
       const now = nowInTz();
+      const nowTotalMin = now.hour * 60 + now.minute;
+      const apptMin = slotData.appointmentMinutes || TENANT_APPT_DURATION || 60;
 
-      // 把所有事件转成占用的时间范围（小时级别）
-      const busyRanges = (evData.events || [])
+      // 后端返回的 available slots（格式: { start: "2026-04-02T09:00:00", end: "2026-04-02T11:00:00" }）
+      const availableSlots = (slotData.slots || []).map(s => {
+        const startTime = s.start.split('T')[1].substring(0, 5); // "09:00"
+        const endTime   = s.end.split('T')[1].substring(0, 5);   // "11:00"
+        const [sh, sm]  = startTime.split(':').map(Number);
+        const [eh, em]  = endTime.split(':').map(Number);
+        return { startTime, endTime, startMin: sh * 60 + sm, endMin: eh * 60 + em };
+      });
+
+      // 把事件也转成时间范围，用于显示 booked/blocked 格子
+      const busySlots = (evData.events || [])
         .filter(ev => ev.start?.dateTime && ev.end?.dateTime)
         .map(ev => {
-          const startH = getHourInTz(ev.start.dateTime);
-          const startM = getMinuteInTz(ev.start.dateTime);
-          const endH   = getHourInTz(ev.end.dateTime);
-          const endM   = getMinuteInTz(ev.end.dateTime);
-          const sum     = (ev.summary || '').toLowerCase();
-          const type    = (sum.includes('blocked') || sum.includes('unavailable')) ? 'blocked' : 'booked';
-          return { startMin: startH * 60 + startM, endMin: endH * 60 + endM, type };
+          const sh = getHourInTz(ev.start.dateTime);
+          const sm = getMinuteInTz(ev.start.dateTime);
+          const eh = getHourInTz(ev.end.dateTime);
+          const em = getMinuteInTz(ev.end.dateTime);
+          const sum = (ev.summary || '').toLowerCase();
+          const type = (sum.includes('blocked') || sum.includes('unavailable')) ? 'blocked' : 'booked';
+          const startTime = String(sh).padStart(2,'0') + ':' + String(sm).padStart(2,'0');
+          const endTime   = String(eh).padStart(2,'0') + ':' + String(em).padStart(2,'0');
+          return { startTime, endTime, startMin: sh * 60 + sm, endMin: eh * 60 + em, type };
         });
 
-      // 用 appt duration 作为格子宽度（默认60分钟）
-      const slotDur = TENANT_APPT_DURATION || 60;
-      // 营业时间 8:00 - 18:00
-      const openMin = 8 * 60;
-      const closeMin = 18 * 60;
-
+      // 合并：available + busy，按开始时间排序
       const allSlots = [];
-      for (let startMin = openMin; startMin + slotDur <= closeMin; startMin += slotDur) {
-        const endMin = startMin + slotDur;
-        const h = Math.floor(startMin / 60);
-        const m = startMin % 60;
-        const hh = String(h).padStart(2, '0');
-        const mm = String(m).padStart(2, '0');
-        const endHH = String(Math.floor(endMin / 60)).padStart(2, '0');
-        const endMM = String(endMin % 60).padStart(2, '0');
 
-        // 检查这个时间段是否与任何事件重叠
-        const overlapping = busyRanges.find(b => startMin < b.endMin && endMin > b.startMin);
+      // 添加 busy slots（已预约/已屏蔽的时间段）
+      for (const b of busySlots) {
+        allSlots.push({ ...b, status: b.type });
+      }
 
+      // 添加 available slots
+      for (const s of availableSlots) {
         let status = 'available';
-        if (isToday && startMin < (now.hour * 60 + now.minute)) {
+        if (isToday && s.startMin < nowTotalMin) {
           status = 'past';
-        } else if (overlapping) {
-          status = overlapping.type; // 'booked' 或 'blocked'
         }
+        allSlots.push({ ...s, status });
+      }
 
-        allSlots.push({ startMin, endMin, h, m, hh, mm, endHH, endMM, status });
+      // 按开始时间排序
+      allSlots.sort((a, b) => a.startMin - b.startMin);
+
+      if (!allSlots.length) {
+        sg.innerHTML = '<div class="empty">No time slots for this day.</div>';
+        return;
       }
 
       sg.innerHTML = allSlots.map(s => {
-        const label = `${s.hh}:${s.mm}`;
-        const endLabel = `${s.endHH}:${s.endMM}`;
         if (s.status === 'available') {
-          return `<div class="slot available" onclick="quickBlock('${date}','${s.hh}:${s.mm}','${s.endHH}:${s.endMM}')">${label} – ${endLabel}<br><small>Available</small></div>`;
+          return `<div class="slot available" onclick="quickBlock('${date}','${s.startTime}','${s.endTime}')">${s.startTime} – ${s.endTime}<br><small>Available</small></div>`;
         } else if (s.status === 'blocked') {
-          return `<div class="slot blocked">${label} – ${endLabel}<br><small>Blocked</small></div>`;
+          return `<div class="slot blocked">${s.startTime} – ${s.endTime}<br><small>Blocked</small></div>`;
         } else if (s.status === 'past') {
-          return `<div class="slot past">${label} – ${endLabel}<br><small>Past</small></div>`;
+          return `<div class="slot past">${s.startTime} – ${s.endTime}<br><small>Past</small></div>`;
         } else {
-          return `<div class="slot booked">${label} – ${endLabel}<br><small>Booked</small></div>`;
+          return `<div class="slot booked">${s.startTime} – ${s.endTime}<br><small>Booked</small></div>`;
         }
       }).join('');
     }
