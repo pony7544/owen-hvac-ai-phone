@@ -154,6 +154,9 @@ const recordingSchema = new mongoose.Schema({
   assistantFrames: { type: Buffer },
   durationSec:     { type: Number, default: 0 },
   available:       { type: Boolean, default: false },
+  // ===== R2 归档字段 =====
+  r2Key:           { type: String, default: "" },        // R2 对象 key，非空表示已上传到 R2
+  archivedToR2:    { type: Boolean, default: false },    // true = 已归档，MongoDB 中的 wavBuffer 已清除
 }, { timestamps: true });
 
 // ===== 新增：月度统计汇总表（可选，用于优化查询） =====
