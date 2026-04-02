@@ -298,9 +298,10 @@ app.get("/api/calendar/slots", requireApiAuth, async (req, res) => {
   const tenant = getSessionTenant(req);
   if (!tenant?.calendarService) return res.status(400).json({ ok: false, error: "No calendar" });
   try {
+    const apptMin = tenant.defaultAppointmentMinutes || 60;
     const events = await tenant.calendarService.listEventsForDay(req.query.date);
-    const slots = tenant.calendarService.generateSlotsForDay(req.query.date, events, 60);
-    res.json({ ok: true, slots });
+    const slots = tenant.calendarService.generateSlotsForDay(req.query.date, events, apptMin);
+    res.json({ ok: true, slots, appointmentMinutes: apptMin });
   } catch (err) { res.status(500).json({ ok: false, error: err?.message }); }
 });
 
