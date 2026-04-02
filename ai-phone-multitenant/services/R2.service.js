@@ -3,7 +3,16 @@
 // 使用 S3 兼容 API，录音文件 2 天后从 MongoDB 迁移到 R2
 // =============================================================
 
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+let S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand;
+try {
+  const s3 = require("@aws-sdk/client-s3");
+  S3Client = s3.S3Client;
+  PutObjectCommand = s3.PutObjectCommand;
+  GetObjectCommand = s3.GetObjectCommand;
+  DeleteObjectCommand = s3.DeleteObjectCommand;
+} catch (err) {
+  console.warn("[R2] @aws-sdk/client-s3 not installed — R2 storage disabled. Run: npm install @aws-sdk/client-s3");
+}
 
 let s3Client = null;
 let bucketName = "";
@@ -14,6 +23,11 @@ let r2Enabled = false;
  * 需要环境变量：R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
  */
 function initR2() {
+  if (!S3Client) {
+    console.log("[R2] SDK not available — skipping R2 init");
+    return false;
+  }
+
   const accountId = process.env.R2_ACCOUNT_ID;
   const accessKeyId = process.env.R2_ACCESS_KEY_ID;
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
