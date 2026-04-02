@@ -99,12 +99,14 @@ async function loadRecordingFromDB(callSid) {
       try { assistantFrames = JSON.parse(zlib.gunzipSync(doc.assistantFrames).toString()); } catch (_) {}
     }
     return {
-      wavBuffer: doc.wavBuffer,
+      wavBuffer: doc.wavBuffer || null,
       _callerFrames: callerFrames,
       _assistantFrames: assistantFrames,
       durationSec: doc.durationSec,
       createdAt: doc.createdAt?.toISOString(),
       available: doc.available,
+      r2Key: doc.r2Key || "",
+      archivedToR2: doc.archivedToR2 || false,
     };
   } catch (err) {
     console.error("[DB] load recording error:", err.message);
